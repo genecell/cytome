@@ -48,6 +48,10 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.11",
     "pandas>=1.5",
+    # Fragment storage defaults to lz4 (convert_fragments) and merge's fragment
+    # path hardcodes it, so this is not optional: without it `pip install
+    # cytome` cannot import or merge fragments at all.
+    "lz4>=4.0",
 ]
 
 [project.urls]

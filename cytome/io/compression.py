@@ -41,6 +41,14 @@ def compress_blob(data: bytes, method: str = "zstd", level: int | None = None) -
     if chosen == "zstd" and _ZSTD_AVAILABLE:
         return zstd.ZstdCompressor(level=level if level is not None else 3).compress(data)
     if chosen == "lz4":
+        if not _LZ4_AVAILABLE:
+            # Deliberately NOT a silent fallback to zlib: the caller records
+            # the method name alongside the blob, so falling back would label
+            # zlib bytes as lz4 and break decompression later.
+            raise ImportError(
+                "lz4 compression was requested but lz4 is not installed. "
+                "It is a required dependency of cytome: pip install lz4"
+            )
         return _lz4_block.compress(data, store_size=True)
     return zlib.compress(data, level=level if level is not None else 6)
 
