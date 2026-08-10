@@ -1,30 +1,65 @@
-name: Publish to PyPI
+name: publish-pypi
+# Publish cytome to PyPI on a GitHub Release, via PyPI Trusted Publishing
+# (OIDC — no API token needed).
+#
+# ONE-TIME SETUP on pypi.org → Publishing:
+#   owner        <you>
+#   repository   cytome
+#   workflow     publish.yml
+#   environment  (leave blank)
+# For a project that does not exist on PyPI yet, add it as a **pending
+# publisher** — that lets the very first upload come from this workflow, so no
+# API token is ever created. If instead you claim the name manually with
+# `twine upload`, add the Trusted Publisher afterwards and this workflow takes
+# over from the second release on.
 
 on:
   release:
-    types: [created]
+    # `published` and not `created`: GitHub does not trigger `created` for
+    # draft releases, and composing a release in the web UI saves it as a draft
+    # first — so a `created` trigger silently never fires on the normal path.
+    types: [published]
+  workflow_dispatch:
 
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
-
+    permissions:
+      id-token: write        # OIDC identity for Trusted Publishing
+      contents: read
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
+      # A PyPI version can never be re-uploaded, so everything that can fail
+      # should fail before the upload step, not after it.
+      - name: Install and test
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pytest tests/ -q
 
-      - name: Install build tools
-        run: pip install build twine
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install build twine
+          python -m build
 
-      - name: Build package
-        run: python -m build
+      - name: Check metadata renders on PyPI
+        run: python -m twine check dist/*
+
+      - name: Tag must match the package version
+        if: github.event_name == 'release'
+        run: |
+          BUILT=$(ls dist/*.tar.gz | sed -E 's/.*-([0-9][^-]*)\.tar\.gz/\1/')
+          TAG=${GITHUB_REF_NAME#v}
+          echo "tag=$TAG built=$BUILT"
+          if [ "$TAG" != "$BUILT" ]; then
+            echo "::error::Release tag '$GITHUB_REF_NAME' does not match the" \
+                 "built version '$BUILT'. Fix the tag or pyproject.toml —" \
+                 "an upload under the wrong version cannot be undone."
+            exit 1
+          fi
 
       - name: Publish to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: twine upload dist/*
+        uses: pypa/gh-action-pypi-publish@release/v1
