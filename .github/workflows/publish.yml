@@ -61,5 +61,14 @@ jobs:
             exit 1
           fi
 
+      # skip-existing turns "this version is already on PyPI" from a red build
+      # into a no-op. That matters because 0.2.2 was uploaded by hand before
+      # this workflow existed, so cutting a v0.2.2 release to carry the release
+      # notes would otherwise fail at the upload step.
+      # It does not hide a forgotten version bump: tagging v0.2.3 with
+      # pyproject still at 0.2.2 fails the tag-vs-version guard above, before
+      # anything is uploaded.
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
