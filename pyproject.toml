@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cytome"
+version = "0.2.2"
+description = "Single-file multi-omics data format for single-cell biology"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "BSD-3-Clause"}
+authors = [
+    { name = "Min Dai", email = "dai@broadinstitute.org" }
+]
+maintainers = [
+    { name = "Min Dai", email = "dai@broadinstitute.org" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Framework :: Jupyter",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Natural Language :: English",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+keywords = [
+    "single-cell",
+    "genomics",
+    "bioinformatics",
+    "scRNA-seq",
+    "scATAC-seq",
+    "multiomics",
+    "data-format",
+    "sqlite",
+    "streaming",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "pandas>=1.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/genecell/cytome"
+Source = "https://github.com/genecell/cytome"
+Documentation = "https://github.com/genecell/cytome"
+
+[project.optional-dependencies]
+anndata = ["anndata>=0.10"]
+mudata = ["mudata>=0.2"]
+full = [
+    "anndata>=0.10",
+    "mudata>=0.2",
+    "zstandard>=0.20",
+    "pysam>=0.22",
+    "pyBigWig>=0.3",
+]
+dev = [
+    "pytest>=7.0",
+    "anndata>=0.10",
+    "mudata>=0.2",
+    "zstandard>=0.20",
+    "pysam>=0.22",
+    "pyBigWig>=0.3",
+    "torch>=2.0",
+]
+
+[project.scripts]
+cytome = "cytome.cli.main:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cytome*"]
+exclude = ["cytome.tests*"]

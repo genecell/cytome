@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Rust sub-repos (build artifacts excluded)
+cytome-import-fragments/
+cytome-import-fragments-noodles/target/
+
+# Local dev / AI agent state
+.plandrop/
+.stato/
+.statoignore
+AGENTS.md
+CLAUDE.md
+
+# Results and data
+results/
+*.cytome
+*.cytome-wal
+*.cytome-shm
+
+# Local benchmark scripts
+generate_plots.py
+generate_selective_plots.py
+run_benchmark*.py
+
+# Test datasets are downloaded on demand (tests/real_data/download_datasets.py)
+tests/real_data/data/*.h5ad
+
+# Not part of the cytome Python package (Rust prototype, benchmarks, assembler)
+benchmark_noodles/
+cytome-import-fragments-noodles/
+publish.sh
+.ipynb_checkpoints/
+docs/prompt/
