@@ -80,8 +80,6 @@ ds = cytome.from_anndata(adata, modality="RNA", output="rna.cytome")
 - SQL-queryable entity tables (`cells`, `genes`, `peaks`, `samples`)
 - Merge, subset, and downsample APIs with chunk-aware implementations
 - Fragment storage (chunked, compressed) with genomic range queries and export
-  (bulk fragment **import** is provided by [PIASO](https://piaso.org) —
-  `piaso.pp.importFragments`)
 - Analysis results live on the file: embeddings (`ds.embeddings`), neighbor
   graphs (`ds.graphs`), per-cell / per-feature columns, and arbitrary analysis
   artifacts (`ds.metadata`) — PIASO writes results back onto the cytome
@@ -166,22 +164,20 @@ read results from the dataset afterwards.
 import cytome
 import piaso
 
-# Open a cytome dataset and run the PIASO ATAC pipeline (results persist on ds)
+# Open a cytome dataset and analyse it with PIASO (results persist on ds)
 ds = cytome.open("atac.cytome")
 
-piaso.pp.calculateCellMetrics(ds)        # per-cell QC -> ds.cells
-piaso.pp.selectPeaks(ds)                  # highly variable peaks -> ds.peaks
+piaso.pp.calculateCellMetrics(ds)         # per-cell QC -> ds.cells
 piaso.tl.runSVDLazy(ds)                   # X_svd embedding -> ds.embeddings
 piaso.tl.neighbors(ds)                    # connectivities/distances -> ds.graphs
-piaso.tl.leiden(ds, key_added="leiden")  # labels -> ds.cells["leiden"]
+piaso.tl.leiden(ds, key_added="leiden")   # labels -> ds.cells["leiden"]
 piaso.tl.umap(ds)                         # X_umap -> ds.embeddings
 piaso.pl.plotUMAP(ds, color="leiden")
 
-# Markers + peak calling can persist to the cytome too
+# Marker genes can persist to the cytome too
 import cosg
 cosg.run_cosg_cytome(ds, groupby="leiden", modality="ATAC",
                      write_to_cytome=True)        # -> ds.metadata["cosg"]
-piaso.tl.picco(ds, groupby="leiden", genome="mm10")  # PICCO peak calling
 
 ds.close()
 ```
