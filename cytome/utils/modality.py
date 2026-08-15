@@ -271,5 +271,6 @@ __all__ = [
     "modality_feature_table_info",
     "modality_has_feature",
     "read_feature_column",
+    "read_feature_columns",
     "modality_cell_depth",
 ]

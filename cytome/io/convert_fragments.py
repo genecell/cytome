@@ -474,7 +474,7 @@ def import_fragments_streaming(
     tile_total_hits = {}
 
     if tile_sizes and tile_output_cytome is not None:
-        from piaso.preprocessing._streaming_io import (
+        from cytome.io.chunking import (
             _compute_chunk_params, ChunkBucketWriter,
         )
         n_cells = len(cell_name_to_idx)
@@ -894,7 +894,7 @@ def _finalize_tiles(
 ):
     """Finalize tile matrices: close writers, build metadata, write to cytome."""
     import pandas as pd
-    from piaso.preprocessing._streaming_io import (
+    from cytome.io.chunking import (
         _compute_chunk_params, _write_chunks_to_cytome,
     )
 

@@ -6,6 +6,31 @@ from pathlib import Path
 
 from cytome.core.dataset import CytomeDataset
 
+# ---------------------------------------------------------------- modality API
+# Promoted to the top level as a stability commitment, not for convenience.
+#
+# Downstream packages (PIASO's feature resolver) need to answer "which modality
+# holds this feature, and how do I read its column" without reimplementing the
+# routing. They were reaching into ``cytome.utils.modality`` -- an internal
+# path, on which cytome made no promises -- so any reshaping here would have
+# broken them silently.
+#
+# These names are public API. ``MODALITY_REGISTRY`` entries are 4-tuples
+# ``(modality, entity_table, idx_col, id_columns)`` and RNA comes first, because
+# callers auto-detecting which modality holds a feature iterate in order.
+# Changing that shape, or the signatures below, requires a major version bump.
+# tests/test_public_api_contract.py enforces this.
+from cytome.utils.modality import (
+    MODALITY_REGISTRY,
+    MODALITY_VAR_ENTITY,
+    modality_var_entity,
+    modality_feature_table_info,
+    modality_has_feature,
+    read_feature_column,
+    read_feature_columns,
+    modality_cell_depth,
+)
+
 
 __all__ = [
     "CytomeDataset",
@@ -22,8 +47,17 @@ __all__ = [
     "from_barcodes",
     "merge",
     "import_gtf",
+    # modality routing -- see the note above before changing any of these
+    "MODALITY_REGISTRY",
+    "MODALITY_VAR_ENTITY",
+    "modality_var_entity",
+    "modality_feature_table_info",
+    "modality_has_feature",
+    "read_feature_column",
+    "read_feature_columns",
+    "modality_cell_depth",
 ]
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 
 def import_gtf(ds, gtf_path, **kwargs):
