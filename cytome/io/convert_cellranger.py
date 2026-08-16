@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -187,6 +188,7 @@ def _from_one_cellranger(folder: Path, output, sample_name, import_fragments, bu
     if not peak_mask.any():   # fallback: peak feature ids look like 'chr:start-end'
         peak_mask = np.array(
             [(":" in str(x) and "-" in str(x).split(":", 1)[-1]) for x in ids]) & ~gene_mask
+    _warn_unhandled_feature_types(ftypes, gene_mask, peak_mask)
     if not gene_mask.any() and not peak_mask.any():
         gene_mask = np.ones(len(ids), dtype=bool)   # single-modality file → all RNA
     if modalities == "rna":
@@ -440,6 +442,7 @@ def from_10x_h5(path: str | Path, output: str | Path, sample_name: Optional[str]
 
     gene_mask = ftypes == "Gene Expression"
     peak_mask = np.array(["Peak" in str(t) for t in ftypes])
+    _warn_unhandled_feature_types(ftypes, gene_mask, peak_mask)
     if not gene_mask.any() and not peak_mask.any():
         gene_mask = np.ones(len(ids), dtype=bool)   # single-modality file → all RNA
     if modalities == "rna":
@@ -485,6 +488,32 @@ def _read_matrix_dir(mtx_dir: Path):
         features = [line.strip().split("\t") for line in handle if line.strip()]
 
     return matrix, barcodes, features
+
+
+def _warn_unhandled_feature_types(ftypes, gene_mask, peak_mask) -> None:
+    """Say so when a feature type is read but not written.
+
+    Cell Ranger puts 'Antibody Capture' (CITE-seq) and 'CRISPR Guide Capture'
+    rows in the same matrix as Gene Expression. Only Gene Expression -> RNA and
+    Peaks -> ATAC map to a modality, so anything else is dropped. Dropping it
+    silently means a user's ADT panel disappears with no indication that the
+    file ever held one.
+
+    Call this *before* applying the ``modalities`` selection, so that
+    deliberately asking for ``'rna'`` does not warn about the peaks you chose
+    to leave out.
+    """
+    unhandled = ~(np.asarray(gene_mask) | np.asarray(peak_mask))
+    if not unhandled.any():
+        return
+    kinds = sorted({str(t) for t in np.asarray(ftypes)[unhandled]})
+    warnings.warn(
+        f"{int(unhandled.sum())} features of type {kinds} were not written: "
+        "only 'Gene Expression' (-> RNA) and 'Peaks' (-> ATAC) map to a "
+        "cytome modality.",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def _peaks_from_feature_ids(feature_ids: np.ndarray) -> Optional[pd.DataFrame]:

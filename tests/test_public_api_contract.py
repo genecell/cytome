@@ -211,3 +211,72 @@ def test_from_10x_h5_runs(tmp_path):
 
     with pytest.raises(ValueError, match="modalities must be"):
         cytome.from_10x_h5(h5, tmp_path / "bad.cytome", modalities="nope", force=True)
+
+
+def _write_10x_h5(path, feature_types, ids=None):
+    """A minimal Cell Ranger v3 matrix: (n_features, n_cells) CSC, 3 cells."""
+    import h5py
+    import numpy as np
+    from scipy import sparse as sp
+
+    n = len(feature_types)
+    ids = ids or [f"F{i}".encode() for i in range(n)]
+    X = sp.csc_matrix(np.arange(1, n * 3 + 1, dtype=np.int32).reshape(n, 3))
+    with h5py.File(path, "w") as f:
+        g = f.create_group("matrix")
+        g.create_dataset("data", data=X.data)
+        g.create_dataset("indices", data=X.indices.astype(np.int64))
+        g.create_dataset("indptr", data=X.indptr.astype(np.int64))
+        g.create_dataset("shape", data=np.array(X.shape, dtype=np.int64))
+        g.create_dataset("barcodes", data=np.array([b"C1", b"C2", b"C3"]))
+        fg = g.create_group("features")
+        fg.create_dataset("id", data=np.array(ids))
+        fg.create_dataset("name", data=np.array(ids))
+        fg.create_dataset("feature_type", data=np.array(feature_types))
+        fg.create_dataset("genome", data=np.array([b"test"] * n))
+
+
+def test_dropped_feature_types_are_reported(tmp_path):
+    """CITE-seq ADT rows are not written; that must not be silent.
+
+    Cell Ranger emits 'Antibody Capture' into the same matrix as Gene
+    Expression. Only Gene Expression and Peaks map to a modality, so the ADT
+    panel is dropped -- a user who does not get told simply loses it.
+    """
+    import cytome
+
+    h5 = tmp_path / "cite.h5"
+    _write_10x_h5(
+        h5,
+        [b"Gene Expression", b"Gene Expression", b"Antibody Capture"],
+        ids=[b"G1", b"G2", b"CD3_TotalSeqB"],
+    )
+
+    with pytest.warns(UserWarning, match="Antibody Capture"):
+        ds = cytome.from_10x_h5(h5, tmp_path / "cite.cytome", force=True)
+    ds.close()
+
+
+def test_no_warning_when_modalities_drops_features_on_purpose(tmp_path):
+    """Asking for 'rna' is a choice, not an accident -- it must stay quiet.
+
+    A warning that fires on the documented happy path is noise, and noise is
+    what trains people to ignore the real one above.
+    """
+    import warnings as _w
+
+    import cytome
+
+    h5 = tmp_path / "arc.h5"
+    _write_10x_h5(
+        h5,
+        [b"Gene Expression", b"Peaks"],
+        ids=[b"G1", b"chr1:1-2"],
+    )
+
+    for mods in ("both", "rna", "atac"):
+        with _w.catch_warnings():
+            _w.simplefilter("error", UserWarning)
+            ds = cytome.from_10x_h5(h5, tmp_path / f"{mods}.cytome",
+                                    modalities=mods, force=True)
+            ds.close()
