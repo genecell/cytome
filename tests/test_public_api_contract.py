@@ -166,3 +166,48 @@ def test_compute_chunk_params_bounds_the_file_count():
             "on atlas-scale runs."
         )
         assert chunk_size * n_chunks >= n_cells, "chunks do not cover all cells"
+
+
+def test_from_10x_h5_runs(tmp_path):
+    """It referenced an undefined name, so every call raised NameError.
+
+    0.2.3 shipped `from_10x_h5` with a `modalities` branch copied from
+    `from_cellranger` but no such parameter, so the function was unusable for
+    every input. Nothing caught it because no test called it -- checking that a
+    function *exists* is not checking that it runs.
+    """
+    import numpy as np
+    from scipy import sparse as sp
+
+    import cytome
+
+    h5 = tmp_path / "tiny.h5"
+    X = sp.csc_matrix(np.array([[1, 0, 2], [0, 3, 0], [4, 0, 5], [0, 6, 0]], dtype=np.int32))
+    import h5py
+
+    with h5py.File(h5, "w") as f:
+        g = f.create_group("matrix")
+        g.create_dataset("data", data=X.data)
+        g.create_dataset("indices", data=X.indices.astype(np.int64))
+        g.create_dataset("indptr", data=X.indptr.astype(np.int64))
+        g.create_dataset("shape", data=np.array(X.shape, dtype=np.int64))
+        g.create_dataset("barcodes", data=np.array([b"C1", b"C2", b"C3"]))
+        fg = g.create_group("features")
+        fg.create_dataset("id", data=np.array([b"G1", b"G2", b"chr1:1-2", b"chr1:5-9"]))
+        fg.create_dataset("name", data=np.array([b"G1", b"G2", b"chr1:1-2", b"chr1:5-9"]))
+        fg.create_dataset("feature_type", data=np.array(
+            [b"Gene Expression", b"Gene Expression", b"Peaks", b"Peaks"]))
+        fg.create_dataset("genome", data=np.array([b"test"] * 4))
+
+    for mods in ("both", "rna", "atac"):
+        ds = cytome.from_10x_h5(h5, tmp_path / f"{mods}.cytome",
+                                modalities=mods, force=True)
+        mods_on_file = set(ds.modalities)
+        ds.close()
+        if mods == "rna":
+            assert "ATAC" not in mods_on_file
+        elif mods == "atac":
+            assert "RNA" not in mods_on_file
+
+    with pytest.raises(ValueError, match="modalities must be"):
+        cytome.from_10x_h5(h5, tmp_path / "bad.cytome", modalities="nope", force=True)

@@ -410,13 +410,24 @@ def _read_10x_h5(path: str | Path):
 
 
 def from_10x_h5(path: str | Path, output: str | Path, sample_name: Optional[str] = None,
-                build_index: bool = True, force: bool = False):
+                build_index: bool = True, modalities: str = "both",
+                force: bool = False):
     """Create a Cytome dataset directly from a CellRanger ``.h5`` — no AnnData.
 
     Gene Expression features → RNA ``genes`` (``gene_id`` = Ensembl id, unique;
     ``symbol`` = gene name). Peak features (multiome) → ATAC ``peaks``. Duplicate
     ids are de-duplicated (``-1``/``-2``); duplicate symbols emit a warning.
+
+    Parameters
+    ----------
+    modalities : {"both", "rna", "atac"}, default "both"
+        Which feature types to keep from a multiome file. Matches
+        :func:`from_cellranger`. Single-modality files are unaffected.
     """
+    if modalities not in ("both", "rna", "atac"):
+        raise ValueError(
+            f"modalities must be 'both', 'rna' or 'atac', got {modalities!r}."
+        )
     from cytome.io.convert_anndata import make_unique_ids, warn_duplicate_symbols
 
     matrix, barcodes, ids, names, ftypes = _read_10x_h5(path)

@@ -57,7 +57,7 @@ __all__ = [
     "read_feature_columns",
     "modality_cell_depth",
 ]
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 
 def import_gtf(ds, gtf_path, **kwargs):
@@ -318,7 +318,8 @@ def from_cellranger(path, output: str | Path, sample_name=None,
 
 
 def from_10x_h5(path: str | Path, output: str | Path, sample_name: str | None = None,
-                build_index: bool = True, force: bool = False):
+                build_index: bool = True, modalities: str = "both",
+                force: bool = False):
     """Create a Cytome dataset directly from a CellRanger ``.h5`` (no AnnData).
 
     Gene Expression features → RNA ``genes`` (``gene_id`` = Ensembl id, ``symbol``
@@ -327,7 +328,7 @@ def from_10x_h5(path: str | Path, output: str | Path, sample_name: str | None = 
     """
     from cytome.io.convert_cellranger import from_10x_h5 as _impl
     return _impl(path=path, output=output, sample_name=sample_name,
-                 build_index=build_index, force=force)
+                 build_index=build_index, modalities=modalities, force=force)
 
 
 def from_cellranger_arc(
