@@ -1,3 +1,8 @@
+[![Stars](https://img.shields.io/github/stars/genecell/cytome?logo=GitHub&color=yellow)](https://github.com/genecell/cytome/stargazers)
+[![PyPI](https://img.shields.io/pypi/v/cytome?logo=PyPI)](https://pypi.org/project/cytome)
+[![Total downloads](https://static.pepy.tech/personalized-badge/cytome?period=total&units=international_system&left_color=black&right_color=orange&left_text=downloads)](https://pepy.tech/project/cytome)
+[![Monthly downloads](https://static.pepy.tech/personalized-badge/cytome?period=month&units=international_system&left_color=black&right_color=orange&left_text=downloads/month)](https://pepy.tech/project/cytome)
+
 # cytome
 
 **A single-file format for single-cell multi-omics data.**
@@ -7,6 +12,20 @@
 `cytome` stores expression matrices, cell metadata, genomic fragments, embeddings, graphs, and computational provenance in a single SQLite file. It opens from manifest metadata, supports SQL-style metadata filtering, and provides a tested CLI for conversion, merge, subset, export, and validation.
 
 `cytome` is part of the [PIASO](https://piaso.org) toolkit for single-cell analysis. PIASO natively supports cytome datasets for streaming single-cell ATAC-seq and RNA-seq workflows.
+
+## Contents
+
+- [Why cytome?](#why-cytome)
+- [Quick start](#quick-start)
+  - [Marker genes, straight off the file](#marker-genes-straight-off-the-file)
+  - [Coming from AnnData](#coming-from-anndata)
+- [Key features](#key-features)
+- [Installation](#installation)
+- [Usage examples](#usage-examples) — [AnnData](#convert-from-anndata) · [query](#open-and-query) · [merge](#merge-datasets) · [CLI](#command-line) · [ATAC fragments](#atac-fragments) · [PIASO](#with-piaso)
+- [File format](#file-format)
+- [Comparison with existing tools](#comparison-with-existing-tools)
+- [Citation](#citation)
+- [License](#license)
 
 ## Why cytome?
 
