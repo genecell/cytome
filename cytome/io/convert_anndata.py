@@ -7,6 +7,7 @@ import re
 import tempfile
 import warnings
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -147,8 +148,27 @@ def from_anndata(
     chunk_size: int | None = None,
     compression: str = "zstd",
     force: bool = False,
+    write_raw: bool = True,
+    write_layers: bool = True,
+    write_obsm: bool = True,
+    write_obsp: bool = True,
+    write_varm: bool = True,
+    write_varp: bool = True,
+    write_uns: bool = True,
+    skip_layers: Sequence[str] | None = None,
+    skip_obsm: Sequence[str] | None = None,
+    skip_obsp: Sequence[str] | None = None,
+    skip_varm: Sequence[str] | None = None,
+    skip_varp: Sequence[str] | None = None,
 ) -> CytomeDataset:
-    """Convert AnnData to Cytome dataset."""
+    """Convert AnnData to Cytome dataset.
+
+    The ``write_*`` / ``skip_*`` arguments mirror :func:`from_h5ad`, which
+    delegates here when ``backed=False``. They exist on both paths so that
+    asking for a counts-only conversion means the same thing either way:
+    before this, ``from_h5ad(..., backed=False, skip_layers=[...])`` accepted
+    the argument and wrote every layer anyway.
+    """
     del compression
     if output is None:
         handle = tempfile.NamedTemporaryFile(suffix=".cytome", delete=False)
@@ -219,16 +239,27 @@ def from_anndata(
     x_matrix_name = f"{modality}_counts" if "counts" not in adata.layers else f"{modality}_X"
     ds.add_matrix(x_matrix_name, matrix)
 
+    skip_layers_set = set(skip_layers or [])
+    skip_obsm_set = set(skip_obsm or [])
+    skip_obsp_set = set(skip_obsp or [])
+    skip_varm_set = set(skip_varm or [])
+    skip_varp_set = set(skip_varp or [])
+
     layer_map: dict[str, str] = {}
-    for layer_name, layer_mat in adata.layers.items():
-        cyt_name = f"{modality}_{layer_name}"
-        layer = layer_mat if sp.issparse(layer_mat) else sp.csr_matrix(np.asarray(layer_mat))
-        ds.add_matrix(cyt_name, layer)
-        layer_map[cyt_name] = str(layer_name)
+    if write_layers:
+        for layer_name, layer_mat in adata.layers.items():
+            if layer_name in skip_layers_set:
+                continue
+            cyt_name = f"{modality}_{layer_name}"
+            layer = layer_mat if sp.issparse(layer_mat) else sp.csr_matrix(np.asarray(layer_mat))
+            ds.add_matrix(cyt_name, layer)
+            layer_map[cyt_name] = str(layer_name)
 
     obsm_map: dict[str, str] = {}
     obsm_as_matrix: dict[str, str] = {}
-    for key, emb in adata.obsm.items():
+    for key, emb in (adata.obsm.items() if write_obsm else ()):
+        if key in skip_obsm_set:
+            continue
         cyt_key = f"{modality}_obsm_{key}"
         if sp.issparse(emb):
             if emb.shape[1] > 500:
@@ -244,7 +275,9 @@ def from_anndata(
         obsm_map[cyt_key] = str(key)
 
     varm_map: dict[str, str] = {}
-    for key, emb in adata.varm.items():
+    for key, emb in (adata.varm.items() if write_varm else ()):
+        if key in skip_varm_set:
+            continue
         cyt_key = f"{modality}_varm_{key}"
         if sp.issparse(emb):
             emb = emb.toarray()
@@ -254,18 +287,22 @@ def from_anndata(
         varm_map[cyt_key] = str(key)
 
     obsp_map: dict[str, str] = {}
-    for key, graph in adata.obsp.items():
+    for key, graph in (adata.obsp.items() if write_obsp else ()):
+        if key in skip_obsp_set:
+            continue
         cyt_key = f"{modality}_obsp_{key}"
         ds.add_graph(cyt_key, graph, axis="obs", entity_table="cells")
         obsp_map[cyt_key] = str(key)
 
     varp_map: dict[str, str] = {}
-    for key, graph in adata.varp.items():
+    for key, graph in (adata.varp.items() if write_varp else ()):
+        if key in skip_varp_set:
+            continue
         cyt_key = f"{modality}_varp_{key}"
         ds.add_var_graph(cyt_key, graph, entity_table=var_entity)
         varp_map[cyt_key] = str(key)
 
-    if adata.raw is not None:
+    if write_raw and adata.raw is not None:
         raw_name = f"{modality}_raw_X"
         raw_matrix = adata.raw.X if sp.issparse(adata.raw.X) else sp.csr_matrix(np.asarray(adata.raw.X))
         ds.add_matrix(raw_name, raw_matrix)
@@ -283,7 +320,7 @@ def from_anndata(
     ds.metadata["_anndata_obsp_map"] = obsp_map
     ds.metadata["_anndata_varp_map"] = varp_map
 
-    for key, value in adata.uns.items():
+    for key, value in (adata.uns.items() if write_uns else ()):
         try:
             ds.metadata[key] = value
         except TypeError:
@@ -400,7 +437,15 @@ def from_h5ad(
                 "Cytome's own .cytome format does not require it."
             ) from _e
         adata = anndata.read_h5ad(str(h5ad_path))
-        return from_anndata(adata, modality=modality, output=output, force=force)
+        return from_anndata(
+            adata, modality=modality, output=output, force=force,
+            write_raw=write_raw, write_layers=write_layers,
+            write_obsm=write_obsm, write_obsp=write_obsp,
+            write_varm=write_varm, write_varp=write_varp,
+            write_uns=write_uns,
+            skip_layers=skip_layers, skip_obsm=skip_obsm,
+            skip_obsp=skip_obsp, skip_varm=skip_varm, skip_varp=skip_varp,
+        )
 
     # === Backed (streaming) path — Round 10 rewrite ===
     import gc

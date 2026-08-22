@@ -376,6 +376,118 @@ def from_cellranger_arc(
     return ds
 
 
+def _read_10x_h5_meta(path: str | Path):
+    """Read everything except the matrix: barcodes, feature table, shape.
+
+    Cheap -- these are the small datasets. Separating them from the counts is
+    what lets the caller decide on modalities and masks *before* any of the
+    matrix is touched.
+    """
+    import h5py
+
+    def _dec(arr):
+        return [b.decode() if isinstance(b, (bytes, bytearray)) else str(b) for b in arr]
+
+    with h5py.File(str(path), "r") as f:
+        if "matrix" in f:                          # CellRanger >= 3.0
+            g = f["matrix"]
+            feat = g["features"]
+            ids = _dec(feat["id"][:])
+            names = _dec(feat["name"][:]) if "name" in feat else ids
+            ftypes = (_dec(feat["feature_type"][:]) if "feature_type" in feat
+                      else ["Gene Expression"] * len(ids))
+            group = "matrix"
+        else:                                      # CellRanger 2.x: genome group
+            group = next(iter(f.keys()))
+            g = f[group]
+            ids = _dec(g["genes"][:])
+            names = _dec(g["gene_names"][:]) if "gene_names" in g else ids
+            ftypes = ["Gene Expression"] * len(ids)
+        barcodes = _dec(g["barcodes"][:])
+        shape = tuple(int(x) for x in g["shape"][:])   # (n_features, n_cells)
+
+    return (barcodes, np.asarray(ids), np.asarray(names), np.asarray(ftypes),
+            shape, group)
+
+
+#: Non-zeros held per batch when the batch size is chosen automatically. At
+#: ~12 bytes per non-zero (int32 value + int64 column) and one further copy for
+#: the column selection, 8M non-zeros is a few hundred MB -- small enough for a
+#: laptop, large enough that the per-batch overhead does not dominate.
+_TARGET_NNZ_PER_BATCH = 8_000_000
+
+
+def _auto_batch_size(indptr: np.ndarray, n_cells: int) -> int:
+    """Choose a cell batch from the real density of *this* file.
+
+    Cells per batch is the wrong thing to fix: 5,000 RNA cells is a few hundred
+    MB, 5,000 multiome cells is well over a gigabyte, and the caller cannot know
+    which they have without opening the file. ``indptr`` is already read (it is
+    one number per cell) and gives the non-zero count exactly, so the batch can
+    be sized to a *memory* target instead and adapt on its own.
+    """
+    if n_cells == 0:
+        return 1
+    mean_nnz = max(1.0, float(indptr[n_cells] - indptr[0]) / n_cells)
+    return int(np.clip(_TARGET_NNZ_PER_BATCH / mean_nnz, 1, n_cells))
+
+
+def _iter_10x_h5_cell_chunks(path: str | Path, group: str, n_cells: int,
+                             n_features: int, batch_size: int | None):
+    """Yield ``(row_offset, csr_chunk)`` of shape ``(batch, n_features)``.
+
+    The transpose is free, and that is the whole trick. CellRanger stores the
+    matrix as CSC over ``(features, cells)``, so ``indptr`` is indexed by *cell*
+    and ``indices`` holds *feature* ids. Those exact three arrays are also a
+    valid CSR over ``(cells, features)`` -- same bytes, different reading. So:
+
+    * a batch of cells is a **contiguous** slice of ``data``/``indices``, which
+      is the one access pattern HDF5 is fast at, and
+    * no transpose is ever computed. The previous implementation materialised
+      the whole matrix and called ``.T.tocsr()``, which costs a second full copy
+      and is why peak memory reached ~18x the file size.
+
+    Memory is bounded by ``batch_size`` cells' worth of non-zeros.
+    """
+    import h5py
+
+    with h5py.File(str(path), "r") as f:
+        g = f[group]
+        indptr = g["indptr"][:]              # n_cells + 1, small
+        data_ds, indices_ds = g["data"], g["indices"]
+        if batch_size is None:
+            batch_size = _auto_batch_size(indptr, n_cells)
+
+        for start in range(0, n_cells, batch_size):
+            stop = min(start + batch_size, n_cells)
+            lo, hi = int(indptr[start]), int(indptr[stop])
+            if hi == lo:                     # batch is entirely empty
+                yield start, sp.csr_matrix((stop - start, n_features),
+                                           dtype=data_ds.dtype)
+                continue
+            chunk = sp.csr_matrix(
+                (data_ds[lo:hi], indices_ds[lo:hi], indptr[start:stop + 1] - lo),
+                shape=(stop - start, n_features),
+            )
+            yield start, chunk
+
+
+def _select_columns(chunk: sp.csr_matrix, remap: np.ndarray, n_out: int):
+    """Keep the columns of a CSR chunk that ``remap`` assigns a new index.
+
+    ``remap[j]`` is the output column for input column *j*, or -1 to drop it.
+    Done on the arrays rather than via ``chunk[:, mask]`` so the intermediate
+    is never built: the new ``indptr`` falls out of a cumulative sum of the
+    keep-mask, indexed by the old ``indptr``.
+    """
+    keep = remap[chunk.indices] >= 0
+    new_indptr = np.concatenate(([0], np.cumsum(keep)))[chunk.indptr]
+    return sp.csr_matrix(
+        (chunk.data[keep], remap[chunk.indices[keep]], new_indptr),
+        shape=(chunk.shape[0], n_out),
+    )
+
+
 def _read_10x_h5(path: str | Path):
     """Parse a CellRanger ``.h5`` (v2 or v3) with h5py — no AnnData.
 
@@ -413,18 +525,27 @@ def _read_10x_h5(path: str | Path):
 
 def from_10x_h5(path: str | Path, output: str | Path, sample_name: Optional[str] = None,
                 build_index: bool = True, modalities: str = "both",
-                force: bool = False):
+                force: bool = False, batch_size: Optional[int] = None):
     """Create a Cytome dataset directly from a CellRanger ``.h5`` — no AnnData.
 
     Gene Expression features → RNA ``genes`` (``gene_id`` = Ensembl id, unique;
     ``symbol`` = gene name). Peak features (multiome) → ATAC ``peaks``. Duplicate
     ids are de-duplicated (``-1``/``-2``); duplicate symbols emit a warning.
 
+    The matrix is read and written in cell batches, so peak memory is set by
+    *batch_size* rather than by the size of the file.
+
     Parameters
     ----------
     modalities : {"both", "rna", "atac"}, default "both"
         Which feature types to keep from a multiome file. Matches
         :func:`from_cellranger`. Single-modality files are unaffected.
+    batch_size : int, optional
+        Cells per batch. By default this is chosen from the file's own density
+        so that each batch holds roughly a fixed number of non-zeros — a dense
+        multiome gets small batches and a sparse RNA matrix gets large ones,
+        without the caller having to know which they have. Pass an integer to
+        override.
     """
     if modalities not in ("both", "rna", "atac"):
         raise ValueError(
@@ -432,7 +553,8 @@ def from_10x_h5(path: str | Path, output: str | Path, sample_name: Optional[str]
         )
     from cytome.io.convert_anndata import make_unique_ids, warn_duplicate_symbols
 
-    matrix, barcodes, ids, names, ftypes = _read_10x_h5(path)
+    barcodes, ids, names, ftypes, shape, group = _read_10x_h5_meta(path)
+    n_features, n_cells = shape
 
     ds = cytome.create(output, force=force)
     cells_df = pd.DataFrame({"barcode": barcodes})
@@ -452,19 +574,43 @@ def from_10x_h5(path: str | Path, output: str | Path, sample_name: Optional[str]
 
     if gene_mask.any():
         warn_duplicate_symbols(names[gene_mask])
-        genes_df = pd.DataFrame({
+        ds.set_entity("genes", pd.DataFrame({
             "gene_id": make_unique_ids(ids[gene_mask]),
             "symbol": names[gene_mask],
-        })
-        ds.set_entity("genes", genes_df)
-        ds.add_matrix("RNA_counts", matrix[gene_mask, :].T.tocsr())
+        }))
 
+    peaks_df = None
     if peak_mask.any():
         peaks_df = _peaks_from_feature_ids(ids[peak_mask])
         if peaks_df is None:
             peaks_df = pd.DataFrame({"peak_id": make_unique_ids(ids[peak_mask])})
         ds.set_entity("peaks", peaks_df)
-        ds.add_matrix("ATAC_counts", matrix[peak_mask, :].T.tocsr())
+
+    # One pass over the file, writing every requested modality as it goes: the
+    # counts are never held whole, so peak memory is set by `batch_size` rather
+    # than by the size of the matrix.
+    targets = []
+    for mask, layer in ((gene_mask, "RNA_counts"), (peak_mask, "ATAC_counts")):
+        if not mask.any():
+            continue
+        remap = np.full(n_features, -1, dtype=np.int64)
+        remap[np.flatnonzero(mask)] = np.arange(int(mask.sum()))
+        targets.append((
+            remap,
+            int(mask.sum()),
+            ds.create_layer_writer(layer, n_rows=n_cells, n_cols=int(mask.sum()),
+                                   dtype=np.int32),
+        ))
+
+    if targets:
+        for offset, chunk in _iter_10x_h5_cell_chunks(
+                path, group, n_cells, n_features, batch_size):
+            for remap, n_out, writer in targets:
+                writer.write_chunk(_select_columns(chunk, remap, n_out), offset)
+        for _, _, writer in targets:
+            writer.finalize()
+
+    if peaks_df is not None:
         ds.flush()
         if build_index:
             build_peak_index(ds._conn)

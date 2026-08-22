@@ -138,6 +138,16 @@ class EntityTable:
 
 
 def _numpy_to_sqlite_type(dtype: np.dtype) -> str:
+    # bool BEFORE integer: np.issubdtype(np.bool_, np.integer) is False, so a
+    # boolean column used to fall through to TEXT and store '1'/'0'. Read back
+    # that is a <U1 array, and a non-empty string is truthy, so
+    # `col.astype(bool)` returned ALL TRUE -- which silently turned
+    # highly_variable into "every gene" on any file where INFOG happened to
+    # create the column. Which files were affected depended on write order,
+    # because ALTER TABLE ADD COLUMN only fires when the column is absent, so
+    # whichever writer got there first fixed the type.
+    if np.issubdtype(dtype, np.bool_):
+        return "INTEGER"
     if np.issubdtype(dtype, np.integer):
         return "INTEGER"
     if np.issubdtype(dtype, np.floating):

@@ -154,11 +154,30 @@ def close_database(conn: sqlite3.Connection) -> None:
     conn.close()
 
 
+def _package_version() -> str:
+    """The installed cytome version, without importing the package at module
+    import time (sqlite_engine is imported from cytome/__init__)."""
+    try:
+        from importlib.metadata import version
+        return version("cytome")
+    except Exception:
+        pass
+    try:
+        import cytome
+        return getattr(cytome, "__version__", "unknown")
+    except Exception:
+        return "unknown"
+
+
 def _init_manifest(conn: sqlite3.Connection, dataset_name: str) -> None:
     manifest = {
         "format_version": "1.0.0",
         "min_reader_version": "1.0.0",
-        "writer_version": "cytome 0.1.0",
+        # Read the real version rather than a literal. This said "cytome
+        # 0.1.0" for every file the package has ever written, including ones
+        # written by 0.2.4, so the manifest could not be used to answer "which
+        # version produced this" -- the one question it exists to answer.
+        "writer_version": f"cytome {_package_version()}",
         "created_at": _now_iso(),
         "dataset_name": dataset_name,
         "modalities": [],

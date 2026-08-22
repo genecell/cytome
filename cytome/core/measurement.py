@@ -62,9 +62,14 @@ class MeasurementLayer:
         """
         return read_sparse_rows(self._conn, self._matrix_name, indices)
 
-    def iter_rows(self) -> Iterator[Tuple[int, int, sp.csr_matrix]]:
-        """Iterate row chunks as CSR matrices."""
-        yield from read_sparse_rows_iter(self._conn, self._matrix_name)
+    def iter_rows(self, row_filter=None) -> Iterator[Tuple[int, int, sp.csr_matrix]]:
+        """Iterate row chunks as CSR matrices.
+
+        ``row_filter``: sorted global row indices to keep. Chunks containing
+        none of them are skipped without being fetched or decompressed.
+        """
+        yield from read_sparse_rows_iter(self._conn, self._matrix_name,
+                                         row_filter=row_filter)
 
     def column(self, idx: int) -> sp.csr_matrix:
         """Read one feature column across all rows."""

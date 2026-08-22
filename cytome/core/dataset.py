@@ -538,6 +538,7 @@ class CytomeDataset:
         ndarray: np.ndarray,
         provenance: dict[str, Any] | None = None,
         flush: bool = True,
+        dtype: "np.dtype | str | None" = None,
     ) -> None:
         """Add a dense cell embedding (e.g. ``X_umap``, ``X_gdr``).
 
@@ -545,9 +546,16 @@ class CytomeDataset:
         expectation. Pass ``flush=False`` to batch several writes and call
         :meth:`flush` once at the end (cheaper when adding many at once).
         """
+        arr = np.asarray(ndarray)
+        # An embedding written here was float64 while the same embedding
+        # converted from an h5ad was float32, in the same file. `dtype` lets a
+        # caller state the width; None keeps whatever the array already has,
+        # so a conversion stays lossless.
+        if dtype is not None:
+            arr = arr.astype(np.dtype(dtype), copy=False)
         self._pending_writes[f"embedding:{name}"] = {
             "name": name,
-            "array": np.asarray(ndarray),
+            "array": arr,
             "entity": "cells",
             "provenance": provenance,
         }
@@ -882,7 +890,10 @@ class CytomeDataset:
             skipped entirely.  This prevents IndexError when
             ``matrix_meta.n_rows`` exceeds the entity table count.
         """
-        for row_start, row_end, chunk_csr in ml.iter_rows():
+        # Pass the wanted rows down so chunks holding none of them are never
+        # fetched. Filtering after iter_rows() meant every chunk was
+        # decompressed and then thrown away.
+        for row_start, row_end, chunk_csr in ml.iter_rows(row_filter=keep_idx):
             # Cap at entity count if provided
             if entity_count is not None:
                 if row_start >= entity_count:
@@ -1363,6 +1374,43 @@ class CytomeDataset:
 
         return downsample(self, n_cells=n_cells, fraction=fraction, **kwargs)
 
+    def checkpoint(self, mode: str = "TRUNCATE") -> None:
+        """Fold the write-ahead log back into the ``.cytome`` file.
+
+        A cytome is three files: ``x.cytome``, ``x.cytome-wal`` and
+        ``x.cytome-shm``. ``flush()`` COMMITS, which in WAL mode writes to the
+        ``-wal``, not to the main database. So anything committed but not yet
+        checkpointed lives only in the sidecar, and a plain file copy of the
+        ``.cytome`` alone silently leaves it behind.
+
+        Call this before copying the file with an external tool (``cp``,
+        ``rsync``, an upload), or use :meth:`copy` / :meth:`backup`, which no
+        longer need it.
+        """
+        self.flush()
+        self._conn.commit()
+        self._conn.execute(f"PRAGMA wal_checkpoint({mode})")
+
+    def _snapshot_to(self, out: "Path") -> None:
+        """Write a consistent copy of this database to ``out``.
+
+        Uses SQLite's online backup API rather than copying the file. Copying
+        the ``.cytome`` alone loses every committed-but-not-checkpointed page,
+        with no error: measured on a live dataset, ``copy()`` dropped an
+        embedding and ``backup()`` produced a file with no ``embedding_meta``
+        table at all. The backup API reads through the WAL and is safe on a
+        database that is still open.
+        """
+        import sqlite3
+        self.flush()
+        self._conn.commit()
+        dest = sqlite3.connect(str(out))
+        try:
+            self._conn.backup(dest)
+            dest.commit()
+        finally:
+            dest.close()
+
     def copy(self, output, force: bool = False):
         """Copy the full dataset to ``output`` and return a handle to the copy.
 
@@ -1374,8 +1422,7 @@ class CytomeDataset:
         if out.exists() and not force:
             raise FileExistsError(
                 f"{out} already exists; pass force=True to overwrite.")
-        self.flush()
-        shutil.copy2(self.path, out)
+        self._snapshot_to(out)
         return CytomeDataset(out, mode="r")
 
     def backup(self, output, force: bool = False):
@@ -1390,8 +1437,7 @@ class CytomeDataset:
         if out.exists() and not force:
             raise FileExistsError(
                 f"{out} already exists; pass force=True to overwrite.")
-        self.flush()
-        shutil.copy2(self.path, out)
+        self._snapshot_to(out)
         return out
 
     def to_pytorch(
@@ -1625,6 +1671,30 @@ class CytomeDataset:
             compression="zstd",
             entity=payload.get("entity", "cells"),
         )
+
+        # add_embedding has always taken a `provenance` dict and embedding_meta
+        # has always had a provenance_id column, and nothing connected them:
+        # every embedding written through here had provenance_id NULL, so the
+        # file could not answer "which modality / function produced this".
+        prov = payload.get("provenance")
+        if prov:
+            try:
+                pid = self.provenance.log(
+                    operation="embedding",
+                    function_name=str(prov.get("function", "add_embedding")),
+                    parameters={k: v for k, v in prov.items() if k != "function"},
+                    package_name=str(prov.get("package", "cytome")),
+                    package_version=str(prov.get("package_version", "unknown")),
+                    input_objects=list(prov.get("input_objects", [])),
+                    output_objects=[payload["name"]],
+                )
+                self._conn.execute(
+                    "UPDATE embedding_meta SET provenance_id = ? WHERE array_name = ?",
+                    (pid, payload["name"]),
+                )
+            except Exception as exc:      # provenance must never lose the data
+                logger.warning("could not record provenance for embedding %s: %s",
+                               payload["name"], exc)
 
     def _write_entity_table(self, table_name: str, frame: pd.DataFrame) -> None:
         key_col = _primary_key_for_table(table_name)

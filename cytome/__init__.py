@@ -57,7 +57,7 @@ __all__ = [
     "read_feature_columns",
     "modality_cell_depth",
 ]
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 
 
 def import_gtf(ds, gtf_path, **kwargs):
@@ -319,16 +319,21 @@ def from_cellranger(path, output: str | Path, sample_name=None,
 
 def from_10x_h5(path: str | Path, output: str | Path, sample_name: str | None = None,
                 build_index: bool = True, modalities: str = "both",
-                force: bool = False):
+                force: bool = False, batch_size: int | None = None):
     """Create a Cytome dataset directly from a CellRanger ``.h5`` (no AnnData).
 
     Gene Expression features → RNA ``genes`` (``gene_id`` = Ensembl id, ``symbol``
     = name); Peak features (multiome) → ATAC ``peaks``. Handles CellRanger v2/v3.
     ``force=False`` (default) raises if ``output`` exists; ``force=True`` overwrites.
+
+    The matrix is read in cell batches; ``batch_size`` defaults to a size chosen
+    from the file's own density. See
+    :func:`cytome.io.convert_cellranger.from_10x_h5`.
     """
     from cytome.io.convert_cellranger import from_10x_h5 as _impl
     return _impl(path=path, output=output, sample_name=sample_name,
-                 build_index=build_index, modalities=modalities, force=force)
+                 build_index=build_index, modalities=modalities, force=force,
+                 batch_size=batch_size)
 
 
 def from_cellranger_arc(
