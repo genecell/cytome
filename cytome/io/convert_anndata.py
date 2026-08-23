@@ -141,6 +141,64 @@ def _check_atac_var_has_peak_coords(var: pd.DataFrame) -> None:
     )
 
 
+
+def _write_uns_spatial(ds, spatial: dict) -> None:
+    """Write a scanpy ``uns['spatial']`` dict into the spatial-image tables."""
+    import warnings
+
+    for lib, entry in spatial.items():
+        if not isinstance(entry, dict):
+            warnings.warn(f"uns['spatial'][{lib!r}] is not a dict; dropped")
+            continue
+        images = entry.get("images", {}) or {}
+        sfs = entry.get("scalefactors", {}) or {}
+        numeric_sfs = {k: float(v) for k, v in sfs.items()
+                       if isinstance(v, (int, float, np.integer, np.floating))}
+        dropped = [k for k in entry if k not in ("images", "scalefactors")]
+        dropped += [k for k in sfs if k not in numeric_sfs]
+        if dropped:
+            warnings.warn(
+                f"uns['spatial'][{lib!r}]: dropped non-convention keys "
+                f"{sorted(dropped)} (only images + numeric scalefactors are "
+                f"stored)")
+        first = True
+        for key, img in images.items():
+            ds.add_spatial_image(str(lib), str(key), np.asarray(img),
+                                 scalefactors=numeric_sfs if first else None,
+                                 replace=True)
+            first = False
+        if first and numeric_sfs:
+            # scalefactors but no images: keep them anyway
+            from ..core.spatial import _ensure_tables
+            _ensure_tables(ds._conn)
+            for k, v in numeric_sfs.items():
+                ds._conn.execute(
+                    "INSERT OR REPLACE INTO spatial_scalefactors "
+                    "(library_id, key, value) VALUES (?,?,?)",
+                    (str(lib), k, v))
+
+
+def _embedding_name(modality: str, obsm_key: str, existing=None) -> str:
+    """The stored name for an ``obsm`` array: ``{modality}_{key}`` with the
+    scanpy ``X_`` prefix dropped — ``RNA_umap``, ``RNA_spatial``, ``RNA_pca``,
+    ``ATAC_umap`` — because the ``obsm``/``X_`` tokens are AnnData plumbing,
+    not information. The exact original key is preserved in
+    ``_anndata_obsm_map``, so ``to_anndata`` restores ``obsm`` verbatim
+    regardless of the stored name; readers of files written by earlier
+    versions still see the old ``{modality}_obsm_{key}`` names, which the
+    basis resolvers already match.
+
+    ``existing``: names already taken this conversion — on the (rare)
+    collision like ``X_umap`` + ``umap`` both present, the later key keeps
+    its full form instead of overwriting.
+    """
+    short = obsm_key[2:] if obsm_key.startswith("X_") else obsm_key
+    name = f"{modality}_{short}"
+    if existing is not None and name in existing:
+        name = f"{modality}_{obsm_key}"
+    return name
+
+
 def from_anndata(
     adata,
     modality: str = "RNA",
@@ -260,7 +318,8 @@ def from_anndata(
     for key, emb in (adata.obsm.items() if write_obsm else ()):
         if key in skip_obsm_set:
             continue
-        cyt_key = f"{modality}_obsm_{key}"
+        cyt_key = _embedding_name(modality, key,
+                                   existing=set(obsm_map) | set(obsm_as_matrix))
         if sp.issparse(emb):
             if emb.shape[1] > 500:
                 # Large sparse obsm (e.g. gene activity) — store as matrix
@@ -320,7 +379,22 @@ def from_anndata(
     ds.metadata["_anndata_obsp_map"] = obsp_map
     ds.metadata["_anndata_varp_map"] = varp_map
 
+    if "spatial" in getattr(adata, "obsm", {}):
+        # keep the queryable index in sync with the embedding it mirrors
+        try:
+            ds.set_spatial_coords(np.asarray(adata.obsm["spatial"]))
+        except Exception as _e:      # pragma: no cover - index is best-effort
+            import warnings as _w
+            _w.warn(f"spatial coordinate index not built: {_e}")
+
     for key, value in (adata.uns.items() if write_uns else ()):
+        if key == "spatial" and isinstance(value, dict):
+            # Visium-convention images + scalefactors go to the spatial tables
+            # (image arrays are not JSON and previously vanished in the
+            # TypeError fallback below). Non-convention entries under a
+            # library are named, never silently dropped.
+            _write_uns_spatial(ds, value)
+            continue
         try:
             ds.metadata[key] = value
         except TypeError:
@@ -573,7 +647,8 @@ def from_h5ad(
                         print(f"  [skip] obsm/{k}")
                     continue
                 arr = read_elem(f["obsm"][k])
-                cyt_key = f"{modality}_obsm_{k}"
+                cyt_key = _embedding_name(
+                    modality, k, existing=set(obsm_map) | set(obsm_as_matrix))
                 if sp.issparse(arr):
                     if arr.shape[1] > 500:
                         mat = arr.tocsr() if not sp.isspmatrix_csr(arr) else arr
@@ -1039,6 +1114,10 @@ def to_anndata(
             continue
         adata.uns[key] = value
 
+    _spatial_uns = ds.spatial_images.as_uns() if hasattr(ds, "spatial_images") else {}
+    if _spatial_uns:
+        adata.uns["spatial"] = _spatial_uns
+
     raw_info = _metadata_get(ds, "_anndata_raw", default=None)
     if isinstance(raw_info, dict):
         matrix_name = raw_info.get("matrix_name")
@@ -1058,8 +1137,10 @@ def update_from_anndata(ds: CytomeDataset, adata, modality: str = "RNA") -> None
     ds.set_entity("cells", obs.reset_index(drop=True))
     _store_column_meta(ds._conn, "cells", obs.reset_index(drop=True))
 
+    _taken: set = set()
     for key, emb in adata.obsm.items():
-        cyt_key = f"{modality}_obsm_{key}"
+        cyt_key = _embedding_name(modality, key, existing=_taken)
+        _taken.add(cyt_key)
         ds.add_embedding(cyt_key, np.asarray(emb))
     for key, layer in adata.layers.items():
         mat = layer if sp.issparse(layer) else sp.csr_matrix(np.asarray(layer))

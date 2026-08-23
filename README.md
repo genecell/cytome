@@ -224,7 +224,7 @@ Trade-offs in the current implementation:
 
 ## Citation
 
-If you use `cytome`, please cite the upcoming manuscript.
+If you use `cytome`, please cite this repository (a citation entry will be added here when available).
 
 ## License
 

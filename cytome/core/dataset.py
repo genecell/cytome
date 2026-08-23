@@ -263,6 +263,43 @@ class CytomeDataset:
         return _EmbeddingAccessor(self._conn, entity="genes")
 
     @property
+    def spatial_images(self):
+        """Stored tissue images + scale factors (see cytome.core.spatial)."""
+        from .spatial import _SpatialImageAccessor
+        return _SpatialImageAccessor(self._conn)
+
+    def add_spatial_image(self, library_id: str, img_key: str, image,
+                          scalefactors=None, replace: bool = False) -> None:
+        """Store a registered tissue image (ndarray, exact) or an image FILE
+        (png/jpeg/tiff path, bytes kept verbatim) with its scale factors.
+        Scalefactors upsert per key. See ``cytome/core/spatial.py``."""
+        from .spatial import add_spatial_image as _add
+        _add(self._conn, library_id, img_key, image,
+             scalefactors=scalefactors, replace=replace)
+
+    def delete_spatial_image(self, library_id: str, img_key: str) -> None:
+        from .spatial import delete_spatial_image as _del
+        _del(self._conn, library_id, img_key)
+
+    def set_spatial_coords(self, coords, cell_idx=None) -> None:
+        """Index per-cell spatial coordinates (full-res pixel units) in the
+        schema's ``spatial_coords`` table + R*-tree, enabling
+        :meth:`cells_in_region`. The ``spatial`` embedding remains the array
+        analysis/plotting consume; this is its queryable index."""
+        # entity writes are buffered until flush(); the FK on cell_idx needs
+        # the cells rows on disk first
+        self.flush()
+        from .spatial import set_spatial_coords as _set
+        _set(self._conn, coords, cell_idx=cell_idx)
+
+    def cells_in_region(self, x, y):
+        """Cell indices whose spatial coordinates fall in the rectangle
+        ``x=(x0,x1), y=(y0,y1)`` — indexed R*-tree lookup; pairs with
+        ``spatial_images.crop(...)`` for image-plus-cells ROI work."""
+        from .spatial import cells_in_region as _q
+        return _q(self._conn, x, y)
+
+    @property
     def graphs(self) -> _GraphAccessor:
         return _GraphAccessor(self._conn, axis="obs", entity="cells")
 

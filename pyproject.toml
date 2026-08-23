@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cytome"
-version = "0.2.5"
+version = "0.2.6"
 description = "Single-file multi-omics data format for single-cell biology"
 readme = "README.md"
 requires-python = ">=3.9"
