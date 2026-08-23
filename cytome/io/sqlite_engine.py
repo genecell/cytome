@@ -155,16 +155,25 @@ def close_database(conn: sqlite3.Connection) -> None:
 
 
 def _package_version() -> str:
-    """The installed cytome version, without importing the package at module
-    import time (sqlite_engine is imported from cytome/__init__)."""
+    """The version of the code that is running, resolved lazily (sqlite_engine
+    is imported from cytome/__init__, so this cannot import at module level).
+
+    Deliberately ``cytome.__version__`` and not the installed distribution
+    metadata: a checkout on PYTHONPATH beside a stale editable install would
+    report the installed version and stamp every manifest with a version that
+    did not write the file -- the exact claim ``writer_version`` exists to
+    make. Metadata is only a fallback for the pathological case where the
+    attribute is missing."""
     try:
-        from importlib.metadata import version
-        return version("cytome")
+        import cytome
+        v = getattr(cytome, "__version__", None)
+        if v:
+            return v
     except Exception:
         pass
     try:
-        import cytome
-        return getattr(cytome, "__version__", "unknown")
+        from importlib.metadata import version
+        return version("cytome")
     except Exception:
         return "unknown"
 

@@ -57,7 +57,15 @@ __all__ = [
     "read_feature_columns",
     "modality_cell_depth",
 ]
-__version__ = "0.2.5"
+# The one place the version is written. pyproject.toml declares the version
+# dynamic and reads this attribute, so a release bump here reaches the built
+# distribution too -- the 0.2.5/0.2.6 skew that reached CI came from bumping
+# pyproject alone while this file kept a literal of its own.
+#
+# The manifest's writer_version reads THIS, not the installed distribution
+# metadata: a source tree run against a stale editable install would otherwise
+# stamp files with the version of code that did not write them.
+__version__ = "0.2.6"
 
 
 def import_gtf(ds, gtf_path, **kwargs):
