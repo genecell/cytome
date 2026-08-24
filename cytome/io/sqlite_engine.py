@@ -375,7 +375,13 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             csc_chunk_size INTEGER,
             csc_n_chunks INTEGER,
             created_at TEXT,
-            provenance_id INTEGER REFERENCES _provenance(id)
+            provenance_id INTEGER REFERENCES _provenance(id),
+            -- Whether the stored values are integers, decided once by the
+            -- writer. Consumers otherwise re-derive it from a sample, and
+            -- COSG's first attempt at that was dead code that always answered
+            -- "cannot tell" while looking correct. NULL = written before this
+            -- column existed; probe those.
+            is_integer INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS dense_chunks (
@@ -552,6 +558,14 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             "ALTER TABLE _exon_annotation "
             "ADD COLUMN transcript_type TEXT"
         )
+
+    # cytome 0.3.0 migration -- matrix_meta.is_integer. Older files leave it
+    # NULL, which means "unknown, probe if you care" rather than "not
+    # integer": the distinction matters because a consumer that reads NULL as
+    # False would refuse to normalise a perfectly good counts matrix.
+    _mm_cols = [r[1] for r in conn.execute("PRAGMA table_info(matrix_meta)")]
+    if _mm_cols and "is_integer" not in _mm_cols:
+        conn.execute("ALTER TABLE matrix_meta ADD COLUMN is_integer INTEGER")
 
     # NOTE: the narrowPeak / PICCO stat columns (summit, score, signal,
     # neg_log10_pvalue, neg_log10_qvalue) are part of the `peaks` CREATE TABLE

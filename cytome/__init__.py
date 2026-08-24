@@ -65,7 +65,7 @@ __all__ = [
 # The manifest's writer_version reads THIS, not the installed distribution
 # metadata: a source tree run against a stale editable install would otherwise
 # stamp files with the version of code that did not write them.
-__version__ = "0.2.6"
+__version__ = "0.3.0"
 
 
 def import_gtf(ds, gtf_path, **kwargs):
@@ -89,7 +89,8 @@ def create(path: str | Path, force: bool = False) -> CytomeDataset:
 
 
 def from_anndata(adata, modality: str = "RNA", output: str | Path | None = None,
-                 force: bool = False) -> CytomeDataset:
+                 force: bool = False, counts_layer: str | None = None,
+                 main_layer_name: str | None = None) -> CytomeDataset:
     """Create a Cytome dataset from an in-memory AnnData object.
 
     Use this when you already have an ``AnnData`` instance (e.g. just
@@ -133,7 +134,8 @@ def from_anndata(adata, modality: str = "RNA", output: str | Path | None = None,
         :class:`FileExistsError`; ``force=True`` overwrites.
     """
     from cytome.io.convert_anndata import from_anndata as _impl
-    return _impl(adata=adata, modality=modality, output=output, force=force)
+    return _impl(adata=adata, modality=modality, output=output, force=force,
+                 counts_layer=counts_layer, main_layer_name=main_layer_name)
 
 
 def from_h5ad(

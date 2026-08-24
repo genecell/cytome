@@ -199,10 +199,61 @@ def _embedding_name(modality: str, obsm_key: str, existing=None) -> str:
     return name
 
 
+_MAIN_LAYER_FALLBACK = "data"
+
+
+def _values_are_integer(matrix, n_probe: int = 20000) -> bool:
+    """Whether a sparse/dense matrix holds integer values.
+
+    Samples at most ``n_probe`` stored values: a normalized matrix has
+    non-integers within the first few thousand.
+    """
+    data = getattr(matrix, "data", None)
+    if data is None:
+        data = np.asarray(matrix).ravel()
+    data = np.asarray(data[:n_probe])
+    if data.size == 0:
+        return True                      # an all-zero matrix is integer
+    if np.issubdtype(data.dtype, np.integer):
+        return True
+    return bool(np.allclose(data, np.round(data)))
+
+
+def _resolve_main_matrix_name(modality, x_is_integer, counts_layer,
+                              main_layer_name, stacklevel=3) -> str:
+    """Name the matrix that ``adata.X`` becomes.
+
+    The invariant this exists to hold: **``{modality}_counts`` holds raw
+    integer counts, or it does not exist.** Before 0.3.0 ``adata.X`` went to
+    ``{modality}_counts`` whatever it contained, so a normalized matrix was
+    stored under a name every downstream default reads as counts -- which is
+    how ``run_cosg_cytome(layer='auto')`` came to log-normalize an already
+    log-normalized matrix.
+    """
+    if main_layer_name is not None:
+        return f"{modality}_{main_layer_name}"
+    if counts_layer is not None:
+        # the raw counts are going to {modality}_counts, so X is something else
+        return f"{modality}_{_MAIN_LAYER_FALLBACK}"
+    if x_is_integer:
+        return f"{modality}_counts"
+    warnings.warn(
+        f"adata.X does not hold integer counts, so it is stored as "
+        f"'{modality}_{_MAIN_LAYER_FALLBACK}' rather than "
+        f"'{modality}_counts' -- which downstream defaults read as raw "
+        f"counts. Pass main_layer_name= to name it yourself, or "
+        f"counts_layer= to say which layer holds the raw counts.",
+        UserWarning, stacklevel=stacklevel,
+    )
+    return f"{modality}_{_MAIN_LAYER_FALLBACK}"
+
+
 def from_anndata(
     adata,
     modality: str = "RNA",
     output: str | Path | None = None,
+    counts_layer: str | None = None,
+    main_layer_name: str | None = None,
     chunk_size: int | None = None,
     compression: str = "zstd",
     force: bool = False,
@@ -294,10 +345,43 @@ def from_anndata(
     _store_column_meta(ds._conn, var_entity, var)
 
     matrix = adata.X if sp.issparse(adata.X) else sp.csr_matrix(np.asarray(adata.X))
-    x_matrix_name = f"{modality}_counts" if "counts" not in adata.layers else f"{modality}_X"
+
+    # `counts_layer` asserts where the raw counts are. Verify the assertion --
+    # storing a normalized matrix under `{modality}_counts` is the whole bug
+    # this release exists to close, and a caller who names the wrong layer
+    # would reintroduce it by hand.
+    if counts_layer is not None:
+        if counts_layer not in adata.layers:
+            raise KeyError(
+                f"counts_layer={counts_layer!r} is not in adata.layers; "
+                f"available: {sorted(adata.layers)}")
+        _cl = adata.layers[counts_layer]
+        _cl = _cl if sp.issparse(_cl) else sp.csr_matrix(np.asarray(_cl))
+        if not _values_are_integer(_cl):
+            raise ValueError(
+                f"counts_layer={counts_layer!r} does not hold integer values, "
+                f"so it is not raw counts. cytome stores raw counts as "
+                f"'{modality}_counts' and every downstream default reads that "
+                f"name as counts. Pass the layer that holds UMIs, or omit "
+                f"counts_layer and name the matrix with main_layer_name=.")
+        ds.add_matrix(f"{modality}_counts", _cl)
+
+    x_matrix_name = _resolve_main_matrix_name(
+        modality, _values_are_integer(matrix), counts_layer, main_layer_name)
     ds.add_matrix(x_matrix_name, matrix)
 
+    # A layer promoted to `{modality}_counts` must not also be written under
+    # its own name: it is the same matrix, and storing it twice doubles the
+    # file for nothing. The promoted name is the canonical one.
     skip_layers_set = set(skip_layers or [])
+    if counts_layer is not None:
+        skip_layers_set.add(counts_layer)
+    if counts_layer is not None:
+        # already written as `{modality}_counts`; writing it again under its
+        # AnnData name would store one matrix twice and recreate exactly the
+        # near-identical pair this release exists to remove (RNA_count beside
+        # RNA_counts, one letter apart).
+        skip_layers_set.add(counts_layer)
     skip_obsm_set = set(skip_obsm or [])
     skip_obsp_set = set(skip_obsp or [])
     skip_varm_set = set(skip_varm or [])
@@ -414,10 +498,30 @@ def from_anndata(
     return ds
 
 
+def _h5_values_are_integer(grp, n_probe: int = 20000) -> bool:
+    """Whether an h5ad matrix group holds integer values.
+
+    Reads at most ``n_probe`` stored values with an h5py slice, so the streaming
+    path can hold the same naming invariant as the in-memory one without giving
+    up streaming to do it.
+    """
+    try:
+        data = grp["data"] if hasattr(grp, "keys") and "data" in grp else grp
+        a = np.asarray(data[:n_probe], dtype="float64")
+        if a.size == 0:
+            return True
+        a = a[np.isfinite(a)]
+        return bool(a.size == 0 or np.allclose(a, np.round(a)))
+    except Exception:
+        return True          # cannot tell -> keep the historical name
+
+
 def from_h5ad(
     h5ad_path: str | Path,
     output: str | Path,
     modality: str = "RNA",
+    counts_layer: str | None = None,
+    main_layer_name: str | None = None,
     backed: bool = False,
     chunk_size: int = 2048,
     storage_chunk_size: int = 128,
@@ -591,7 +695,12 @@ def from_h5ad(
                   f"{n_vars:,} {var_entity}). Streaming matrices...")
 
         # --- 2. X — stream via cytome's create_layer_writer ---
-        x_matrix_name = f"{modality}_counts"
+        # Same invariant as from_anndata: {modality}_counts holds raw integer
+        # counts or does not exist. Probed with an h5py slice so streaming is
+        # preserved.
+        x_matrix_name = _resolve_main_matrix_name(
+            modality, _h5_values_are_integer(f["X"]),
+            counts_layer, main_layer_name, stacklevel=4)
         _stream_h5_csr_to_writer(
             ds, f["X"], matrix_name=x_matrix_name,
             chunk_size=chunk_size, storage_chunk_size=storage_chunk_size,
@@ -839,6 +948,7 @@ def _emit_backed_inventory(
     f, modality, *, write_raw, write_layers, write_obsm, write_obsp,
     write_varm, write_varp, write_uns,
     skip_layers, skip_obsm, skip_obsp, skip_varm, skip_varp,
+    counts_layer=None, main_layer_name=None,
     h5ad_path, output,
 ):
     """Print a slot inventory before conversion starts (verbose=True only).
@@ -864,7 +974,11 @@ def _emit_backed_inventory(
     print(f"  Will write:")
     x_shape = _shape_of(f["X"]) if "X" in f else None
     if x_shape:
-        print(f"    - X ({modality}_counts): {x_shape[0]:,} x {x_shape[1]:,}, "
+        # announce the name X will actually get, not the one it used to get
+        _x_name = _resolve_main_matrix_name(
+            modality, _h5_values_are_integer(f["X"]), counts_layer,
+            main_layer_name, stacklevel=6) if "X" in f else f"{modality}_counts"
+        print(f"    - X ({_x_name}): {x_shape[0]:,} x {x_shape[1]:,}, "
               f"dtype={_csr_dtype(f['X'])}")
 
     if write_layers and "layers" in f:

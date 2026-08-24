@@ -21,6 +21,26 @@ INSERT INTO matrix_chunks(
 """
 
 
+def _values_are_integer(dtype_str, sample) -> int | None:
+    """1 / 0 / None for "these values are integers".
+
+    Decided by the writer, once, while the data is in hand. Consumers that
+    re-derive it from a stored sample get it wrong in ways that are hard to
+    notice -- a probe that silently answers "cannot tell" reads exactly like
+    "not integer" at the call site.
+    """
+    import numpy as _np
+    try:
+        if _np.issubdtype(_np.dtype(dtype_str), _np.integer):
+            return 1
+        a = _np.asarray(sample, dtype="float64")
+        if a.size == 0:
+            return 1                      # an all-zero matrix is integral
+        return int(bool(_np.allclose(a, _np.round(a))))
+    except Exception:
+        return None
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -82,6 +102,7 @@ class ChunkedLayerWriter:
 
         self._chunk_idx = 0
         self._total_nnz = 0
+        self._is_integer = None      # 1 / 0 / None, settled as chunks arrive
         self._finalized = False
 
         if overwrite:
@@ -136,6 +157,14 @@ class ChunkedLayerWriter:
                 dtype_str,
                 compression,
             ))
+            if self._is_integer != 0:
+                # one non-integral chunk settles it: the matrix is
+                # integral only if every chunk is
+                _v = _values_are_integer(dtype_str, sub.data[:20000])
+                if _v == 0:
+                    self._is_integer = 0
+                elif self._is_integer is None:
+                    self._is_integer = _v
             self._total_nnz += sub.nnz
             self._chunk_idx += 1
 
@@ -152,8 +181,8 @@ class ChunkedLayerWriter:
             INSERT INTO matrix_meta(
                 matrix_name, n_rows, n_cols, n_nonzero, dtype,
                 row_entity, col_entity, chunk_size, n_chunks,
-                created_at, provenance_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, provenance_id, is_integer
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 self._matrix_name,
@@ -167,6 +196,7 @@ class ChunkedLayerWriter:
                 int(self._chunk_idx),
                 _now_iso(),
                 provenance_id,
+                self._is_integer,
             ),
         )
         self._conn.commit()
@@ -235,8 +265,9 @@ def write_sparse_chunked(
         """
         INSERT INTO matrix_meta(
             matrix_name, n_rows, n_cols, n_nonzero, dtype,
-            row_entity, col_entity, chunk_size, n_chunks, created_at, provenance_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            row_entity, col_entity, chunk_size, n_chunks, created_at,
+            provenance_id, is_integer
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             matrix_name,
@@ -250,6 +281,7 @@ def write_sparse_chunked(
             int(chunk_idx),
             _now_iso(),
             provenance_id,
+            _values_are_integer(str(csr.data.dtype), csr.data[:20000]),
         ),
     )
 
