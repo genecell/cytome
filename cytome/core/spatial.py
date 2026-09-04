@@ -200,6 +200,16 @@ class _SpatialImageAccessor:
         )
         return [(r[0], r[1]) for r in rows]
 
+    def _db_path(self):
+        """The file this accessor reads, for a proxy that must reconnect."""
+        try:
+            for _seq, name, filename in self._conn.execute("PRAGMA database_list"):
+                if name == "main" and filename:
+                    return filename
+        except sqlite3.Error:
+            pass
+        return None
+
     def libraries(self) -> List[str]:
         if not self._has_tables():
             return []
@@ -258,17 +268,26 @@ class _SpatialImageAccessor:
         )
         return {r[0]: r[1] for r in rows}
 
-    def as_uns(self) -> Dict:
+    def as_uns(self, lazy: bool = True) -> Dict:
         """The scanpy ``uns['spatial']`` shape, exactly.
 
         ``{lib: {'images': {key: ndarray}, 'scalefactors': {k: float}}}`` —
         consumers of the Visium convention need no cytome-specific logic
         beyond calling this.
+
+        ``lazy=True`` (default) puts a :class:`LazyImage` in each ``images``
+        slot instead of a decoded array. It decodes on first use — ``np.asarray``,
+        indexing, ``matplotlib.imshow`` — and reports ``shape`` and ``dtype``
+        without decoding at all. Every reader of a cytome calls this (including
+        ``to_anndata``), and a full-resolution tissue image is hundreds of
+        megabytes, so decoding eagerly charged that cost to every read whether
+        or not anyone plotted. Pass ``lazy=False`` for plain arrays.
         """
         out: Dict = {}
         for lib, key in self.keys():
             entry = out.setdefault(lib, {"images": {}, "scalefactors": {}})
-            entry["images"][key] = self[lib, key]
+            entry["images"][key] = (LazyImage(self, lib, key, self._db_path())
+                                    if lazy else self[lib, key])
         for lib in list(out):
             out[lib]["scalefactors"] = self.scalefactors(lib)
         # libraries that have scalefactors but no image rows still round-trip
@@ -333,6 +352,101 @@ class _SpatialImageAccessor:
 # --------------------------------------------------------------------------
 # Write side (called from Dataset methods)
 # --------------------------------------------------------------------------
+
+class LazyImage:
+    """A stored tissue image that decodes when something actually reads it.
+
+    Behaves as an array where it matters: ``np.asarray(img)``, ``img[...]``,
+    ``img.shape``, ``img.dtype``, ``len(img)``, and matplotlib's ``imshow``
+    all work. ``shape`` and ``dtype`` come from the row metadata, so a caller
+    that only inspects them never pays for the decode. The decoded array is
+    cached on first use, so repeated access costs nothing extra.
+    """
+
+    __slots__ = ("_images", "_library_id", "_img_key", "_array", "_path")
+
+    def __init__(self, images, library_id: str, img_key: str, path=None):
+        self._images = images
+        self._library_id = library_id
+        self._img_key = img_key
+        self._array = None
+        self._path = path
+
+    def _accessor(self):
+        """The accessor, reconnecting if the dataset it came from was closed.
+
+        A proxy commonly outlives its Dataset: ``adata = ds.to_anndata()``
+        then ``ds.close()``, and any reader that returns an AnnData does the
+        same. Without this the image would raise "Cannot operate on a closed
+        database" at plot time, a long way from the close that caused it, so
+        the proxy reopens the file read-only instead.
+        """
+        try:
+            self._images._conn.execute("SELECT 1").fetchone()
+            return self._images
+        except (sqlite3.ProgrammingError, sqlite3.Error):
+            if not self._path:
+                raise
+            conn = sqlite3.connect(f"file:{self._path}?mode=ro", uri=True)
+            self._images = type(self._images)(conn)
+            return self._images
+
+    # -- metadata, without decoding ------------------------------------
+    @property
+    def _info(self) -> Dict:
+        return self._accessor().info(self._library_id, self._img_key)
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        if self._array is not None:
+            return self._array.shape
+        meta = self._info
+        shape = (meta["height"], meta["width"])
+        if meta["channels"] and meta["channels"] > 1:
+            shape += (meta["channels"],)
+        return shape
+
+    @property
+    def dtype(self):
+        if self._array is not None:
+            return self._array.dtype
+        meta = self._info
+        # file-backed rows (png/jpg/tiff) do not know their dtype until decoded
+        return np.dtype(meta["dtype"]) if meta["dtype"] else self.__array__().dtype
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    @property
+    def size(self) -> int:
+        return int(np.prod(self.shape))
+
+    # -- the decode ----------------------------------------------------
+    def compute(self) -> np.ndarray:
+        """The decoded array (cached)."""
+        if self._array is None:
+            acc = self._accessor()
+            self._array = acc[self._library_id, self._img_key]
+        return self._array
+
+    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+        arr = self.compute()
+        if dtype is not None:
+            arr = arr.astype(dtype, copy=False)
+        return arr
+
+    def __getitem__(self, idx):
+        return self.compute()[idx]
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __repr__(self) -> str:
+        loaded = "loaded" if self._array is not None else "not loaded"
+        return (f"LazyImage({self._library_id!r}, {self._img_key!r}, "
+                f"shape={self.shape}, {loaded})")
+
 
 def add_spatial_image(conn: sqlite3.Connection, library_id: str, img_key: str,
                       image, scalefactors: Optional[Dict[str, float]] = None,

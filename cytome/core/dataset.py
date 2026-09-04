@@ -350,10 +350,12 @@ class CytomeDataset:
         ... )
         >>> ds.set_categories("region", colors={"CTX": "#CC79A7"})
         """
-        if column not in self.cells:
+        actual = self.cells.resolve_column(column, warn=True)
+        if actual is None:
             raise KeyError(
                 f"set_categories: '{column}' is not a column in ds.cells "
                 f"(available: {list(self.cells.columns)}).")
+        column = actual
         cats = dict(self.metadata.get("categories", {}) or {})
         entry = dict(cats.get(column, {}))
         if order is not None:
@@ -409,6 +411,9 @@ class CytomeDataset:
         cats = self.metadata.get("categories", {}) or {}
         if column is None:
             return cats
+        actual = self.cells.resolve_column(column)
+        if actual is not None:
+            column = actual
         entry = cats.get(column)
         # Self-heal on read: if the column exists but its current values are no
         # longer covered by the stored order (the column was overwritten outside
@@ -1618,12 +1623,17 @@ class CytomeDataset:
         return "\n".join(lines)
 
     def _enqueue_write(self, key: str, payload: Any) -> None:
-        # Overwriting a cells column can invalidate its stored category order
-        # (e.g. relabelling makes the saved order reference values that no longer
-        # exist, or vice-versa). Drop the stale entry so direct readers of
-        # ds.metadata['categories'] don't pick up dead labels.
+        # A full-column overwrite drops that column's stored categories
+        # unconditionally, with a message. The subset-is-valid tolerance the
+        # stale check gives is right for cell filtering and whole-table
+        # replacement, where the labels keep their meaning — but a full
+        # rewrite is a different event: after a re-run at a new resolution,
+        # cluster "3" is a different set of cells, and keeping its old colour
+        # is exactly the "categories not updated" bug. The stale-only check
+        # also never fired when the new labels were a subset of the old order,
+        # so the old colours silently mapped to different cells.
         if key.startswith("entity:cells:") and isinstance(payload, _EntityWrite):
-            self._invalidate_stale_categories(payload.column_name, payload.values)
+            self._drop_categories_on_overwrite(payload.column_name)
         self._pending_writes[key] = payload
         if self._auto_flush:
             self.flush()
@@ -1649,6 +1659,34 @@ class CytomeDataset:
             if v is not None and str(v) != "" and str(v).lower() != "nan"
         }
         return uniques - {str(o) for o in order}
+
+    def _drop_categories_on_overwrite(self, column) -> None:
+        """Drop ``categories[column]`` because the column is being rewritten.
+
+        Unconditional where :meth:`_invalidate_stale_categories` is
+        conditional: the caller knows every value in the column is being
+        replaced, so any stored order/colours describe a labelling that no
+        longer exists — even when the new labels happen to be a subset of the
+        old ones. Writers that want an order re-persist it afterwards (as
+        ``piaso.tl.leiden`` does), which is also the sequence that makes the
+        message below almost never user-facing.
+        """
+        cats = self.metadata.get("categories")
+        if not cats or column not in cats:
+            return
+        import warnings as _w
+        self.metadata["categories"] = {
+            k: v for k, v in cats.items() if k != column}
+        try:
+            self.flush()
+        except Exception:
+            pass
+        _w.warn(
+            f"cytome: cells column {column!r} is being overwritten — its "
+            f"stored category order/colors were dropped. Re-run "
+            f"set_categories({column!r}, ...) if you want an explicit order.",
+            stacklevel=4,
+        )
 
     def _invalidate_stale_categories(self, column, values=None) -> None:
         """Drop a stored ``categories[column]`` entry when the column's current
@@ -1844,6 +1882,22 @@ def _primary_key_for_table(table_name: str) -> str:
 
 
 def _py_scalar(value: Any) -> Any:
+    """One DataFrame cell as something ``sqlite3`` can bind.
+
+    ``pandas.NA`` and ``NaT`` are the cases worth naming: they carry no
+    ``.item()``, and sqlite3 has no adapter for them, so a nullable column
+    (``string``, ``Int64``, ``boolean``) or a categorical with missing values —
+    which is what a cell-type deconvolution writes by construction — used to
+    fail the whole conversion with "Error binding parameter N: type 'NAType' is
+    not supported". They are missing values; SQL spells that NULL.
+    """
+    if value is None or value is pd.NaT or value is pd.NA:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass          # arrays and other non-scalars: not a missing value
     return value.item() if hasattr(value, "item") else value
 
 

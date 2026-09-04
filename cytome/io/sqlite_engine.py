@@ -199,7 +199,62 @@ def _init_manifest(conn: sqlite3.Connection, dataset_name: str) -> None:
     )
 
 
+#: The ``fragment_chunks`` columns an older file may be missing. Exactly the
+#: ones ``_create_schema`` declares and indexes -- ``max_start`` was on this
+#: list once and is not a column of this table, so every current file looked
+#: like it needed migrating and every open took the ALTER path below. Under a
+#: concurrent writer that meant waiting out ``busy_timeout`` (60 s) and then
+#: failing to open a file that was never old.
+_FRAGMENT_CHUNKS_MIGRATED_COLUMNS = ("min_start",)
+
+
+def _migrate_fragment_chunks_columns(conn: sqlite3.Connection) -> None:
+    """Older files have a ``fragment_chunks`` table without the ``min_start``
+    column the current schema indexes on.
+    ``CREATE INDEX IF NOT EXISTS ... ON fragment_chunks(chrom, min_start)``
+    then fails with "no such column" and the file cannot be opened at all —
+    not read, not migrated. Add the column (nullable; readers treat NULL as
+    "unknown, scan the chunk") so the index statement is legal. Idempotent,
+    and a no-op on every file this version wrote.
+    """
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "fragment_chunks" not in tables:
+        return
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(fragment_chunks)")}
+    missing = [c for c in _FRAGMENT_CHUNKS_MIGRATED_COLUMNS if c not in cols]
+    if not missing:
+        return
+    _add_fragment_chunks_columns(conn, missing)
+
+
+def _add_fragment_chunks_columns(conn: sqlite3.Connection, columns) -> None:
+    """ALTER in the missing columns, tolerating two races that are not errors.
+
+    *Read-only file*: cannot be migrated in place; leave it to the read-only
+    handling downstream, exactly as before this migration existed — opening
+    must never require permission to change the file.
+
+    *Concurrent opener*: several worker processes open the same older file at
+    once, each reads the schema before any has altered it, and the second
+    ALTER fails with "duplicate column name". The column is there, which is
+    the goal; a check-then-alter is not atomic across processes and the
+    duplicate error is the only signal that another opener won.
+    """
+    for col in columns:
+        try:
+            conn.execute(f"ALTER TABLE fragment_chunks ADD COLUMN {col} INTEGER")
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "readonly" in msg:
+                return
+            if "duplicate column" in msg:
+                continue
+            raise
+
+
 def _create_schema(conn: sqlite3.Connection) -> None:
+    _migrate_fragment_chunks_columns(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS _manifest (
@@ -565,7 +620,19 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     # False would refuse to normalise a perfectly good counts matrix.
     _mm_cols = [r[1] for r in conn.execute("PRAGMA table_info(matrix_meta)")]
     if _mm_cols and "is_integer" not in _mm_cols:
-        conn.execute("ALTER TABLE matrix_meta ADD COLUMN is_integer INTEGER")
+        try:
+            conn.execute("ALTER TABLE matrix_meta ADD COLUMN is_integer INTEGER")
+        except sqlite3.OperationalError as exc:
+            # A 0.2.x file on read-only media -- which is how the released
+            # datasets ship (mode 444) -- cannot take the column, and opening
+            # it raised "attempt to write a readonly database" from a line
+            # nobody reading the traceback would connect to a schema upgrade.
+            # The column is a convenience for writers; readers treat both
+            # missing and NULL as "unknown, probe if you care", so skipping it
+            # costs nothing. Anything other than read-only is a real problem
+            # and still raises.
+            if "readonly" not in str(exc) and "read-only" not in str(exc):
+                raise
 
     # NOTE: the narrowPeak / PICCO stat columns (summit, score, signal,
     # neg_log10_pvalue, neg_log10_qvalue) are part of the `peaks` CREATE TABLE

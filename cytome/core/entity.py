@@ -53,21 +53,53 @@ class EntityTable:
             self._conn.execute(f"SELECT COUNT(*) FROM {self._table_name}").fetchone()[0]
         )
 
+    def resolve_column(self, column_name: str, warn: bool = False):
+        """Resolve ``column_name`` to the stored casing, or None if absent.
+
+        SQLite identifiers are case-insensitive: a table holding ``Leiden``
+        will happily accept ``UPDATE ... SET leiden = ?`` and route it to
+        ``Leiden``. An API that checks membership case-sensitively can only
+        disagree with its own storage — which is how ``cells['leiden'] = ...``
+        overwrote ``Leiden`` silently while ``cells['leiden']`` raised
+        ``KeyError`` on the very column it had just written. Every name-taking
+        method resolves through here so Python and SQLite agree.
+
+        With ``warn=True`` a case mismatch emits a warning naming both
+        spellings; membership checks resolve silently.
+        """
+        cols = self.columns
+        if column_name in cols:
+            return column_name
+        lowered = {c.lower(): c for c in cols}
+        actual = lowered.get(column_name.lower())
+        if actual is not None and warn:
+            import warnings
+            warnings.warn(
+                f"{self._table_name}[{column_name!r}] resolves to existing "
+                f"column {actual!r} (SQLite column names are "
+                f"case-insensitive); using {actual!r}.",
+                stacklevel=3,
+            )
+        return actual
+
     def __contains__(self, column_name: str) -> bool:
-        """Return True if the column exists in the table."""
-        return column_name in self.columns
+        """Return True if the column exists in the table (case-insensitive,
+        matching SQLite's own identifier semantics)."""
+        return self.resolve_column(column_name) is not None
 
     def has_column(self, column_name: str) -> bool:
         """Return True if the column exists in the table.
 
         Equivalent to ``column_name in entity_table``.
         """
-        return column_name in self.columns
+        return column_name in self
 
     def __getitem__(self, column_name: str) -> np.ndarray:
         """Return a column as a NumPy array."""
-        if column_name not in self.columns:
+        actual = self.resolve_column(column_name, warn=True)
+        if actual is None:
             raise KeyError(f"Column {column_name!r} not in {self._table_name}")
+        column_name = actual
         rows = self._conn.execute(
             f"SELECT {_quote_ident(column_name)} FROM {self._table_name} ORDER BY ROWID"
         ).fetchall()
@@ -89,6 +121,11 @@ class EntityTable:
                 f"Length mismatch for {self._table_name}.{column_name}: "
                 f"expected {self.n}, got {values_arr.shape[0]}"
             )
+        # Canonicalise BEFORE either write path, so the enqueue key, the
+        # category-invalidation lookup and the SQL all see the stored casing.
+        actual = self.resolve_column(column_name, warn=True)
+        if actual is not None:
+            column_name = actual
         if self._enqueue_write is not None:
             self._enqueue_write(
                 f"entity:{self._table_name}:{column_name}",
@@ -119,14 +156,21 @@ class EntityTable:
         return pd.read_sql_query(f"SELECT * FROM {self._table_name}", self._conn)
 
     def _apply_column_write(self, column_name: str, values: np.ndarray) -> None:
-        if column_name not in self.columns:
+        actual = self.resolve_column(column_name)
+        if actual is None:
             sqlite_type = _numpy_to_sqlite_type(values.dtype)
-            try:
-                self._conn.execute(
-                    f"ALTER TABLE {self._table_name} ADD COLUMN {_quote_ident(column_name)} {sqlite_type}"
-                )
-            except Exception:
-                pass  # column may already exist
+            # No blanket except here. The old `except Exception: pass` was
+            # load-bearing for a bug: it swallowed SQLite's *duplicate column*
+            # error when a case-variant of the column already existed, and the
+            # UPDATE below then overwrote that column silently. It also
+            # swallowed a locked database and a full disk. Resolution above
+            # makes the duplicate case unreachable; everything else should be
+            # heard about.
+            self._conn.execute(
+                f"ALTER TABLE {self._table_name} ADD COLUMN {_quote_ident(column_name)} {sqlite_type}"
+            )
+        else:
+            column_name = actual
         key_col = _infer_primary_key(self._conn, self._table_name)
         keys = self._conn.execute(
             f"SELECT {_quote_ident(key_col)} FROM {self._table_name} ORDER BY ROWID"

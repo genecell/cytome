@@ -20,10 +20,18 @@ import pytest
 import scipy.sparse as sp
 
 
+#: Names in ``__all__`` that are data, not callables. The registry tables are
+#: exported on purpose -- callers read them to see which modalities exist and
+#: which var entity each routes to -- so "everything exported is callable" is
+#: not the rule. Naming them here keeps the check strict about the bug it
+#: exists for: a function that lives in a submodule and was never re-exported.
+_EXPORTED_CONSTANTS = {"MODALITY_REGISTRY", "MODALITY_VAR_ENTITY"}
+
+
 def test_every_name_in_dunder_all_is_resolvable_and_callable():
-    """Every entry in cytome.__all__ must be (a) accessible as
-    ``cytome.<name>`` and (b) callable (or a class). Catches the
-    "function exists in submodule but never re-exported" bug pattern.
+    """Every entry in cytome.__all__ must be accessible as ``cytome.<name>``,
+    and callable (or a class) unless it is a declared exported constant.
+    Catches the "function exists in submodule but never re-exported" pattern.
     """
     import cytome
     missing = []
@@ -33,6 +41,8 @@ def test_every_name_in_dunder_all_is_resolvable_and_callable():
             missing.append(name)
             continue
         obj = getattr(cytome, name)
+        if name in _EXPORTED_CONSTANTS:
+            continue
         if not (callable(obj) or inspect.isclass(obj)):
             not_callable.append((name, type(obj).__name__))
     assert not missing, (
@@ -40,8 +50,12 @@ def test_every_name_in_dunder_all_is_resolvable_and_callable():
         f"{missing}. Add the corresponding wrapper in cytome/__init__.py."
     )
     assert not not_callable, (
-        f"Names in cytome.__all__ resolved but not callable: {not_callable}."
+        f"Names in cytome.__all__ resolved but not callable: {not_callable}. "
+        f"If one is a constant meant to be public, add it to "
+        f"_EXPORTED_CONSTANTS in this file."
     )
+    stale = _EXPORTED_CONSTANTS - set(cytome.__all__)
+    assert not stale, f"_EXPORTED_CONSTANTS names something unexported: {stale}"
 
 
 def test_from_h5ad_top_level_callable():

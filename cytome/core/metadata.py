@@ -52,8 +52,45 @@ class MetadataStore:
         ).fetchone()
         return row is not None
 
+    #: Past this, say so. The metadata table stores JSON text, and an ndarray
+    #: serialises at roughly 20 bytes per float32 element -- a full-resolution
+    #: tissue image lands in the hundreds of megabytes, which SQLite will
+    #: store but which makes the file slow and enormous for something that
+    #: belongs in a blob.
+    WARN_JSON_BYTES = 64 * 1024 * 1024
+
+    #: Past this, refuse. SQLite's own ``SQLITE_MAX_LENGTH`` (1 GB by default)
+    #: rejects the row with "string or blob too big", and above 2 GB Python's
+    #: ``sqlite3`` raises ``OverflowError: string longer than INT_MAX bytes``
+    #: from deep inside the write -- which is how a 6000x6000x3 float32 image
+    #: used to fail while the same image as uint8 squeaked under, a size cliff
+    #: that reads as a mysterious dtype dependency. Fail before either, and
+    #: name the place bulk arrays belong. Deliberately not lower: a payload
+    #: SQLite would have accepted must keep working, with a warning.
+    MAX_JSON_BYTES = 900 * 1024 * 1024
+
+    _WHERE_BULK_GOES = (
+        "The metadata table stores JSON values, not bulk arrays. For tissue "
+        "images use ds.add_spatial_image(library, key, array) -- stored as a "
+        "compressed blob and returned by ds.spatial_images.as_uns() in the "
+        "scanpy convention; for other large arrays use a matrix or an "
+        "embedding.")
+
     def __setitem__(self, key: str, value: Any) -> None:
         value_json, value_type = _serialize_value(value)
+        n_bytes = len(value_json)
+        if n_bytes > self.MAX_JSON_BYTES:
+            raise ValueError(
+                f"metadata[{key!r}] serialises to {n_bytes / 1e6:.0f} MB of "
+                f"JSON, past what SQLite will store in one value. "
+                f"{self._WHERE_BULK_GOES}")
+        if n_bytes > self.WARN_JSON_BYTES:
+            import warnings as _warnings
+            _warnings.warn(
+                f"metadata[{key!r}] serialises to {n_bytes / 1e6:.0f} MB of "
+                f"JSON. It will be stored, but slowly and at that size on "
+                f"disk. {self._WHERE_BULK_GOES}",
+                stacklevel=2)
         payload = _MetadataWrite(key=key, value_json=value_json, value_type=value_type)
         if self._enqueue_write is not None:
             self._enqueue_write(f"metadata:{key}", payload)

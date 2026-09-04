@@ -32,11 +32,23 @@ class TestCytomeDataset:
         ds.close()
 
     def test_flush(self, tmp_cytome):
+        """add_embedding persists immediately; flush=False batches it.
+
+        The default is flush=True -- writing an embedding and not seeing it on
+        disk is the surprising behaviour, not the other way round. flush=False
+        is for callers adding several at once.
+        """
+        def n_rows(ds):
+            return ds._conn.execute(
+                "SELECT COUNT(*) FROM embedding_meta").fetchone()[0]
+
         ds = cytome.create(tmp_cytome)
         ds.add_embedding("e", np.zeros((10, 2), dtype=np.float32))
-        assert ds._conn.execute("SELECT COUNT(*) FROM embedding_meta").fetchone()[0] == 0
+        assert n_rows(ds) == 1                       # persisted by default
+        ds.add_embedding("f", np.zeros((10, 2), dtype=np.float32), flush=False)
+        assert n_rows(ds) == 1                       # held back
         ds.flush()
-        assert ds._conn.execute("SELECT COUNT(*) FROM embedding_meta").fetchone()[0] == 1
+        assert n_rows(ds) == 2
         ds.close()
 
     def test_validate_valid(self, tmp_cytome):

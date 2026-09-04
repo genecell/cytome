@@ -205,8 +205,13 @@ def test_from_h5ad_backed_lossless_roundtrip(tmp_path):
     )
 
     # --- numeric equality of X (a couple of chunks) ---
-    chunks_mem = list(ds_mem.iter_chunks(modality="RNA", layer="counts"))
-    chunks_backed = list(ds_backed.iter_chunks(modality="RNA", layer="counts"))
+    # Read the layer name the writer chose rather than assuming "counts":
+    # since 0.3.0 a non-integer X is stored as RNA_data, precisely so that
+    # "counts" means counts. The two paths must agree on the name as well as
+    # on the values, which the _anndata_X_layer comparison above already pins.
+    x_layer = ds_mem.metadata["_anndata_X_layer"].split("_", 1)[1]
+    chunks_mem = list(ds_mem.iter_chunks(modality="RNA", layer=x_layer))
+    chunks_backed = list(ds_backed.iter_chunks(modality="RNA", layer=x_layer))
     X_mem = sp.vstack([c for c, _ in chunks_mem]).toarray()
     X_backed = sp.vstack([c for c, _ in chunks_backed]).toarray()
     np.testing.assert_allclose(X_mem, X_backed, rtol=0, atol=0,
@@ -298,7 +303,10 @@ def test_from_h5ad_backed_peak_rss_bounded(tmp_path):
     ("write_varm", False, "varm_map_empty", None),
     ("write_varp", False, "varp_map_empty", None),
     ("skip_layers", ["infog"], "layer_skipped", "RNA_infog"),
-    ("skip_obsm", ["X_umap"], "obsm_skipped", "RNA_obsm_X_umap"),
+    # RNA_X_umap, not RNA_obsm_X_umap: 0.2.6 dropped the "obsm_" infix. Under
+    # the old name this row asserted a key that could never be present and so
+    # would have passed with skip_obsm entirely broken.
+    ("skip_obsm", ["X_umap"], "obsm_skipped", "RNA_X_umap"),
     ("skip_obsp", ["distances"], "obsp_skipped", "RNA_obsp_distances"),
 ])
 def test_from_h5ad_backed_skip_kwargs(
@@ -555,16 +563,16 @@ def test_from_h5ad_backed_sparse_obsm_large_goes_to_add_matrix(tmp_path):
     # _anndata_obsm_map.
     obsm_as_matrix = ds.metadata.get("_anndata_obsm_as_matrix", {})
     obsm_map = ds.metadata.get("_anndata_obsm_map", {})
-    assert "RNA_obsm_ATAC_gene_activity" in obsm_as_matrix, (
+    assert "RNA_ATAC_gene_activity" in obsm_as_matrix, (
         f"sparse obsm with shape[1]=600 should be stored via add_matrix "
         f"+ _anndata_obsm_as_matrix; got obsm_as_matrix={obsm_as_matrix}, "
         f"obsm_map={obsm_map}"
     )
-    assert "RNA_obsm_ATAC_gene_activity" not in obsm_map
+    assert "RNA_ATAC_gene_activity" not in obsm_map
     # And the matrix actually exists in matrix_meta
     row = ds._conn.execute(
         "SELECT n_rows, n_cols FROM matrix_meta "
-        "WHERE matrix_name = 'RNA_obsm_ATAC_gene_activity'"
+        "WHERE matrix_name = 'RNA_ATAC_gene_activity'"
     ).fetchone()
     assert row is not None, "matrix not written"
     assert row == (n_obs, 600)
@@ -618,16 +626,16 @@ def test_from_h5ad_backed_sparse_obsm_small_densified_to_add_embedding(tmp_path)
     # Small sparse → densified to embedding, NOT add_matrix.
     obsm_as_matrix = ds.metadata.get("_anndata_obsm_as_matrix", {})
     obsm_map = ds.metadata.get("_anndata_obsm_map", {})
-    assert "RNA_obsm_small_sparse" in obsm_map, (
+    assert "RNA_small_sparse" in obsm_map, (
         f"small sparse obsm (shape[1]=100) should be densified and "
         f"stored via add_embedding + _anndata_obsm_map; got "
         f"obsm_map={obsm_map}, obsm_as_matrix={obsm_as_matrix}"
     )
-    assert "RNA_obsm_small_sparse" not in obsm_as_matrix
+    assert "RNA_small_sparse" not in obsm_as_matrix
     # And the embedding actually exists in embedding_meta
     row = ds._conn.execute(
         "SELECT n_rows, n_cols FROM embedding_meta "
-        "WHERE array_name = 'RNA_obsm_small_sparse'"
+        "WHERE array_name = 'RNA_small_sparse'"
     ).fetchone()
     assert row is not None, "embedding not written"
     assert row == (n_obs, 100)

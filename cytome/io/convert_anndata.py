@@ -826,14 +826,33 @@ def from_h5ad(
 
         # --- 9. uns — per-key, skip unpickleable ---
         if write_uns and "uns" in f:
-            uns = read_elem(f["uns"])
-            for key, value in uns.items():
+            # Read one key at a time. `read_elem(f["uns"])` materialises every
+            # key at once, which for a Visium object means a full-resolution
+            # tissue image in memory before anything decides where it goes.
+            uns_grp = f["uns"]
+            for key in list(uns_grp.keys()):
+                try:
+                    value = read_elem(uns_grp[key])
+                except Exception as exc:      # pragma: no cover - exotic uns
+                    if verbose:
+                        print(f"  [skip] uns/{key} (unreadable: {exc})")
+                    continue
+                if key == "spatial" and isinstance(value, dict):
+                    # Same route as the in-memory path: images become
+                    # compressed blobs in the spatial tables. Without this the
+                    # backed path serialised the image as JSON text, which is
+                    # ~20 bytes per float32 element and overflows sqlite3's
+                    # 2 GB bind limit on any full-resolution image.
+                    _write_uns_spatial(ds, value)
+                    del value
+                    gc.collect()
+                    continue
                 try:
                     ds.metadata[key] = value
-                except TypeError:
+                except (TypeError, ValueError, OverflowError) as exc:
                     if verbose:
-                        print(f"  [skip] uns/{key} (unpickleable)")
-            del uns
+                        print(f"  [skip] uns/{key} ({exc})")
+                del value
             gc.collect()
 
     ds.flush()
@@ -1018,6 +1037,33 @@ def _emit_backed_inventory(
             pass
 
 
+def _writable_frame(df):
+    """Object columns with missing values become categoricals.
+
+    A cytome column that is NULL for some or all cells comes back as an
+    object column holding None, and anndata's h5ad writer cannot serialise
+    that -- ``TypeError: Can't implicitly convert non-string objects to
+    strings``, raised while writing a key the user never touched. Nullable
+    ``string`` fares no better (no registered writer). ``Categorical`` is the
+    representation anndata does write, and it is what scanpy would have used
+    for these columns anyway, so `to_anndata(...)` output can be written to
+    disk whether or not the source had missing labels.
+    """
+    if df is None or df.empty:
+        return df
+    out = None
+    for col in df.columns:
+        series = df[col]
+        if series.dtype != object:
+            continue
+        if not series.isna().any():
+            continue
+        if out is None:
+            out = df.copy()
+        out[col] = pd.Categorical(series)
+    return df if out is None else out
+
+
 def to_anndata(
     ds: CytomeDataset,
     modality: str = "RNA",
@@ -1110,6 +1156,8 @@ def to_anndata(
     if id_col in var.columns:
         var = var.set_index(id_col, drop=False)
 
+    obs = _writable_frame(obs)
+    var = _writable_frame(var)
     adata = anndata.AnnData(X=X, obs=obs, var=var)
 
     # Collect names of obsm entries stored as matrices so they are not
@@ -1228,7 +1276,14 @@ def to_anndata(
             continue
         adata.uns[key] = value
 
-    _spatial_uns = ds.spatial_images.as_uns() if hasattr(ds, "spatial_images") else {}
+    # Materialised, not lazy: `to_anndata` hands back a *detached* object that
+    # people write to disk, and anndata's h5ad writer type-checks the values in
+    # `uns` -- a proxy there fails with "Can't implicitly convert non-string
+    # objects to strings", a long way from the conversion that put it there.
+    # Laziness belongs on `ds.spatial_images.as_uns()`, where the dataset is
+    # open and the caller is exploring rather than serialising.
+    _spatial_uns = (ds.spatial_images.as_uns(lazy=False)
+                    if hasattr(ds, "spatial_images") else {})
     if _spatial_uns:
         adata.uns["spatial"] = _spatial_uns
 

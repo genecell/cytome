@@ -65,7 +65,7 @@ __all__ = [
 # The manifest's writer_version reads THIS, not the installed distribution
 # metadata: a source tree run against a stale editable install would otherwise
 # stamp files with the version of code that did not write them.
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 
 def import_gtf(ds, gtf_path, **kwargs):
@@ -161,6 +161,12 @@ def from_h5ad(
     skip_varm: list[str] | None = None,
     skip_varp: list[str] | None = None,
     force: bool = False,
+    # These two were added to from_anndata and to the implementation but not
+    # here, and they are what the "X does not hold integer counts" warning
+    # tells you to pass -- so following the advice raised TypeError on the
+    # entry point most likely to raise the warning.
+    counts_layer: str | None = None,
+    main_layer_name: str | None = None,
 ) -> CytomeDataset:
     """Create a Cytome dataset from a ``.h5ad`` file on disk.
 
@@ -239,6 +245,8 @@ def from_h5ad(
         skip_varm=skip_varm,
         skip_varp=skip_varp,
         force=force,
+        counts_layer=counts_layer,
+        main_layer_name=main_layer_name,
     )
     if not backed:
         return _impl(backed=False, **_common_kwargs)
@@ -260,6 +268,18 @@ def from_h5ad(
             RuntimeWarning,
             stacklevel=2,
         )
+        # The failed attempt leaves a partial file behind, and the retry
+        # writes to the same path -- so without this the fallback dies on
+        # "Cytome already exists", reporting a name collision for debris it
+        # created itself one line earlier. Only the partial file is removed,
+        # and only when we are the ones who just made it.
+        _out = _common_kwargs.get("output")
+        if _out is not None and not _common_kwargs.get("force", False):
+            from pathlib import Path as _Path
+            for _suffix in ("", "-wal", "-shm"):
+                _p = _Path(str(_out) + _suffix)
+                if _p.exists():
+                    _p.unlink()
         return _impl(backed=False, **_common_kwargs)
 
 
