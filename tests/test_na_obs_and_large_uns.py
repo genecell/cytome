@@ -14,9 +14,13 @@ Both reported from a Visium HD analysis:
 import numpy as np
 import pandas as pd
 import pytest
+
+# anndata is an optional extra (`pip install cytome[anndata]`). Imported at
+# module scope this fails at *collection*, which aborts the entire run for
+# anyone who installed cytome without it; skipping is the honest outcome.
+ad = pytest.importorskip("anndata")
 import scipy.sparse as sp
 
-import anndata as ad
 
 import cytome
 
@@ -42,12 +46,21 @@ def test_obs_with_pandas_na_round_trips_as_missing(tmp_path):
     first = pd.Categorical(["T"] * n, categories=["T", "B"])
     first[: n // 3] = None                       # unassigned bins
     a.obs["first_type"] = first
-    a.obs["label"] = pd.array(["x"] * n, dtype="string")
-    a.obs["label"][: n // 4] = pd.NA
-    a.obs["count"] = pd.array(np.arange(n), dtype="Int64")
-    a.obs["count"][: n // 5] = pd.NA
-    a.obs["flag"] = pd.array([True] * n, dtype="boolean")
-    a.obs["flag"][:3] = pd.NA
+    # Built with the NAs in place rather than assigned afterwards.
+    # `a.obs["label"][: n // 4] = pd.NA` is chained assignment: pandas 3 makes
+    # copy-on-write mandatory, so it writes to a temporary and the frame keeps
+    # its old values -- silently, since the warning that used to flag this was
+    # removed in the same release. The test then wrote no NAs at all and was
+    # asserting against the wrong input.
+    _label = pd.array(["x"] * n, dtype="string")
+    _label[: n // 4] = pd.NA
+    a.obs["label"] = _label
+    _count = pd.array(np.arange(n), dtype="Int64")
+    _count[: n // 5] = pd.NA
+    a.obs["count"] = _count
+    _flag = pd.array([True] * n, dtype="boolean")
+    _flag[:3] = pd.NA
+    a.obs["flag"] = _flag
     a.obs["score"] = np.linspace(0, 1, n)
     a.obs.loc[a.obs.index[0], "score"] = np.nan
 

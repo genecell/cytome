@@ -108,7 +108,13 @@ def test_import_fragments_default_skipped_for_rna(tmp_path):
     """modalities='rna' → no fragments imported even if atac_fragments.tsv.gz exists, no warning."""
     _make_cellranger_mtx(tmp_path / "outs", with_frags=True)
     with warnings.catch_warnings():
-        warnings.simplefilter("error", DeprecationWarning)   # would raise if fragments imported
+        # Escalate only the warning this test is about. `simplefilter("error",
+        # DeprecationWarning)` also caught scipy's unrelated `spmatrix`
+        # deprecation, raised from the fixture's own mmwrite on current scipy,
+        # so the test failed for a reason that had nothing to do with it.
+        warnings.simplefilter("ignore")
+        warnings.filterwarnings("error", message=".*imports ATAC fragments.*",
+                                category=DeprecationWarning)
         ds = cytome.from_cellranger(tmp_path / "outs", tmp_path / "r.cytome", modalities="rna")
     assert "ATAC" not in ds.modalities and ds.n_peaks == 0
     ds.close()

@@ -183,7 +183,9 @@ def test_from_10x_h5_runs(tmp_path):
 
     h5 = tmp_path / "tiny.h5"
     X = sp.csc_matrix(np.array([[1, 0, 2], [0, 3, 0], [4, 0, 5], [0, 6, 0]], dtype=np.int32))
-    import h5py
+    # h5py is an optional extra; skip rather than fail so a base install
+    # can still run the suite.
+    h5py = pytest.importorskip("h5py")
 
     with h5py.File(h5, "w") as f:
         g = f.create_group("matrix")
@@ -215,7 +217,9 @@ def test_from_10x_h5_runs(tmp_path):
 
 def _write_10x_h5(path, feature_types, ids=None):
     """A minimal Cell Ranger v3 matrix: (n_features, n_cells) CSC, 3 cells."""
-    import h5py
+    # h5py is an optional extra; skip rather than fail so a base install
+    # can still run the suite.
+    h5py = pytest.importorskip("h5py")
     import numpy as np
     from scipy import sparse as sp
 

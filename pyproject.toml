@@ -65,6 +65,10 @@ mudata = ["mudata>=0.2"]
 full = [
     "anndata>=0.10",
     "mudata>=0.2",
+    # from_10x_h5 and the backed h5ad path read HDF5 directly. Not a base
+    # dependency -- the point of the base install is that it is small -- but
+    # "full" should mean every reader works.
+    "h5py>=3.0",
     "zstandard>=0.20",
     "pysam>=0.22",
     "pyBigWig>=0.3",
@@ -72,6 +76,7 @@ full = [
 dev = [
     "pytest>=7.0",
     "anndata>=0.10",
+    "h5py>=3.0",
     "mudata>=0.2",
     "zstandard>=0.20",
     "pysam>=0.22",

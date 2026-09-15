@@ -65,7 +65,7 @@ __all__ = [
 # The manifest's writer_version reads THIS, not the installed distribution
 # metadata: a source tree run against a stale editable install would otherwise
 # stamp files with the version of code that did not write them.
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 
 def import_gtf(ds, gtf_path, **kwargs):

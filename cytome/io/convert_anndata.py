@@ -354,7 +354,10 @@ def from_anndata(
         if counts_layer not in adata.layers:
             raise KeyError(
                 f"counts_layer={counts_layer!r} is not in adata.layers; "
-                f"available: {sorted(adata.layers)}")
+                # sorted() over the raw keys raised TypeError on anndata
+                # >= 0.13, which lists X under a None key -- so the error
+                # explaining a bad counts_layer= died before it could print.
+                f"available: {sorted(k for k in adata.layers if k is not None)}")
         _cl = adata.layers[counts_layer]
         _cl = _cl if sp.issparse(_cl) else sp.csr_matrix(np.asarray(_cl))
         if not _values_are_integer(_cl):
@@ -390,6 +393,14 @@ def from_anndata(
     layer_map: dict[str, str] = {}
     if write_layers:
         for layer_name, layer_mat in adata.layers.items():
+            # anndata >= 0.13 lists X under a `None` key in `.layers`; 0.10 did
+            # not. Formatted into a name it becomes `{modality}_None`, so every
+            # conversion under a current anndata wrote a third matrix holding a
+            # duplicate of X under a nonsense name -- and `main_layer_name=`
+            # looked ignored, because the matrix it asked for was there beside
+            # one nobody asked for.
+            if layer_name is None:
+                continue
             if layer_name in skip_layers_set:
                 continue
             cyt_name = f"{modality}_{layer_name}"
@@ -628,7 +639,8 @@ def from_h5ad(
     # === Backed (streaming) path — Round 10 rewrite ===
     import gc
     import time
-    import h5py
+    from ._optional import require_h5py
+    h5py = require_h5py("from_h5ad(backed=True)")
     # `anndata.io` is the public home for read_elem only in anndata >= 0.11.
     # On anndata 0.10.x it lives in `anndata.experimental`. Fall back so the
     # backed path works across both (otherwise backed=True raised
@@ -1312,6 +1324,8 @@ def update_from_anndata(ds: CytomeDataset, adata, modality: str = "RNA") -> None
         _taken.add(cyt_key)
         ds.add_embedding(cyt_key, np.asarray(emb))
     for key, layer in adata.layers.items():
+        if key is None:                     # anndata >= 0.13 lists X here
+            continue
         mat = layer if sp.issparse(layer) else sp.csr_matrix(np.asarray(layer))
         ds.add_matrix(f"{modality}_{key}", mat)
 

@@ -383,7 +383,8 @@ def _read_10x_h5_meta(path: str | Path):
     what lets the caller decide on modalities and masks *before* any of the
     matrix is touched.
     """
-    import h5py
+    from ._optional import require_h5py
+    h5py = require_h5py("cytome.from_10x_h5")
 
     def _dec(arr):
         return [b.decode() if isinstance(b, (bytes, bytearray)) else str(b) for b in arr]
@@ -449,7 +450,8 @@ def _iter_10x_h5_cell_chunks(path: str | Path, group: str, n_cells: int,
 
     Memory is bounded by ``batch_size`` cells' worth of non-zeros.
     """
-    import h5py
+    from ._optional import require_h5py
+    h5py = require_h5py("cytome.from_10x_h5")
 
     with h5py.File(str(path), "r") as f:
         g = f[group]
@@ -493,7 +495,8 @@ def _read_10x_h5(path: str | Path):
 
     Returns ``(matrix_features_x_cells, barcodes, ids, names, feature_types)``.
     """
-    import h5py
+    from ._optional import require_h5py
+    h5py = require_h5py("cytome.from_10x_h5")
 
     def _dec(arr):
         return [b.decode() if isinstance(b, (bytes, bytearray)) else str(b) for b in arr]

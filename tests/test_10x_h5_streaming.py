@@ -58,7 +58,9 @@ def test_top_level_wrapper_forwards_every_parameter():
 
 def _write_h5(path, n_genes, n_peaks, n_cells, density=0.3, seed=0):
     """A CellRanger v3 file: CSC over (features, cells), like the real thing."""
-    import h5py
+    # h5py is an optional extra; skip rather than fail so a base install
+    # can still run the suite.
+    h5py = pytest.importorskip("h5py")
 
     rng = np.random.default_rng(seed)
     n_features = n_genes + n_peaks
@@ -186,7 +188,9 @@ def test_select_columns_matches_fancy_indexing():
 
 def test_empty_batch_is_handled(tmp_path):
     """Cells with no counts at all must not break the indptr rebase."""
-    import h5py
+    # h5py is an optional extra; skip rather than fail so a base install
+    # can still run the suite.
+    h5py = pytest.importorskip("h5py")
 
     h5 = tmp_path / "sparse.h5"
     n_features, n_cells = 5, 6

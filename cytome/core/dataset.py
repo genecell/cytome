@@ -34,6 +34,31 @@ logger = logging.getLogger(__name__)
 _KNOWN_MODALITY_NAMES = frozenset({"RNA", "GA", "ATAC", "tiles"})
 
 
+def _sql_column_type(series) -> str:
+    """SQLite column type for a pandas column.
+
+    **TEXT is the fallback, not INTEGER.** The old order defaulted to INTEGER
+    and only reached TEXT through ``is_object_dtype``; pandas 3 turns on
+    ``future.infer_string`` by default, so a string column is ``StringDtype``
+    rather than ``object``, missed every branch, and was declared INTEGER.
+    Cluster labels written as ``"0"``, ``"1"``, ``"2"`` came back as ``0``,
+    ``1``, ``2`` -- silently, because SQLite stores what it is handed and only
+    the read is typed. Anything comparing a label to a string, or looking it up
+    in a stored category order, then quietly stopped matching.
+
+    Defaulting to TEXT means an unrecognised dtype loses its type rather than
+    its value, which is the recoverable direction.
+    """
+    dtype = series.dtype
+    if pd.api.types.is_bool_dtype(dtype):
+        return "INTEGER"
+    if pd.api.types.is_float_dtype(dtype):
+        return "REAL"
+    if pd.api.types.is_integer_dtype(dtype):
+        return "INTEGER"
+    return "TEXT"
+
+
 class Modality:
     """Per-modality accessor for matrix layers."""
 
@@ -1809,13 +1834,7 @@ class CytomeDataset:
         for col in frame.columns:
             if col.lower() in existing_lower:
                 continue
-            sql_type = "INTEGER"
-            if pd.api.types.is_float_dtype(frame[col]):
-                sql_type = "REAL"
-            elif pd.api.types.is_object_dtype(frame[col]):
-                sql_type = "TEXT"
-            elif isinstance(frame[col].dtype, pd.CategoricalDtype):
-                sql_type = "TEXT"
+            sql_type = _sql_column_type(frame[col])
             self._conn.execute(
                 f"ALTER TABLE {table_name} ADD COLUMN {_quote_ident(col)} {sql_type}"
             )

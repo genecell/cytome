@@ -9,8 +9,12 @@ resolution for every other modality. The fix gates those fast-paths on the
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-import anndata as ad
 import pytest
+
+# anndata is an optional extra (`pip install cytome[anndata]`). Imported at
+# module scope this fails at *collection*, which aborts the entire run for
+# anyone who installed cytome without it; skipping is the honest outcome.
+ad = pytest.importorskip("anndata")
 
 import cytome
 
