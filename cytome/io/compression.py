@@ -73,6 +73,12 @@ def decompress_blob(data: bytes, method: str = "zstd") -> bytes:
     bytes
         Decompressed data.
     """
+    # The importer writes raw int32 bytes with method "none" (or an empty
+    # string) when asked not to compress. Those bytes must never reach the
+    # magic-byte detector below: a little-endian int32 can start with any
+    # value, including one that looks like a zstd or lz4 header.
+    if method in ("none", "", "raw", None) or not isinstance(method, str):
+        return bytes(data)
     if method in ("lz4", "zlib"):
         actual = method
     else:
@@ -118,6 +124,31 @@ def decode_ends(blob: bytes, method: str, starts, encoding: int = 0):
     if encoding == 1:
         arr = starts + arr
     return arr
+
+
+def decode_lengths(ends_blob: bytes, method: str, encoding: int = 0, starts=None):
+    """Fragment lengths (``end - start``) from the blobs that hold them.
+
+    With ``encoding == 1`` the ends blob *is* the length column -- the
+    importer stores ``end - start`` there -- so the lengths come from one
+    blob with no arithmetic and the starts are never touched. With
+    ``encoding == 0`` the blob holds absolute ends and ``starts`` (already
+    decoded) is required.
+
+    This is the one place that knows the difference; callers that want
+    lengths should ask for lengths rather than subtracting two columns they
+    had to decode first.
+    """
+    import numpy as np
+    raw = decompress_blob(ends_blob, method)
+    arr = np.frombuffer(raw, dtype=np.int32).copy()
+    if encoding == 1:
+        return arr
+    if starts is None:
+        raise ValueError(
+            "decode_lengths: encoding 0 stores absolute ends, so the decoded "
+            "starts are needed to recover lengths.")
+    return arr - starts
 
 
 def _resolve_method(method: str) -> str:

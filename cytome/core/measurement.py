@@ -40,7 +40,10 @@ class MeasurementLayer:
         n_rows, n_cols = self.shape
 
         row_start, row_end = _slice_bounds(row_sel, n_rows)
-        matrix = read_sparse_slice(self._conn, self._matrix_name, row_start, row_end)
+        if self.is_column_major:
+            matrix = self.to_memory()[row_start:row_end]
+        else:
+            matrix = read_sparse_slice(self._conn, self._matrix_name, row_start, row_end)
 
         if isinstance(col_sel, slice):
             c_start, c_end = _slice_bounds(col_sel, n_cols)
@@ -52,7 +55,16 @@ class MeasurementLayer:
         raise TypeError(f"Unsupported column selector: {type(col_sel)}")
 
     def to_memory(self) -> sp.csr_matrix:
-        """Load entire matrix into memory."""
+        """Load entire matrix into memory.
+
+        A column-major matrix is assembled from its CSC chunks; row-major
+        from its row chunks. Either way the result is CSR.
+        """
+        if self.is_column_major:
+            blocks = [chunk for _, _, chunk in self.iter_columns()]
+            if not blocks:
+                return sp.csr_matrix(self.shape, dtype=self.dtype)
+            return sp.hstack(blocks, format="csc").tocsr()
         return read_sparse_chunked(self._conn, self._matrix_name)
 
     def rows(self, indices: np.ndarray) -> sp.csr_matrix:
@@ -60,6 +72,8 @@ class MeasurementLayer:
 
         Only decompresses chunks containing at least one requested row.
         """
+        if self.is_column_major:
+            return self.to_memory()[np.asarray(indices)]
         return read_sparse_rows(self._conn, self._matrix_name, indices)
 
     def iter_rows(self, row_filter=None) -> Iterator[Tuple[int, int, sp.csr_matrix]]:
@@ -68,27 +82,66 @@ class MeasurementLayer:
         ``row_filter``: sorted global row indices to keep. Chunks containing
         none of them are skipped without being fetched or decompressed.
         """
+        if self.is_column_major:
+            # Silence here would be an empty matrix: iter_chunks would yield
+            # nothing and every consumer would compute on nothing.
+            raise ValueError(
+                f"{self._matrix_name!r} is stored column-major (CSC chunks only); "
+                f"it has no row chunks to iterate. Read it by columns with "
+                f"iter_columns(), or use a consumer that supports the CSC layout."
+            )
         yield from read_sparse_rows_iter(self._conn, self._matrix_name,
                                          row_filter=row_filter)
 
     def column(self, idx: int) -> sp.csr_matrix:
         """Read one feature column across all rows."""
-        if self.has_feature_index:
-            for col_start, col_end, chunk in self.iter_columns():
-                if col_start <= idx < col_end:
-                    return chunk[:, idx - col_start].tocsr()
-        return self[:, idx]
+        return self.columns([idx])
 
     def columns(self, indices: list[int] | np.ndarray) -> sp.csr_matrix:
-        """Read selected feature columns across all rows."""
-        idx_list = list(indices)
-        if self.has_feature_index and idx_list:
-            pieces = [self.column(i) for i in idx_list]
-            return sp.hstack(pieces, format="csr")
-        return self[:, list(indices)]
+        """Read selected feature columns across all rows, in the order given.
+
+        With a feature index this touches only the chunks that actually hold
+        the requested columns, each one once. The previous form called
+        ``column()`` per index and each of those re-iterated every chunk in
+        the matrix, so asking for k features read the whole store k times --
+        fine for one marker, quadratic for a marker panel.
+        """
+        idx_list = [int(i) for i in indices]
+        if not idx_list:
+            return sp.csr_matrix((self.shape[0], 0), dtype=self.dtype)
+        if not self.has_feature_index:
+            return self[:, idx_list]
+
+        wanted = np.asarray(idx_list, dtype=np.int64)
+        out = sp.lil_matrix((self.shape[0], wanted.shape[0]), dtype=self.dtype)
+        remaining = wanted.shape[0]
+        for col_start, col_end, chunk in self.iter_columns():
+            hits = np.flatnonzero((wanted >= col_start) & (wanted < col_end))
+            if hits.size == 0:
+                continue
+            local = chunk[:, (wanted[hits] - col_start).tolist()].tocsc()
+            for slot, j in enumerate(hits):
+                out[:, int(j)] = local[:, slot]
+            remaining -= hits.size
+            if remaining <= 0:
+                break
+        return out.tocsr()
 
     def build_feature_index(self, chunk_size: int | None = None, compression: str = "zstd") -> None:
-        """Build optional CSC chunk index for feature-wise iteration."""
+        """Build the column-major (CSC) chunks for feature-wise iteration.
+
+        **This materialises the whole matrix in memory** (``to_memory().tocsc()``)
+        before writing the chunks, so it is for matrices that fit in RAM -- a
+        gene matrix, a small peak set. For a large peak or tile matrix do not
+        call this: re-quantify with ``--layout csc`` (the importer's and the
+        quantifier's default), which writes column-major in one bounded pass
+        without ever holding the matrix.
+
+        Why it matters: on a matrix with far more features than cells the SVD
+        engine's transpose product is about 8x faster on column-major storage,
+        because it scatters into a ``cells x block`` buffer that fits in cache
+        rather than a ``features x block`` one that does not.
+        """
         full_csc = self.to_memory().tocsc()
         chunk_size = int(chunk_size or self._meta.get("chunk_size", 256))
         self._conn.execute(
@@ -178,7 +231,8 @@ class MeasurementLayer:
     def _load_meta(self) -> dict[str, object]:
         row = self._conn.execute(
             """
-            SELECT n_rows, n_cols, dtype, chunk_size, has_csc, csc_chunk_size, csc_n_chunks
+            SELECT n_rows, n_cols, dtype, chunk_size, has_csc, csc_chunk_size, csc_n_chunks,
+                   n_chunks
             FROM matrix_meta WHERE matrix_name = ?
             """,
             (self._matrix_name,),
@@ -193,7 +247,13 @@ class MeasurementLayer:
             "has_csc": row[4],
             "csc_chunk_size": row[5],
             "csc_n_chunks": row[6],
+            "n_chunks": row[7],
         }
+
+    @property
+    def is_column_major(self) -> bool:
+        """True when the matrix is stored as CSC chunks only (no row chunks)."""
+        return bool(self._meta.get("has_csc")) and not self._meta.get("n_chunks")
 
 
 def _slice_bounds(sel: object, size: int) -> tuple[int, int]:

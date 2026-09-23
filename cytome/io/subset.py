@@ -20,8 +20,15 @@ def subset(
     include_embeddings: bool = True,
     include_graphs: bool = False,
     copy_annotations: bool = True,
+    matrices: "list[str] | None" = None,
 ):
     """Subset cells to a new Cytome dataset.
+
+    ``matrices`` names the matrices to carry (e.g. ``["ATAC_counts"]``);
+    ``None`` carries every matrix in the store. A caller that clusters one
+    modality of a store holding several -- peaks and tiles, say -- should
+    name the one it needs: the others would otherwise be read and rewritten
+    for nothing, once per subset.
 
     ``copy_annotations`` (default True) carries over the **cell-independent**
     auxiliary data that the cell filter does not touch — the imported GTF gene
@@ -63,7 +70,7 @@ def subset(
             out.set_entity(tbl, _read_entity_dataframe(ds._conn, tbl))
     out.flush()
 
-    _subset_matrices_streaming(ds, out, keep_idx)
+    _subset_matrices_streaming(ds, out, keep_idx, matrices=matrices)
 
     if include_embeddings:
         from cytome.io.chunked_io import read_dense_rows
@@ -137,7 +144,8 @@ def subset(
     return out
 
 
-def _subset_matrices_streaming(ds: CytomeDataset, out: CytomeDataset, keep_idx: np.ndarray) -> None:
+def _subset_matrices_streaming(ds: CytomeDataset, out: CytomeDataset, keep_idx: np.ndarray,
+                               matrices: "list[str] | None" = None) -> None:
     """Subset every matrix into ``out`` **without** materialising the whole
     matrix in RAM.
 
@@ -165,9 +173,20 @@ def _subset_matrices_streaming(ds: CytomeDataset, out: CytomeDataset, keep_idx: 
     mat_rows = ds._conn.execute(
         "SELECT matrix_name, n_cols, dtype, col_entity FROM matrix_meta ORDER BY matrix_name"
     ).fetchall()
+    if matrices is not None:
+        wanted = set(matrices)
+        present = {r[0] for r in mat_rows}
+        missing = sorted(wanted - present)
+        if missing:
+            raise KeyError(f"subset(matrices=...): not in the store: {missing}; "
+                           f"available: {sorted(present)}")
+        mat_rows = [r for r in mat_rows if r[0] in wanted]
 
     out_modalities = set(out.modalities)
     for matrix_name, n_cols, dtype, col_entity in mat_rows:
+        if _is_column_major(ds._conn, matrix_name):
+            _subset_csc_matrix(ds, out, matrix_name, int(n_cols), dtype, col_entity, keep_idx)
+            continue
         writer = out.create_layer_writer(
             matrix_name, n_rows=n_out, n_cols=int(n_cols),
             dtype=dtype, row_entity="cells", col_entity=col_entity,
@@ -207,6 +226,64 @@ def _subset_matrices_streaming(ds: CytomeDataset, out: CytomeDataset, keep_idx: 
     if out_modalities:
         out._write_manifest_key("modalities", sorted(out_modalities))
         out._manifest = out._read_manifest()
+
+
+
+def _is_column_major(conn, matrix_name: str) -> bool:
+    row = conn.execute(
+        "SELECT COALESCE(n_chunks, 0), COALESCE(has_csc, 0) FROM matrix_meta WHERE matrix_name = ?",
+        (matrix_name,),
+    ).fetchone()
+    return bool(row) and row[0] == 0 and bool(row[1])
+
+
+def _subset_csc_matrix(ds, out, matrix_name: str, n_cols: int, dtype, col_entity, keep_idx) -> None:
+    """Row-select a column-major matrix, chunk by chunk, into ``out``.
+
+    A CSC chunk holds all rows of a run of columns, so keeping rows is a
+    fancy index on each chunk and the column ranges are unchanged. Nothing
+    is transposed and one chunk is resident at a time. The result keeps the
+    layout: CSC chunks only, ``matrix_meta.layout = 'csc'``.
+    """
+    from cytome.core.measurement import MeasurementLayer
+    from cytome.io.compression import compress_blob
+    src = MeasurementLayer(ds._conn, matrix_name)
+    meta = ds._conn.execute(
+        "SELECT csc_chunk_size, created_at FROM matrix_meta WHERE matrix_name = ?", (matrix_name,)
+    ).fetchone()
+    keep = np.asarray(keep_idx, dtype=np.int64)
+    n_out = int(len(keep))
+    out._conn.execute("DELETE FROM matrix_csc_chunks WHERE matrix_name = ?", (matrix_name,))
+    total_nnz = 0
+    n_chunks = 0
+    for col_start, col_end, chunk in src.iter_columns():
+        sub = chunk[keep]                       # CSC stays CSC; rows in keep order
+        sub = sp.csc_matrix(sub)
+        sub.sort_indices()
+        total_nnz += int(sub.nnz)
+        out._conn.execute(
+            "INSERT INTO matrix_csc_chunks (matrix_name, chunk_idx, col_start, col_end, n_nonzero, "
+            "data_blob, indices_blob, indptr_blob, dtype, compression) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (matrix_name, n_chunks, int(col_start), int(col_end), int(sub.nnz),
+             compress_blob(np.ascontiguousarray(sub.data, dtype=np.dtype(dtype)).tobytes(), "lz4"),
+             compress_blob(sub.indices.astype(np.int32).tobytes(), "lz4"),
+             compress_blob(sub.indptr.astype(np.int32).tobytes(), "lz4"),
+             str(np.dtype(dtype)), "lz4"),
+        )
+        n_chunks += 1
+    try:
+        out._conn.execute("ALTER TABLE matrix_meta ADD COLUMN layout TEXT DEFAULT 'csr'")
+    except Exception:
+        pass
+    out._conn.execute("DELETE FROM matrix_meta WHERE matrix_name = ?", (matrix_name,))
+    out._conn.execute(
+        "INSERT INTO matrix_meta (matrix_name, n_rows, n_cols, n_nonzero, dtype, row_entity, col_entity, "
+        "chunk_size, n_chunks, has_csc, csc_chunk_size, csc_n_chunks, created_at, layout) "
+        "VALUES (?,?,?,?,?,'cells',?,128,0,1,?,?,?,'csc')",
+        (matrix_name, n_out, n_cols, total_nnz, str(np.dtype(dtype)), col_entity,
+         meta[0] if meta else None, n_chunks, meta[1] if meta else None),
+    )
+    out._conn.commit()
 
 
 def downsample(

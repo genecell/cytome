@@ -211,6 +211,26 @@ def _repair_matrix_rows(conn, matrix_name: str, current_n_rows: int, target_n_ro
     ).fetchone()
     if meta is None:
         return
+
+    # A column-major matrix has no rows in `matrix_chunks`, so the stitch
+    # below would find nothing, build an all-zero CSR of the target shape and
+    # write THAT over the real data -- silent, total loss of the matrix. There
+    # is no honest truncation to do here either: the row count that needs
+    # fixing is metadata, and the column chunks are already correct. Refuse,
+    # loudly, and say what to do.
+    layout = conn.execute(
+        "SELECT COALESCE(n_chunks, 0), COALESCE(has_csc, 0) FROM matrix_meta "
+        "WHERE matrix_name = ?", (matrix_name,)
+    ).fetchone()
+    if layout is not None and layout[0] == 0 and layout[1]:
+        raise ValueError(
+            f"{matrix_name!r} is stored column-major and has {current_n_rows} "
+            f"rows against {target_n_rows} in its row entity table. Repair "
+            f"cannot truncate a column-major matrix by rewriting rows -- it "
+            f"has none -- and rewriting it as an empty row-major matrix would "
+            f"destroy it. Fix the entity table to match the matrix, or "
+            f"re-create the matrix."
+        )
     n_cols, dtype_str, chunk_size, row_entity, col_entity = meta
     n_cols = int(n_cols)
     chunk_size = int(chunk_size)

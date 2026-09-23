@@ -179,18 +179,9 @@ def read_feature_column(
     """Stream a single column from ``{modality}_{layer}`` into a dense
     per-cell vector. Caller verifies the matrix exists.
     """
-    n = ds.n_cells
-    out = np.zeros(n, dtype=np.float32)
-    for chunk, idxs in ds.iter_chunks(
-        modality=modality, layer=layer, batch_size=batch_size,
-    ):
-        col = chunk[:, feat_idx]
-        if hasattr(col, "toarray"):
-            col = col.toarray().ravel()
-        else:
-            col = np.asarray(col).ravel()
-        out[idxs] = col
-    return out
+    return read_feature_columns(
+        ds, modality, layer, [feat_idx], batch_size=batch_size,
+    )[:, 0]
 
 
 def read_feature_columns(
@@ -203,9 +194,23 @@ def read_feature_columns(
     one pass per feature — the batched analogue of :func:`read_feature_column`.
     Caller verifies the matrix exists.
     """
+    from ..core.measurement import MeasurementLayer
+
     n = ds.n_cells
     fi = np.asarray(feat_indices, dtype=np.int64)
     out = np.zeros((n, fi.shape[0]), dtype=np.float32)
+    if fi.size == 0:
+        return out
+
+    # A column-major matrix has no row chunks at all, and reading a handful of
+    # feature columns is the operation it is best at: only the chunks holding
+    # those columns are touched. The row path stays for row-major stores,
+    # where slicing columns out of each row chunk is the cheaper direction.
+    ml = MeasurementLayer(ds._conn, f"{modality}_{layer}")
+    if ml.is_column_major:
+        block = ml.columns(fi.tolist())
+        return np.asarray(block.toarray(), dtype=np.float32)
+
     for chunk, idxs in ds.iter_chunks(
         modality=modality, layer=layer, batch_size=batch_size,
     ):
@@ -214,6 +219,55 @@ def read_feature_columns(
             sub = sub.toarray()
         out[idxs, :] = np.asarray(sub, dtype=np.float32)
     return out
+
+
+def matrix_sums(ds, modality: str, layer: str, batch_size: int = 2048):
+    """Per-cell and per-feature sums and non-zero counts, in ONE pass.
+
+    Reads the matrix in whichever direction it is stored, so a column-major
+    store -- the fragment importer's and the peak quantifier's default -- is
+    walked by columns and a row-major one by rows. Returns
+
+        (cell_sum, cell_nnz, feature_sum, feature_nnz)
+
+    as float64/int64 arrays. This is the shared primitive for everything that
+    needs matrix marginals (cell depth, feature metrics, TF-IDF statistics),
+    so those callers do not each carry their own layout branch.
+    """
+    from ..core.measurement import MeasurementLayer
+
+    n_cells = int(ds.n_cells)
+    name = f"{modality}_{layer}"
+    ml = MeasurementLayer(ds._conn, name)
+    n_features = int(ml.shape[1])
+
+    cell_sum = np.zeros(n_cells, dtype=np.float64)
+    cell_nnz = np.zeros(n_cells, dtype=np.int64)
+    feat_sum = np.zeros(n_features, dtype=np.float64)
+    feat_nnz = np.zeros(n_features, dtype=np.int64)
+
+    if ml.is_column_major:
+        for col_start, col_end, chunk in ml.iter_columns():
+            chunk = chunk.tocsc()
+            if chunk.nnz == 0:
+                continue
+            nz = chunk > 0
+            feat_sum[col_start:col_end] += np.asarray(
+                chunk.sum(axis=0), dtype=np.float64).ravel()
+            feat_nnz[col_start:col_end] += np.asarray(
+                nz.sum(axis=0), dtype=np.int64).ravel()
+            cell_sum += np.asarray(chunk.sum(axis=1), dtype=np.float64).ravel()
+            cell_nnz += np.asarray(nz.sum(axis=1), dtype=np.int64).ravel()
+    else:
+        for chunk, idxs in ds.iter_chunks(
+            modality=modality, layer=layer, batch_size=batch_size,
+        ):
+            nz = chunk > 0
+            cell_sum[idxs] = np.asarray(chunk.sum(axis=1), dtype=np.float64).ravel()
+            cell_nnz[idxs] = np.asarray(nz.sum(axis=1), dtype=np.int64).ravel()
+            feat_sum += np.asarray(chunk.sum(axis=0), dtype=np.float64).ravel()
+            feat_nnz += np.asarray(nz.sum(axis=0), dtype=np.int64).ravel()
+    return cell_sum, cell_nnz, feat_sum, feat_nnz
 
 
 def modality_cell_depth(
@@ -253,12 +307,8 @@ def modality_cell_depth(
                 return n_frags
         except Exception:
             pass
-    n_cells = int(ds.n_cells)
-    depth = np.zeros(n_cells, dtype=np.float64)
-    for chunk, idxs in ds.iter_chunks(
-        modality=modality, layer="counts", batch_size=batch_size,
-    ):
-        depth[idxs] = np.asarray(chunk.sum(axis=1)).ravel()
+    depth, _cnnz, _fsum, _fnnz = matrix_sums(
+        ds, modality, "counts", batch_size=batch_size)
     ds.metadata[cache_key] = depth
     ds.flush()
     return depth
@@ -272,5 +322,6 @@ __all__ = [
     "modality_has_feature",
     "read_feature_column",
     "read_feature_columns",
+    "matrix_sums",
     "modality_cell_depth",
 ]

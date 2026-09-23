@@ -26,6 +26,7 @@ from cytome.utils.modality import (
     modality_var_entity,
     modality_feature_table_info,
     modality_has_feature,
+    matrix_sums,
     read_feature_column,
     read_feature_columns,
     modality_cell_depth,
@@ -65,7 +66,7 @@ __all__ = [
 # The manifest's writer_version reads THIS, not the installed distribution
 # metadata: a source tree run against a stale editable install would otherwise
 # stamp files with the version of code that did not write them.
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 
 def import_gtf(ds, gtf_path, **kwargs):
@@ -75,7 +76,14 @@ def import_gtf(ds, gtf_path, **kwargs):
 
 
 def open(path: str | Path) -> CytomeDataset:
-    """Open an existing Cytome dataset."""
+    """Open an existing Cytome dataset.
+
+    Says once, on stderr, when the file is on a network file system: a
+    cytome is read many times per analysis, and from a node-local disk that
+    is typically ten times faster. Nothing is printed on a local disk.
+    """
+    from cytome.utils.storage import network_filesystem_notice
+    network_filesystem_notice(path)
     return CytomeDataset(path, mode="r+")
 
 

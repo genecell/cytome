@@ -8,7 +8,7 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 import sqlite3
 
-from cytome.io.compression import decompress_blob, decode_starts, decode_ends
+from cytome.io.compression import decompress_blob, decode_starts, decode_ends, decode_lengths
 from cytome.index.rtree import query_fragment_rtree
 from cytome.io.convert_fragments import export_fragments, export_fragments_by_group, _validate_column
 
@@ -106,6 +106,82 @@ class FragmentStore:
             return row is not None and row[0] > 0
         except sqlite3.OperationalError:
             return False
+
+    # Blob columns a reader may ask for, and which stored blobs each needs.
+    # ``lengths`` is the interesting one: with encoding 1 it is the ends blob
+    # alone, so a length-only scan reads a third of the bytes a full decode
+    # does and never runs the cumsum that rebuilds the starts.
+    _READ_COLUMNS = ("starts", "ends", "lengths", "cells")
+
+    def chunks(self, chrom: Optional[str] = None):
+        """The chunk table: one row per stored chunk, cheap to read.
+
+        Returns a list of ``(id, chrom, chunk_idx, n_fragments)`` tuples
+        ordered by chromosome and chunk index. This is metadata, not blobs, so it costs nothing and
+        is what a caller should look at before deciding which chunks to
+        ``read`` -- sampling by chunk, restricting to a chromosome, or
+        sizing an output.
+        """
+        if chrom is None:
+            # Ordered by (chrom, chunk_idx), not rowid: an importer that
+            # merges chromosomes in parallel writes chunks in whatever order
+            # they finish, and a caller sampling chunks by seed needs an
+            # order that is a property of the data.
+            rows = self._conn.execute(
+                "SELECT id, chrom, chunk_idx, n_fragments FROM fragment_chunks "
+                "ORDER BY chrom, chunk_idx").fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id, chrom, chunk_idx, n_fragments FROM fragment_chunks "
+                "WHERE chrom = ? ORDER BY chunk_idx", (str(chrom),)).fetchall()
+        return [(int(r[0]), str(r[1]), int(r[2]), int(r[3] or 0)) for r in rows]
+
+    def read(self, chunk_id: int, columns: Sequence[str] = ("starts", "ends", "cells")) -> Dict[str, np.ndarray]:
+        """Decode one chunk, reading only the blobs the requested columns need.
+
+        ``columns`` is any subset of ``starts``, ``ends``, ``lengths`` and
+        ``cells``. Only the stored blobs those columns depend on are fetched
+        from SQLite and decompressed; asking for ``lengths`` alone on a
+        chunk with ``encoding == 1`` touches one blob.
+        """
+        cols = tuple(columns)
+        unknown = [c for c in cols if c not in self._READ_COLUMNS]
+        if unknown:
+            raise ValueError(
+                f"FragmentStore.read: unknown column(s) {unknown}; "
+                f"choose from {list(self._READ_COLUMNS)}")
+        row = self._conn.execute(
+            "SELECT compression, COALESCE(encoding, 0) FROM fragment_chunks WHERE id = ?",
+            (int(chunk_id),)).fetchone()
+        if row is None:
+            raise KeyError(f"FragmentStore.read: no chunk with id {chunk_id}")
+        comp, enc = row
+        want = set(cols)
+        need_starts = ("starts" in want or "ends" in want
+                       or ("lengths" in want and enc != 1))
+        need_ends = "ends" in want or "lengths" in want
+        need_cells = "cells" in want
+        select = ", ".join(
+            [c for c, n in (("starts_blob", need_starts), ("ends_blob", need_ends),
+                            ("cell_idx_blob", need_cells)) if n] or ["id"])
+        blobs = self._conn.execute(
+            f"SELECT {select} FROM fragment_chunks WHERE id = ?", (int(chunk_id),)).fetchone()
+        it = iter(blobs)
+        starts_b = next(it) if need_starts else None
+        ends_b = next(it) if need_ends else None
+        cells_b = next(it) if need_cells else None
+
+        out: Dict[str, np.ndarray] = {}
+        starts = decode_starts(starts_b, comp, enc) if need_starts else None
+        if "starts" in want:
+            out["starts"] = starts
+        if "ends" in want:
+            out["ends"] = decode_ends(ends_b, comp, starts, enc)
+        if "lengths" in want:
+            out["lengths"] = decode_lengths(ends_b, comp, enc, starts)
+        if need_cells:
+            out["cells"] = np.frombuffer(decompress_blob(cells_b, comp), dtype=np.int32).copy()
+        return out
 
     def iter_chromosome_chunks(self, chrom: str) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Yield (starts, ends, cell_idx) numpy arrays per compressed chunk.

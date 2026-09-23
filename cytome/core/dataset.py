@@ -453,6 +453,18 @@ class CytomeDataset:
         return entry
 
     @property
+    def fragments(self):
+        """The fragment store.
+
+        Fragments are stored per dataset, not per modality, so this is the
+        natural place to reach them; ``ds.ATAC.fragments`` returns the same
+        object and stays for callers that spell it that way.
+        """
+        from cytome.core.fragments import FragmentStore
+
+        return FragmentStore(self._conn, self)
+
+    @property
     def modalities(self) -> list[str]:
         """Modalities present in this cytome.
 
@@ -850,6 +862,7 @@ class CytomeDataset:
         cell_mask: np.ndarray | None = None,
         col_mask: np.ndarray | None = None,
         batch_size: int | None = None,
+        max_batch_nnz: int | None = None,
     ):
         """Iterate over stored matrix chunks without full materialization.
 
@@ -875,6 +888,10 @@ class CytomeDataset:
             batches. Controls the trade-off between RAM usage and compute
             efficiency. ``None`` yields raw on-disk chunks (typically 16
             rows each). Suggested values: 512, 1024, 2048, 4096 rows.
+        max_batch_nnz
+            Optional bound on non-zeros per batch. A batch closes when it
+            reaches ``batch_size`` rows *or* this many non-zeros, whichever
+            comes first. Bounds a batch's memory whatever the cell order.
 
         Yields
         ------
@@ -920,16 +937,25 @@ class CytomeDataset:
                     chunk_csr = chunk_csr[:, col_mask]
                 yield chunk_csr, row_indices
         else:
+            # A batch closes on rows, or on non-zeros when ``max_batch_nnz``
+            # is given. Rows alone let a batch of the deepest cells be many
+            # times the size of an average one; the non-zero bound holds the
+            # batch's memory whatever the cell order, with no change to what
+            # is stored. Granularity is one chunk.
             buffer_chunks: list[sp.spmatrix] = []
             buffer_indices: list[np.ndarray] = []
             buffer_rows = 0
+            buffer_nnz = 0
 
             for chunk_csr, row_indices in raw_iter:
                 buffer_chunks.append(chunk_csr)
                 buffer_indices.append(row_indices)
                 buffer_rows += chunk_csr.shape[0]
+                buffer_nnz += int(chunk_csr.nnz)
 
-                if buffer_rows >= batch_size:
+                if buffer_rows >= batch_size or (
+                    max_batch_nnz is not None and buffer_nnz >= max_batch_nnz
+                ):
                     merged = sp.vstack(buffer_chunks, format="csr")
                     if col_mask is not None:
                         merged = merged[:, col_mask]
@@ -937,6 +963,7 @@ class CytomeDataset:
                     buffer_chunks = []
                     buffer_indices = []
                     buffer_rows = 0
+                    buffer_nnz = 0
 
             if buffer_chunks:
                 merged = sp.vstack(buffer_chunks, format="csr")
