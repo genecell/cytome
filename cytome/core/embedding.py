@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from cytome.core import _handles
+
 import numpy as np
 import sqlite3
 
@@ -13,6 +15,7 @@ class EmbeddingArray:
 
     def __init__(self, conn: sqlite3.Connection, array_name: str) -> None:
         self._conn = conn
+        _handles.bind(self, conn)
         self._array_name = array_name
         row = conn.execute(
             "SELECT n_rows, n_cols, dtype FROM embedding_meta WHERE array_name = ?",

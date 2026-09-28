@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from cytome.core import _handles
+
 from typing import Iterator, Tuple
 
 import numpy as np
@@ -22,6 +24,7 @@ class MeasurementLayer:
 
     def __init__(self, conn: sqlite3.Connection, matrix_name: str) -> None:
         self._conn = conn
+        _handles.bind(self, conn)
         self._matrix_name = matrix_name
         self._meta = self._load_meta()
 

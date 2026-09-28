@@ -302,16 +302,23 @@ def modality_cell_depth(
         try:
             n_frags = np.asarray(ds.cells["n_fragments"], dtype=np.float64)
             if n_frags.size == ds.n_cells and float(n_frags.sum()) > 0:
-                ds.metadata[cache_key] = n_frags
-                ds.flush()
+                _cache(ds, cache_key, n_frags)
                 return n_frags
         except Exception:
             pass
     depth, _cnnz, _fsum, _fnnz = matrix_sums(
         ds, modality, "counts", batch_size=batch_size)
-    ds.metadata[cache_key] = depth
-    ds.flush()
+    _cache(ds, cache_key, depth)
     return depth
+
+
+def _cache(ds, key, value) -> None:
+    """Keep a computed statistic in the store, unless it was opened
+    read-only: then it is recomputed on the next call."""
+    if getattr(ds, "read_only", False):
+        return
+    ds.metadata[key] = value
+    ds.flush()
 
 
 __all__ = [

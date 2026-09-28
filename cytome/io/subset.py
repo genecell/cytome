@@ -28,7 +28,9 @@ def subset(
     ``None`` carries every matrix in the store. A caller that clusters one
     modality of a store holding several -- peaks and tiles, say -- should
     name the one it needs: the others would otherwise be read and rewritten
-    for nothing, once per subset.
+    for nothing, once per subset. With ``matrices`` given, the output also
+    carries only the feature tables those matrices are indexed by (``peaks``
+    for ``ATAC_counts``), not the feature tables of other modalities.
 
     ``copy_annotations`` (default True) carries over the **cell-independent**
     auxiliary data that the cell filter does not touch — the imported GTF gene
@@ -41,7 +43,17 @@ def subset(
     cells makes such a graph incomplete, so it must be re-derived.
     """
     del include_graphs
+    ds.flush()            # what the caller has written so far is part of the source
     keep_idx = _resolve_keep_indices(ds.n_cells, mask)
+    out = _begin_output(ds, keep_idx, output, matrices, copy_annotations)
+    _subset_matrices_streaming(ds, out, keep_idx, matrices=matrices)
+    _finish_output(ds, out, keep_idx, output, include_embeddings, include_fragments,
+                   copy_annotations)
+    return out
+
+
+def _begin_output(ds, keep_idx, output, matrices, copy_annotations):
+    """A new store with the kept cells, the feature tables and the samples; no matrices yet."""
     # force=True preserves the historical overwrite behaviour of subset/
     # filter_cells (the QC pipeline regenerates subset cytomes in place);
     # the create-guard targets the user-facing creators, not derived subsets.
@@ -51,26 +63,36 @@ def subset(
     cells["cell_idx"] = np.arange(cells.shape[0], dtype=np.int64)
     out.set_entity("cells", cells)
 
-    if ds.n_genes:
-        out.set_entity("genes", ds.genes.to_pandas())
-    if ds.n_peaks:
-        out.set_entity("peaks", ds.peaks.to_pandas())
-    # Copy any other column-axis entity tables (tiles, samples, proteins, and —
-    # when copying annotations — the GA_genes var table) that have rows. These
-    # are gene/feature-axis (cell-independent), so they're copied in full.
-    _entity_tables = ["tiles", "samples", "proteins"]
+    # Feature tables. A plain subset carries all of them. One that names its
+    # matrices carries the feature tables of those matrices and no others: a
+    # caller clustering the peak matrix has no use for five million tiles,
+    # and copying them cost more than everything else in the subset together.
+    carried = _feature_tables_of(ds, matrices)
+
+    def _wanted(tbl: str) -> bool:
+        return carried is None or tbl in carried
+
+    # Feature tables do not depend on the cells kept, so they are copied row
+    # for row, in batches, straight from one connection to the other: no
+    # DataFrame of five million tiles, and every value arrives as stored.
+    # ``samples`` describes the cells' samples and is always carried.
+    out.flush()                                   # the cells table first
+    _feature_tables = ["genes", "peaks", "tiles", "proteins"]
     if copy_annotations:
-        _entity_tables.append("GA_genes")
-    for tbl in _entity_tables:
-        try:
-            n = ds._conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
-        except Exception:
-            continue
-        if n:
-            out.set_entity(tbl, _read_entity_dataframe(ds._conn, tbl))
+        _feature_tables.append("GA_genes")
+    for tbl in _feature_tables:
+        if _wanted(tbl):
+            _copy_feature_table(ds._conn, out._conn, tbl)
+    _copy_feature_table(ds._conn, out._conn, "samples")
     out.flush()
 
-    _subset_matrices_streaming(ds, out, keep_idx, matrices=matrices)
+    return out
+
+
+def _finish_output(ds, out, keep_idx, output, include_embeddings, include_fragments,
+                   copy_annotations):
+    """Everything a subset carries after its matrices: embeddings, annotations, spatial
+    coordinates, fragments, metadata, provenance; then the consistency check."""
 
     if include_embeddings:
         from cytome.io.chunked_io import read_dense_rows
@@ -141,7 +163,31 @@ def subset(
             stacklevel=2,
         )
 
-    return out
+
+
+def _feature_tables_of(ds, matrices) -> "set[str] | None":
+    """The feature tables the named matrices are indexed by, or ``None`` for
+    "every table" when no matrices are named.
+
+    A matrix records its column entity in ``matrix_meta.col_entity``; where
+    an old store left it empty the modality's own table is used.
+    """
+    if matrices is None:
+        return None
+    from cytome.utils.modality import modality_feature_table_info
+    tables: set[str] = set()
+    for name in matrices:
+        row = ds._conn.execute(
+            "SELECT col_entity FROM matrix_meta WHERE matrix_name = ?", (name,)).fetchone()
+        if row is None:
+            continue                      # reported, with the list, by the matrix copy
+        if row[0]:
+            tables.add(str(row[0]))
+        try:
+            tables.add(modality_feature_table_info(ds, name.split("_", 1)[0])[0])
+        except Exception:
+            pass
+    return tables
 
 
 def _subset_matrices_streaming(ds: CytomeDataset, out: CytomeDataset, keep_idx: np.ndarray,
@@ -184,6 +230,9 @@ def _subset_matrices_streaming(ds: CytomeDataset, out: CytomeDataset, keep_idx: 
 
     out_modalities = set(out.modalities)
     for matrix_name, n_cols, dtype, col_entity in mat_rows:
+        if "_" in matrix_name and matrix_name.split("_", 1)[0]:
+            # Neither writer below registers the modality in the manifest.
+            out_modalities.add(matrix_name.split("_", 1)[0])
         if _is_column_major(ds._conn, matrix_name):
             _subset_csc_matrix(ds, out, matrix_name, int(n_cols), dtype, col_entity, keep_idx)
             continue
@@ -246,44 +295,148 @@ def _subset_csc_matrix(ds, out, matrix_name: str, n_cols: int, dtype, col_entity
     layout: CSC chunks only, ``matrix_meta.layout = 'csc'``.
     """
     from cytome.core.measurement import MeasurementLayer
-    from cytome.io.compression import compress_blob
     src = MeasurementLayer(ds._conn, matrix_name)
-    meta = ds._conn.execute(
-        "SELECT csc_chunk_size, created_at FROM matrix_meta WHERE matrix_name = ?", (matrix_name,)
-    ).fetchone()
     keep = np.asarray(keep_idx, dtype=np.int64)
-    n_out = int(len(keep))
     out._conn.execute("DELETE FROM matrix_csc_chunks WHERE matrix_name = ?", (matrix_name,))
     total_nnz = 0
     n_chunks = 0
     for col_start, col_end, chunk in src.iter_columns():
-        sub = chunk[keep]                       # CSC stays CSC; rows in keep order
-        sub = sp.csc_matrix(sub)
+        sub = sp.csc_matrix(chunk[keep])        # CSC stays CSC; rows in keep order
         sub.sort_indices()
-        total_nnz += int(sub.nnz)
-        out._conn.execute(
-            "INSERT INTO matrix_csc_chunks (matrix_name, chunk_idx, col_start, col_end, n_nonzero, "
-            "data_blob, indices_blob, indptr_blob, dtype, compression) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (matrix_name, n_chunks, int(col_start), int(col_end), int(sub.nnz),
-             compress_blob(np.ascontiguousarray(sub.data, dtype=np.dtype(dtype)).tobytes(), "lz4"),
-             compress_blob(sub.indices.astype(np.int32).tobytes(), "lz4"),
-             compress_blob(sub.indptr.astype(np.int32).tobytes(), "lz4"),
-             str(np.dtype(dtype)), "lz4"),
-        )
+        total_nnz += _write_csc_chunk(out._conn, matrix_name, n_chunks, col_start, col_end, sub, dtype)
         n_chunks += 1
+    _write_csc_meta(ds, out._conn, matrix_name, int(len(keep)), n_cols, total_nnz, dtype,
+                    col_entity, n_chunks)
+
+
+def _write_csc_chunk(conn, matrix_name, chunk_idx, col_start, col_end, sub, dtype) -> int:
+    from cytome.io.compression import compress_blob
+    conn.execute(
+        "INSERT INTO matrix_csc_chunks (matrix_name, chunk_idx, col_start, col_end, n_nonzero, "
+        "data_blob, indices_blob, indptr_blob, dtype, compression) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (matrix_name, int(chunk_idx), int(col_start), int(col_end), int(sub.nnz),
+         compress_blob(np.ascontiguousarray(sub.data, dtype=np.dtype(dtype)).tobytes(), "lz4"),
+         compress_blob(sub.indices.astype(np.int32).tobytes(), "lz4"),
+         compress_blob(sub.indptr.astype(np.int32).tobytes(), "lz4"),
+         str(np.dtype(dtype)), "lz4"),
+    )
+    return int(sub.nnz)
+
+
+def _write_csc_meta(ds, conn, matrix_name, n_rows, n_cols, total_nnz, dtype, col_entity, n_chunks):
+    meta = ds._conn.execute(
+        "SELECT csc_chunk_size, created_at FROM matrix_meta WHERE matrix_name = ?", (matrix_name,)
+    ).fetchone()
     try:
-        out._conn.execute("ALTER TABLE matrix_meta ADD COLUMN layout TEXT DEFAULT 'csr'")
+        conn.execute("ALTER TABLE matrix_meta ADD COLUMN layout TEXT DEFAULT 'csr'")
     except Exception:
         pass
-    out._conn.execute("DELETE FROM matrix_meta WHERE matrix_name = ?", (matrix_name,))
-    out._conn.execute(
+    conn.execute("DELETE FROM matrix_meta WHERE matrix_name = ?", (matrix_name,))
+    conn.execute(
         "INSERT INTO matrix_meta (matrix_name, n_rows, n_cols, n_nonzero, dtype, row_entity, col_entity, "
         "chunk_size, n_chunks, has_csc, csc_chunk_size, csc_n_chunks, created_at, layout) "
         "VALUES (?,?,?,?,?,'cells',?,128,0,1,?,?,?,'csc')",
-        (matrix_name, n_out, n_cols, total_nnz, str(np.dtype(dtype)), col_entity,
-         meta[0] if meta else None, n_chunks, meta[1] if meta else None),
+        (matrix_name, int(n_rows), int(n_cols), int(total_nnz), str(np.dtype(dtype)), col_entity,
+         meta[0] if meta else None, int(n_chunks), meta[1] if meta else None),
     )
-    out._conn.commit()
+    conn.commit()
+
+
+def split(
+    ds: CytomeDataset,
+    labels,
+    outputs: dict,
+    matrices: "list[str]",
+    include_fragments: bool = False,
+    include_embeddings: bool = False,
+    copy_annotations: bool = True,
+):
+    """Split the cells into one new store per group, reading each matrix once.
+
+    ``labels`` holds one group label per cell; ``outputs`` maps each group to
+    split off to the path of its store (cells of groups not in ``outputs``
+    go nowhere). Each output is exactly what ``subset(ds, labels == group,
+    output, matrices=matrices, ...)`` writes, cell order included.
+
+    ``subset`` reads a whole column-major matrix for every group; this reads
+    it once and hands every column chunk's rows to their groups' stores as
+    it goes, so the cost of the matrices no longer grows with the number of
+    groups. A row-major matrix is split group by group, as ``subset`` does.
+
+
+    Returns the open output datasets, keyed by group. The caller closes
+    them.
+    """
+    from cytome.core.measurement import MeasurementLayer
+    ds.flush()
+    labels = np.asarray(labels)
+    if labels.shape[0] != ds.n_cells:
+        raise ValueError(f"split: {labels.shape[0]} labels for {ds.n_cells} cells")
+    groups = list(outputs)
+    if not groups:
+        return {}
+    keys = labels.astype(str)
+    gid = np.full(len(keys), -1, dtype=np.int64)
+    keeps = []
+    for g_i, g in enumerate(groups):
+        m = keys == str(g)
+        if not m.any():
+            raise ValueError(f"split: no cell has the label {g!r}")
+        gid[m] = g_i
+        keeps.append(np.flatnonzero(m))
+    rank = np.zeros(len(keys), dtype=np.int64)          # a cell's row in its group's store
+    for keep in keeps:
+        rank[keep] = np.arange(len(keep))
+
+    stores = {g: _begin_output(ds, keeps[i], outputs[g], matrices, copy_annotations)
+              for i, g in enumerate(groups)}
+    mat_rows = {r[0]: r[1:] for r in ds._conn.execute(
+        "SELECT matrix_name, n_cols, dtype, col_entity FROM matrix_meta").fetchall()}
+    missing = sorted(set(matrices) - set(mat_rows))
+    if missing:
+        raise KeyError(f"split(matrices=...): not in the store: {missing}; available: {sorted(mat_rows)}")
+    G = len(groups)
+    for name in matrices:
+        n_cols, dtype, col_entity = mat_rows[name]
+        if not _is_column_major(ds._conn, name):
+            for i, g in enumerate(groups):
+                _subset_matrices_streaming(ds, stores[g], keeps[i], matrices=[name])
+            continue
+        n_cols = int(n_cols)
+        for st in stores.values():
+            st._conn.execute("DELETE FROM matrix_csc_chunks WHERE matrix_name = ?", (name,))
+        totals = np.zeros(G, dtype=np.int64)
+        n_chunks = 0
+        for col_start, col_end, chunk in MeasurementLayer(ds._conn, name).iter_columns():
+            c = int(col_end) - int(col_start)
+            col = np.repeat(np.arange(c, dtype=np.int64), np.diff(chunk.indptr))
+            g_of = gid[chunk.indices]
+            # Entries grouped by their group, stably: within a group every column
+            # keeps its entries in stored order, rows ascending as in subset.
+            # A stable sort of small integers is a radix sort in numpy.
+            order = np.argsort(g_of.astype(np.int16 if G < 32_000 else np.int64), kind="stable")
+            bounds = np.searchsorted(g_of[order], np.arange(-1, G + 1))
+            for i, g in enumerate(groups):
+                o = order[bounds[i + 1]:bounds[i + 2]]
+                indptr = np.zeros(c + 1, dtype=np.int64)
+                np.cumsum(np.bincount(col[o], minlength=c), out=indptr[1:])
+                sub = sp.csc_matrix((chunk.data[o], rank[chunk.indices[o]], indptr),
+                                    shape=(len(keeps[i]), c))
+                sub.sort_indices()
+                totals[i] += _write_csc_chunk(stores[g]._conn, name, n_chunks, col_start, col_end,
+                                              sub, dtype)
+            n_chunks += 1
+        for i, g in enumerate(groups):
+            _write_csc_meta(ds, stores[g]._conn, name, len(keeps[i]), n_cols, int(totals[i]),
+                            dtype, col_entity, n_chunks)
+    for i, g in enumerate(groups):
+        out = stores[g]
+        modalities = set(out.modalities) | {m.split("_", 1)[0] for m in matrices if "_" in m}
+        out._write_manifest_key("modalities", sorted(modalities))
+        out._manifest = out._read_manifest()
+        _finish_output(ds, out, keeps[i], outputs[g], include_embeddings, include_fragments,
+                       copy_annotations)
+    return stores
 
 
 def downsample(
@@ -356,6 +509,66 @@ def _copy_table_rows(src_conn, dst_conn, table: str) -> int:
     return len(rows)
 
 
+def _copy_feature_table(src_conn, dst_conn, table: str, batch: int = 50_000) -> int:
+    """Copy a whole table from one store to another, as stored.
+
+    Columns the destination lacks are added with the source's declared
+    type. The rows are copied by SQLite itself, from the source file
+    attached read-only to the destination connection: no Python object per
+    row, and memory does not grow with the table. Where the source cannot be
+    attached (an in-memory source), rows move in batches through Python. A
+    table that is missing or empty in the source is left alone. Returns the
+    number of rows copied.
+    """
+    try:
+        src_cols = src_conn.execute(f"PRAGMA table_info({_q(table)})").fetchall()
+        if not src_cols or not src_conn.execute(f"SELECT 1 FROM {_q(table)} LIMIT 1").fetchone():
+            return 0
+        dst_cols = dst_conn.execute(f"PRAGMA table_info({_q(table)})").fetchall()
+    except Exception:
+        return 0
+    if not dst_cols:
+        return 0                                  # not a table of this schema
+    have = {c[1].lower() for c in dst_cols}
+    for _cid, name, decl, *_rest in src_cols:
+        if name.lower() not in have:
+            dst_conn.execute(f"ALTER TABLE {_q(table)} ADD COLUMN {_q(name)} {decl or ''}".rstrip())
+            have.add(name.lower())
+    names = [c[1] for c in src_cols]
+    collist = ", ".join(_q(n) for n in names)
+    dst_conn.execute(f"DELETE FROM {_q(table)}")
+    src_file = src_conn.execute("PRAGMA database_list").fetchone()[2]
+    if src_file:
+        dst_conn.commit()                         # ATTACH is refused inside a transaction
+        # Attached by path: the connections are opened without URI support. It
+        # is only read, by the same SQLite library as the source's connection.
+        dst_conn.execute("ATTACH DATABASE ? AS cytome_src", (str(src_file),))
+        try:
+            cur = dst_conn.execute(
+                f"INSERT INTO main.{_q(table)} ({collist}) "
+                f"SELECT {collist} FROM cytome_src.{_q(table)} ORDER BY rowid")
+            n = cur.rowcount
+            dst_conn.commit()
+        finally:
+            dst_conn.execute("DETACH DATABASE cytome_src")
+        return int(n)
+    insert = f"INSERT INTO {_q(table)} ({collist}) VALUES ({','.join('?' * len(names))})"
+    cur = src_conn.execute(f"SELECT {collist} FROM {_q(table)} ORDER BY rowid")
+    n = 0
+    while True:
+        rows = cur.fetchmany(batch)
+        if not rows:
+            break
+        dst_conn.executemany(insert, rows)
+        n += len(rows)
+    dst_conn.commit()
+    return n
+
+
+def _q(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
 def _subset_spatial_coords(ds, out, keep_idx: np.ndarray) -> None:
     """Carry spatial coordinates over to the subset, remapping ``cell_idx`` to
     the new 0..n-1 cell indexing and rebuilding the spatial rtree index.
@@ -398,7 +611,7 @@ def _warn_dropped_categories(ds) -> None:
     so the graph is no longer complete) — surface it so the loss isn't silent.
     """
     import warnings
-    for table, label in (("graph_edges", "cell/var graphs"),):
+    for table, label in (("graph_edges", "cell/var graphs"), ("graph_meta", "cell/var graphs")):
         try:
             n = ds._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         except Exception:

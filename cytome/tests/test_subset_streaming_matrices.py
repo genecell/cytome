@@ -114,3 +114,84 @@ def test_filter_cells_all_true_mask_short_circuits(tmp_path):
     assert ds.filter_cells(m) == n - 40
     assert ds.n_cells == n - 40
     ds.close()
+
+
+def _with_tiles(ds, n_tiles=300):
+    ds.set_entity("tiles", pd.DataFrame({
+        "tile_idx": np.arange(n_tiles),
+        "tile_id": [f"chr1:{i * 500}-{i * 500 + 500}" for i in range(n_tiles)],
+        "chr": ["chr1"] * n_tiles,
+        "start": [i * 500 for i in range(n_tiles)],
+        "end_": [i * 500 + 500 for i in range(n_tiles)],
+    }))
+    t = sp.random(ds.n_cells, n_tiles, density=0.05, format="csr", random_state=3,
+                  data_rvs=lambda n: np.ones(n)).astype("float32")
+    ds.add_matrix("tiles_counts", t)
+    ds.flush()
+    return ds
+
+
+def _rows(ds, table):
+    try:
+        return ds._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    except Exception:
+        return 0
+
+
+def test_named_matrices_carry_only_their_own_feature_tables(tmp_path):
+    ds, _, atac_src = _build_multimatrix_cytome(tmp_path / "src.cytome", n_cells=600)
+    _with_tiles(ds)
+    mask = np.arange(ds.n_cells) % 3 == 0
+    out = subset(ds, mask, output=str(tmp_path / "atac.cytome"), matrices=["ATAC_counts"],
+                 include_fragments=False, include_embeddings=False)
+    assert _rows(out, "peaks") == _rows(ds, "peaks") > 0
+    assert _rows(out, "tiles") == 0 and _rows(out, "genes") == 0
+    assert out.modalities == ["ATAC"]
+    from cytome.core.measurement import MeasurementLayer
+    got = MeasurementLayer(out._conn, "ATAC_counts").to_memory().tocsr()
+    assert (got != atac_src[np.where(mask)[0]]).nnz == 0
+    names = [r[0] for r in out._conn.execute("SELECT matrix_name FROM matrix_meta")]
+    assert names == ["ATAC_counts"]
+    out.close()
+
+    two = subset(ds, mask, output=str(tmp_path / "two.cytome"),
+                 matrices=["RNA_counts", "tiles_counts"],
+                 include_fragments=False, include_embeddings=False)
+    assert _rows(two, "genes") > 0 and _rows(two, "tiles") > 0 and _rows(two, "peaks") == 0
+    assert sorted(two.modalities) == ["RNA", "tiles"]
+    two.close()
+    ds.close()
+
+
+def test_a_plain_subset_still_carries_every_feature_table(tmp_path):
+    ds, _, _ = _build_multimatrix_cytome(tmp_path / "src.cytome", n_cells=600)
+    _with_tiles(ds)
+    mask = np.arange(ds.n_cells) % 2 == 0
+    out = subset(ds, mask, output=str(tmp_path / "all.cytome"),
+                 include_fragments=False, include_embeddings=False)
+    for t in ("genes", "peaks", "tiles"):
+        assert _rows(out, t) == _rows(ds, t) > 0, t
+    out.close()
+    n = ds.filter_cells(mask)
+    assert n == int(mask.sum())
+    for t in ("genes", "peaks", "tiles"):
+        assert _rows(ds, t) > 0, t
+    ds.close()
+
+
+def test_column_major_subset_registers_its_modality(tmp_path):
+    ds, _, atac_src = _build_multimatrix_cytome(tmp_path / "src.cytome", n_cells=600)
+    ds.ATAC.counts.build_feature_index()
+    # make it column-major only, as the quantifier writes it
+    ds._conn.execute("DELETE FROM matrix_chunks WHERE matrix_name='ATAC_counts'")
+    ds._conn.execute("UPDATE matrix_meta SET n_chunks=0 WHERE matrix_name='ATAC_counts'")
+    ds._conn.commit()
+    mask = np.arange(ds.n_cells) % 4 == 1
+    out = subset(ds, mask, output=str(tmp_path / "csc.cytome"), matrices=["ATAC_counts"],
+                 include_fragments=False, include_embeddings=False)
+    assert out.modalities == ["ATAC"]
+    from cytome.core.measurement import MeasurementLayer
+    cols = [c for _, _, c in MeasurementLayer(out._conn, "ATAC_counts").iter_columns()]
+    got = sp.hstack(cols).tocsr()
+    assert (got != atac_src[np.where(mask)[0]]).nnz == 0
+    out.close(); ds.close()

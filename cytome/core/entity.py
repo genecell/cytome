@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from cytome.core import _handles
+
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
@@ -37,14 +39,38 @@ class EntityTable:
         enqueue_write: Optional[Callable[[str, object], None]] = None,
     ) -> None:
         self._conn = conn
+        _handles.bind(self, conn)
         self._table_name = table_name
         self._enqueue_write = enqueue_write
 
     @property
     def columns(self) -> list[str]:
-        """Return list of table column names."""
+        """Return list of table column names, including columns written and
+        not yet flushed."""
         rows = self._conn.execute(f"PRAGMA table_info({self._table_name})").fetchall()
-        return [r[1] for r in rows]
+        cols = [r[1] for r in rows]
+        lowered = {c.lower() for c in cols}
+        cols += [c for c in self._pending_columns() if c.lower() not in lowered]
+        return cols
+
+    def _pending(self):
+        """``(dataset, keys)``: the dataset that queued writes for this
+        table, and the keys of those still waiting for its flush()."""
+        owner = getattr(self._enqueue_write, "__self__", None)
+        waiting = getattr(owner, "_pending_writes", None) or {}
+        mine = (f"entity:{self._table_name}:", f"entity_table:{self._table_name}")
+        return owner, [k for k in waiting if k.startswith(mine)]
+
+    def _pending_columns(self) -> list[str]:
+        prefix = f"entity:{self._table_name}:"
+        return [k[len(prefix):] for k in self._pending()[1] if k.startswith(prefix)]
+
+    def _settle(self) -> None:
+        """Reads go to SQL: write what is waiting for this table first, so a
+        column reads back the same before and after an explicit flush()."""
+        owner, keys = self._pending()
+        if keys:
+            owner.flush()
 
     @property
     def n(self) -> int:
@@ -100,6 +126,7 @@ class EntityTable:
         if actual is None:
             raise KeyError(f"Column {column_name!r} not in {self._table_name}")
         column_name = actual
+        self._settle()
         rows = self._conn.execute(
             f"SELECT {_quote_ident(column_name)} FROM {self._table_name} ORDER BY ROWID"
         ).fetchall()
@@ -115,7 +142,13 @@ class EntityTable:
         values
             Values with length equal to row count.
         """
-        values_arr = np.asarray(list(values))
+        if isinstance(values, np.ndarray) and values.ndim == 1 and values.dtype != object:
+            # What np.asarray(list(values)) gives for such an array, without
+            # making one Python object per row. A copy, as before, so a later
+            # change to the caller's array does not reach the pending write.
+            values_arr = values.copy()
+        else:
+            values_arr = np.asarray(list(values))
         if values_arr.shape[0] != self.n:
             raise ValueError(
                 f"Length mismatch for {self._table_name}.{column_name}: "
@@ -136,11 +169,13 @@ class EntityTable:
 
     def query(self, expression: str) -> pd.DataFrame:
         """Run SQL WHERE query and return matching rows as DataFrame."""
+        self._settle()
         sql = f"SELECT * FROM {self._table_name} WHERE {expression}"
         return pd.read_sql_query(sql, self._conn)
 
     def query_mask(self, expression: str) -> np.ndarray:
         """Return boolean mask for rows satisfying SQL expression."""
+        self._settle()
         key_col = _infer_primary_key(self._conn, self._table_name)
         all_ids = self._conn.execute(
             f"SELECT {key_col} FROM {self._table_name} ORDER BY ROWID"
@@ -153,32 +188,71 @@ class EntityTable:
 
     def to_pandas(self) -> pd.DataFrame:
         """Materialize table as pandas DataFrame."""
+        self._settle()
         return pd.read_sql_query(f"SELECT * FROM {self._table_name}", self._conn)
 
     def _apply_column_write(self, column_name: str, values: np.ndarray) -> None:
-        actual = self.resolve_column(column_name)
-        if actual is None:
-            sqlite_type = _numpy_to_sqlite_type(values.dtype)
-            # No blanket except here. The old `except Exception: pass` was
-            # load-bearing for a bug: it swallowed SQLite's *duplicate column*
-            # error when a case-variant of the column already existed, and the
-            # UPDATE below then overwrote that column silently. It also
-            # swallowed a locked database and a full disk. Resolution above
-            # makes the duplicate case unreachable; everything else should be
-            # heard about.
-            self._conn.execute(
-                f"ALTER TABLE {self._table_name} ADD COLUMN {_quote_ident(column_name)} {sqlite_type}"
-            )
-        else:
-            column_name = actual
+        self._apply_column_writes([(column_name, values)])
+
+    def _apply_column_writes(self, writes) -> None:
+        """Write several columns ``[(name, values), ...]`` in one pass.
+
+        SQLite stores a row's columns together, so changing one value
+        rewrites the whole row: a column write costs a full copy of the
+        table, whatever its width, and in WAL mode a second one at the
+        checkpoint. One UPDATE setting all the columns pays that once.
+        A name given twice keeps its last values, as in sequence.
+        """
+        names = []
+        for column_name, values in writes:
+            actual = self.resolve_column(column_name)
+            if actual is None:
+                sqlite_type = _numpy_to_sqlite_type(values.dtype)
+                # No blanket except here. The old `except Exception: pass` was
+                # load-bearing for a bug: it swallowed SQLite's *duplicate column*
+                # error when a case-variant of the column already existed, and the
+                # UPDATE below then overwrote that column silently. It also
+                # swallowed a locked database and a full disk. Resolution above
+                # makes the duplicate case unreachable; everything else should be
+                # heard about.
+                self._conn.execute(
+                    f"ALTER TABLE {self._table_name} ADD COLUMN {_quote_ident(column_name)} {sqlite_type}"
+                )
+                actual = column_name
+            names.append(actual)
+        last = {}
+        for i, name in enumerate(names):
+            last[name.lower()] = i
+        keep = sorted(last.values())
+        names = [names[i] for i in keep]
+        arrays = [np.asarray(writes[i][1]) for i in keep]
         key_col = _infer_primary_key(self._conn, self._table_name)
-        keys = self._conn.execute(
+        keys = [k[0] for k in self._conn.execute(
             f"SELECT {_quote_ident(key_col)} FROM {self._table_name} ORDER BY ROWID"
-        ).fetchall()
+        )]
+        sets = ", ".join(f"{_quote_ident(n)} = ?" for n in names)
         self._conn.executemany(
-            f"UPDATE {self._table_name} SET {_quote_ident(column_name)} = ? WHERE {_quote_ident(key_col)} = ?",
-            [(v.item() if hasattr(v, "item") else v, k[0]) for v, k in zip(values, keys)],
+            f"UPDATE {self._table_name} SET {sets} WHERE {_quote_ident(key_col)} = ?",
+            _rows(arrays, keys),
         )
+
+
+def _as_sql_values(a: np.ndarray) -> list:
+    # tolist() gives each element as .item() would, for every dtype but
+    # object, whose elements it returns as they are (np.int64 among them,
+    # which sqlite3 cannot bind).
+    if a.dtype == object:
+        return [v.item() if hasattr(v, "item") else v for v in a]
+    return a.tolist()
+
+
+def _rows(arrays, keys, block: int = 65536):
+    """``(v1, v2, ..., key)`` per row, converted a block at a time so the
+    Python objects of all the rows never exist at once."""
+    for lo in range(0, len(keys), block):
+        hi = min(lo + block, len(keys))
+        cols = [_as_sql_values(a[lo:hi]) for a in arrays]
+        yield from zip(*cols, keys[lo:hi])
 
 
 def _numpy_to_sqlite_type(dtype: np.dtype) -> str:

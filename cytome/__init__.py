@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from cytome.core.dataset import CytomeDataset
+from cytome.io.chunk_source import ChunkSource, released
+from cytome.io.sqlite_engine import ReadOnlyError, ReadOnlyWarning
 
 # ---------------------------------------------------------------- modality API
 # Promoted to the top level as a stability commitment, not for convenience.
@@ -34,6 +36,11 @@ from cytome.utils.modality import (
 
 
 __all__ = [
+    "ChunkSource",
+    "released",
+    "ReadOnlyError",
+    "ReadOnlyWarning",
+    "require_writable",
     "CytomeDataset",
     "open",
     "create",
@@ -66,7 +73,7 @@ __all__ = [
 # The manifest's writer_version reads THIS, not the installed distribution
 # metadata: a source tree run against a stale editable install would otherwise
 # stamp files with the version of code that did not write them.
-__version__ = "0.3.3"
+__version__ = "0.3.6"
 
 
 def import_gtf(ds, gtf_path, **kwargs):
@@ -75,16 +82,62 @@ def import_gtf(ds, gtf_path, **kwargs):
     return _impl(ds, gtf_path, **kwargs)
 
 
-def open(path: str | Path) -> CytomeDataset:
+def open(path: str | Path, mode: str = "r+") -> CytomeDataset:
     """Open an existing Cytome dataset.
 
+    Parameters
+    ----------
+    path
+        The ``.cytome`` file.
+    mode
+        ``"r+"`` (default): read and write. A store from an older version
+        gains the tables this version defines. If the store cannot be written
+        (the file is read-only, or its folder is, where SQLite keeps the
+        ``-wal`` and ``-shm`` files), it is opened for reading, with a
+        :class:`cytome.ReadOnlyWarning`, and a write raises
+        :class:`cytome.ReadOnlyError`.
+
+        ``"r"``: read only. The file is never changed, so a downloaded store
+        keeps matching its published checksum. What an older store lacks is
+        supplied for reading without being written. ``ds.read_only`` says
+        which one you got.
+
     Says once, on stderr, when the file is on a network file system: a
-    cytome is read many times per analysis, and from a node-local disk that
-    is typically ten times faster. Nothing is printed on a local disk.
+    cytome is read many times per analysis, and reading it from a node-local
+    disk is much faster. Nothing is printed on a local disk.
     """
+    if mode not in ("r", "r+"):
+        raise ValueError(f"mode must be 'r' or 'r+', not {mode!r}")
     from cytome.utils.storage import network_filesystem_notice
     network_filesystem_notice(path)
-    return CytomeDataset(path, mode="r+")
+    return CytomeDataset(path, mode=mode)
+
+
+def require_writable(target, what: str = "this operation") -> None:
+    """Raise :class:`cytome.ReadOnlyError` now if ``target`` cannot be
+    written: a dataset opened read-only, or a path to a store whose file (or
+    folder, for the ``-wal``/``-shm`` files) is read-only.
+
+    For a function that computes for minutes before it writes: called
+    first, a read-only store fails in a second. A path is judged from its
+    permissions, without opening it. Anything else (an AnnData) passes.
+    """
+    import os
+    if isinstance(target, (str, os.PathLike)):
+        from cytome.io.sqlite_engine import _why_not_writable
+        p = Path(target)
+        if not p.exists():
+            return
+        reason = _why_not_writable(p)
+        if reason is not None:
+            raise ReadOnlyError(
+                f"{what} writes to {p.name}, which cannot be written: {reason}. "
+                f"Copy the store somewhere writable, or run where you have "
+                f"write access.")
+        return
+    check = getattr(target, "require_writable", None)
+    if callable(check):
+        check(what)
 
 
 def create(path: str | Path, force: bool = False) -> CytomeDataset:

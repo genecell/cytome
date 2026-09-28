@@ -55,9 +55,13 @@ def test_readonly_pre_030_file_still_opens(tmp_path):
     ds = cytome.open(str(path))
     try:
         assert ds._conn.execute("SELECT COUNT(*) FROM cells").fetchone()[0] == 4
-        cols = [r[1] for r in ds._conn.execute("PRAGMA table_info(matrix_meta)")]
+        assert ds.read_only
+        cols = [r[1] for r in ds._conn.execute("PRAGMA main.table_info(matrix_meta)")]
         assert "is_integer" not in cols, (
             "the column cannot have been added to a read-only file")
+        # Readers see the column all the same, as NULL: "unknown".
+        assert ds._conn.execute(
+            "SELECT is_integer FROM matrix_meta").fetchall() == [(None,)]
     finally:
         ds.close()
 

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
 PathLike = Union[str, Path]
+
 
 _CHROMS = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
 
@@ -120,26 +122,309 @@ def create_database(path: PathLike, force: bool = False) -> sqlite3.Connection:
     return conn
 
 
-def open_database(path: PathLike) -> sqlite3.Connection:
+class ReadOnlyError(sqlite3.OperationalError):
+    """A write was attempted on a store opened for reading only.
+
+    A subclass of :class:`sqlite3.OperationalError`, so code that already
+    handles SQLite's own "attempt to write a readonly database" handles this
+    too. The message says why the store was opened read-only and what to do.
+    """
+
+
+class ReadOnlyWarning(UserWarning):
+    """``cytome.open`` could not open a store for writing and opened it for
+    reading."""
+
+
+class ReadOnlyConnection(sqlite3.Connection):
+    """The connection of a store opened read-only.
+
+    Only these connections pay for the extra layer: a write through
+    ``execute``/``executemany``/``executescript`` that SQLite refuses comes
+    back as :class:`ReadOnlyError` naming the reason, not as SQLite's bare
+    sentence. Writable stores use a plain :class:`sqlite3.Connection`.
+    """
+
+    read_only = True
+    read_only_reason = "it was opened with mode='r'"
+    uri = None
+    #: (size, mtime) of the file and its -wal when opened immutable, to notice
+    #: a writer SQLite cannot see; None otherwise.
+    immutable_stamp = None
+
+    def _refused(self, exc):
+        msg = str(exc).lower()
+        if "readonly" in msg or "read-only" in msg or "read only" in msg:
+            return ReadOnlyError(
+                f"{exc}: this store was opened read-only because "
+                f"{self.read_only_reason}. To change it, copy it somewhere "
+                f"writable (all of <name>.cytome*, see cytome.CytomeDataset.copy) "
+                f"or open it where you have write access."
+            )
+        return None
+
+    def execute(self, *args, **kwargs):
+        try:
+            return super().execute(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            err = self._refused(exc)
+            if err is None:
+                raise
+            raise err from exc
+
+    def executemany(self, *args, **kwargs):
+        try:
+            return super().executemany(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            err = self._refused(exc)
+            if err is None:
+                raise
+            raise err from exc
+
+    def executescript(self, *args, **kwargs):
+        try:
+            return super().executescript(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            err = self._refused(exc)
+            if err is None:
+                raise
+            raise err from exc
+
+
+def is_read_only(conn) -> bool:
+    """Whether ``conn`` is the connection of a store opened read-only."""
+    return bool(getattr(conn, "read_only", False))
+
+
+def _file_uri(path: Path, query: str) -> str:
+    from urllib.parse import quote
+    return f"file:{quote(Path(path).resolve().as_posix(), safe='/')}?{query}"
+
+
+def _why_not_writable(db_path: Path) -> str | None:
+    """Why SQLite could not write ``db_path`` in WAL mode, or None if it can.
+
+    Decided from permissions, not by trying a write: a trial ``BEGIN
+    IMMEDIATE`` on a store another process is writing would wait out the
+    60 s busy timeout, where opening returns at once today. SQLite's own
+    error stays the backstop (see :func:`open_database`).
+    """
+    folder = db_path.resolve().parent
+    if not os.access(db_path, os.W_OK):
+        return f"{db_path} is not writable"
+    for sfx in ("-wal", "-shm"):
+        side = Path(str(db_path) + sfx)
+        if side.exists():
+            if not os.access(side, os.W_OK):
+                return f"{side} is not writable"
+        elif not os.access(folder, os.W_OK):
+            return (f"its folder {folder} is not writable, and SQLite needs to "
+                    f"create {side.name} there")
+    return None
+
+
+def _in_wal_mode(db_path: Path) -> bool:
+    # Bytes 18 and 19 of the header are the read and write versions: 2 = WAL.
+    with open(db_path, "rb") as fh:
+        head = fh.read(20)
+    return len(head) == 20 and head[18] == 2
+
+
+def _read_only_uri(db_path: Path) -> str:
+    """The URI that reads ``db_path`` without writing to it or its folder.
+
+    ``mode=ro`` when SQLite can use the WAL sidecars (they exist, or the
+    folder lets it create them) or the file is not in WAL mode. Otherwise
+    ``immutable=1``, which takes no locks and ignores the WAL: safe only when
+    the WAL is absent or empty, so a WAL holding committed pages is refused
+    rather than silently read around.
+    """
+    folder = db_path.resolve().parent
+    wal = Path(str(db_path) + "-wal")
+    shm = Path(str(db_path) + "-shm")
+    if (not _in_wal_mode(db_path) or os.access(folder, os.W_OK)
+            or (wal.exists() and shm.exists())):
+        return _file_uri(db_path, "mode=ro")
+    wal_bytes = wal.stat().st_size if wal.exists() else 0
+    if wal_bytes:
+        raise ReadOnlyError(
+            f"Cannot read {db_path}: {wal_bytes:,} bytes of committed changes "
+            f"are still in {wal.name}, and SQLite cannot open it here because "
+            f"the folder {folder} is not writable. Whoever owns the store should "
+            f"run ds.checkpoint() or close it cleanly; or copy all of "
+            f"{db_path.name}* to a writable folder and open the copy."
+        )
+    return _file_uri(db_path, "immutable=1")
+
+
+def _stamp(db_path: Path):
+    out = []
+    for p in (db_path, Path(str(db_path) + "-wal")):
+        try:
+            st = p.stat()
+            out.append((st.st_size, st.st_mtime_ns))
+        except FileNotFoundError:
+            out.append(None)
+    return tuple(out)
+
+
+def immutable_store_changed(conn) -> bool:
+    """For a store opened immutable: whether the file or its -wal changed
+    since it was opened (a writer SQLite could not see)."""
+    stamp = getattr(conn, "immutable_stamp", None)
+    if stamp is None:
+        return False
+    path = Path(conn.execute("PRAGMA database_list").fetchall()[0][2])
+    return _stamp(path) != stamp
+
+
+_REFERENCE_SCHEMA = None
+
+
+def _reference_schema():
+    """Tables and columns of today's schema, from an in-memory database:
+    ``[(name, create_sql, is_virtual, [columns])]``."""
+    global _REFERENCE_SCHEMA
+    if _REFERENCE_SCHEMA is None:
+        ref = sqlite3.connect(":memory:")
+        _create_schema(ref)
+        rows = ref.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY rowid").fetchall()
+        virtual = {n for n, sql in rows if sql.upper().startswith("CREATE VIRTUAL")}
+        shadow = {f"{v}_{s}" for v in virtual for s in ("node", "parent", "rowid")}
+        out = []
+        for name, sql in rows:
+            if name in shadow:
+                continue  # made by its virtual table
+            cols = [r[1] for r in ref.execute(f'PRAGMA table_info("{name}")')]
+            out.append((name, sql, name in virtual, cols))
+        ref.close()
+        _REFERENCE_SCHEMA = out
+    return _REFERENCE_SCHEMA
+
+
+def _install_read_shims(conn: sqlite3.Connection) -> list[str]:
+    """Let every reader work on a store from an older version, without
+    writing to it.
+
+    A table the store lacks becomes an empty TEMP table of the same
+    definition; a column it lacks is added by a TEMP view of the same name
+    (``SELECT *, NULL AS col FROM main.t``). Unqualified names find the temp
+    object first. Three rules keep these safe, each from a reproduced
+    failure:
+
+    * made on read-only connections only: on a writable one a temp table
+      would shadow the real table created later, and rows written to it would
+      be lost at close;
+    * ``PRAGMA query_only`` is set after them by the caller, since a
+      read-only connection still accepts writes into its temp tables;
+    * they belong to this connection. Other connections a dataset opens
+      (chunk readers) read only tables and columns every store has.
+    """
+    have = {}
+    for (name,) in conn.execute(
+            "SELECT name FROM main.sqlite_master WHERE type = 'table'"):
+        have[name] = None
+    made = []
+    for name, sql, virtual, cols in _reference_schema():
+        if name not in have:
+            if virtual:
+                ddl = sql.replace("CREATE VIRTUAL TABLE", "CREATE VIRTUAL TABLE temp.", 1)
+                ddl = ddl.replace("temp. ", "temp.", 1)
+            else:
+                ddl = sql.replace("CREATE TABLE", "CREATE TEMP TABLE", 1)
+            conn.execute(ddl)
+            made.append(name)
+            continue
+        if virtual:
+            continue
+        present = [r[1] for r in conn.execute(f'PRAGMA main.table_info("{name}")')]
+        lower = {c.lower() for c in present}
+        lack = [c for c in cols if c.lower() not in lower]
+        if lack:
+            extra = ", ".join(f'NULL AS "{c}"' for c in lack)
+            conn.execute(f'CREATE TEMP VIEW "{name}" AS SELECT *, {extra} FROM main."{name}"')
+            made.append(f"{name}({', '.join(lack)})")
+    return made
+
+
+def open_read_only(path: PathLike, reason: str = "it was opened with mode='r'") -> sqlite3.Connection:
+    """Open ``path`` for reading only. Neither the file nor its folder is
+    written; see :func:`_read_only_uri` for how, and
+    :func:`_install_read_shims` for older stores."""
+    db_path = Path(path)
+    if not db_path.exists():
+        raise FileNotFoundError(f"Cytome file not found: {db_path}")
+    uri = _read_only_uri(db_path)
+    conn = sqlite3.connect(uri, uri=True, factory=ReadOnlyConnection)
+    conn.read_only_reason = reason
+    conn.uri = uri
+    if "immutable=1" in uri:
+        conn.immutable_stamp = _stamp(db_path)
+    conn.execute("PRAGMA busy_timeout=60000")
+    conn.execute("PRAGMA cache_size=-64000")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    try:
+        conn.execute("PRAGMA mmap_size=268435456")
+    except sqlite3.OperationalError:
+        pass
+    conn.shims = _install_read_shims(conn)
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
+def open_database(path: PathLike, mode: str = "r+") -> sqlite3.Connection:
     """Open an existing Cytome database.
 
     Parameters
     ----------
     path
         Existing `.cytome` file path.
+    mode
+        ``"r"``: read only. Nothing is written, to the file or its folder
+        (beyond SQLite's -wal/-shm where the folder allows); what an older
+        store lacks is supplied for reading only.
+        ``"r+"`` (default): read and write, adding to an older store the
+        tables newer versions define. If the store cannot be written (the
+        file, or its folder for the -wal/-shm files, is read-only), it is
+        opened as ``"r"`` with a :class:`ReadOnlyWarning`.
 
     Returns
     -------
     sqlite3.Connection
-        Open configured connection.
+        Open configured connection; a :class:`ReadOnlyConnection` when read
+        only.
     """
     db_path = Path(path)
     if not db_path.exists():
         raise FileNotFoundError(f"Cytome file not found: {db_path}")
-    conn = sqlite3.connect(str(db_path))
-    _configure_connection(conn)
-    _create_schema(conn)  # ensures new tables (e.g. tiles) exist in older files
-    return conn
+    if mode == "r":
+        return open_read_only(db_path)
+    if mode != "r+":
+        raise ValueError(f"mode must be 'r' or 'r+', not {mode!r}")
+    reason = _why_not_writable(db_path)
+    if reason is None:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            _configure_connection(conn)
+            _create_schema(conn)  # ensures new tables (e.g. tiles) exist in older files
+            return conn
+        except sqlite3.OperationalError as exc:
+            # The backstop: permissions said yes and SQLite said no (a
+            # read-only mount, an ACL os.access cannot see).
+            conn.close()
+            msg = str(exc).lower()
+            if "readonly" not in msg and "read-only" not in msg:
+                raise
+            reason = f"SQLite could not write it ({exc})"
+    import warnings
+    warnings.warn(
+        f"{db_path.name} opened read-only because {reason}. Reading works as "
+        f"usual; a write raises cytome.ReadOnlyError.",
+        ReadOnlyWarning, stacklevel=4,
+    )
+    return open_read_only(db_path, reason=reason)
 
 
 def close_database(conn: sqlite3.Connection) -> None:
@@ -523,6 +808,34 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (graph_name, axis, row_idx, col_idx)
         );
         CREATE INDEX IF NOT EXISTS idx_graph_edges_name_axis ON graph_edges(graph_name, axis);
+
+        -- Graphs as compressed row chunks (cytome 0.3.6). A graph written by
+        -- this version lives here; graph_edges / graph_knn are read for files
+        -- written before it.
+        CREATE TABLE IF NOT EXISTS graph_meta (
+            graph_name TEXT NOT NULL,
+            axis TEXT NOT NULL DEFAULT 'obs',
+            entity_table TEXT NOT NULL DEFAULT 'cells',
+            n_rows INTEGER NOT NULL,
+            n_cols INTEGER NOT NULL,
+            n_nonzero INTEGER NOT NULL,
+            dtype TEXT NOT NULL,
+            n_chunks INTEGER NOT NULL,
+            PRIMARY KEY (graph_name, axis)
+        );
+        CREATE TABLE IF NOT EXISTS graph_chunks (
+            graph_name TEXT NOT NULL,
+            axis TEXT NOT NULL DEFAULT 'obs',
+            chunk_idx INTEGER NOT NULL,
+            row_start INTEGER NOT NULL,
+            row_end INTEGER NOT NULL,
+            n_nonzero INTEGER NOT NULL,
+            data_blob BLOB NOT NULL,
+            indices_blob BLOB NOT NULL,
+            indptr_blob BLOB NOT NULL,
+            compression TEXT NOT NULL,
+            PRIMARY KEY (graph_name, axis, chunk_idx)
+        );
 
         -- Genome annotation tables (added in cytome 0.2.2).
         -- Coordinates are 0-based half-open (BED convention).

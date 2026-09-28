@@ -29,6 +29,8 @@ coords * tissue_<img_key>_scalef``.
 """
 from __future__ import annotations
 
+from cytome.core import _handles
+
 import sqlite3
 import struct
 from typing import Dict, List, Optional, Tuple
@@ -184,6 +186,7 @@ class _SpatialImageAccessor:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+        _handles.bind(self, conn)
 
     def _has_tables(self) -> bool:
         row = self._conn.execute(
@@ -387,7 +390,8 @@ class LazyImage:
         except (sqlite3.ProgrammingError, sqlite3.Error):
             if not self._path:
                 raise
-            conn = sqlite3.connect(f"file:{self._path}?mode=ro", uri=True)
+            from cytome.io.sqlite_engine import open_read_only
+            conn = open_read_only(self._path, reason="an image is read after its dataset closed")
             self._images = type(self._images)(conn)
             return self._images
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from cytome.core import _handles
+
 import json
 import logging
 import shutil
@@ -21,7 +23,15 @@ from cytome.core.measurement import MeasurementLayer
 from cytome.core.provenance import ProvenanceLog
 from cytome.io.chunk_tuning import compute_chunk_size
 from cytome.io.chunked_io import ChunkedLayerWriter, write_dense_chunked, write_sparse_chunked
-from cytome.io.sqlite_engine import close_database, create_database, open_database
+from cytome.io.sqlite_engine import (
+    ReadOnlyError,
+    ReadOnlyWarning,
+    close_database,
+    create_database,
+    immutable_store_changed,
+    is_read_only,
+    open_database,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +75,7 @@ class Modality:
     def __init__(self, dataset: "CytomeDataset", name: str) -> None:
         self._dataset = dataset
         self._conn = dataset._conn
+        _handles.bind(self, self._conn)
         self._name = name
 
     @property
@@ -126,6 +137,7 @@ class Modality:
 class _EmbeddingAccessor:
     def __init__(self, conn: sqlite3.Connection, entity: str = "cells") -> None:
         self._conn = conn
+        _handles.bind(self, conn)
         self._entity = entity
 
     def __getitem__(self, name: str) -> np.ndarray:
@@ -155,6 +167,7 @@ class _EmbeddingAccessor:
 class _GraphAccessor:
     def __init__(self, conn: sqlite3.Connection, axis: str = "obs", entity: str = "cells") -> None:
         self._conn = conn
+        _handles.bind(self, conn)
         self._axis = axis
         self._entity = entity
 
@@ -168,21 +181,25 @@ class _GraphAccessor:
                 names.add("knn")
             if self._conn.execute("SELECT COUNT(*) FROM graph_peak_gene").fetchone()[0] > 0:
                 names.add("peak_gene")
-        try:
-            rows = self._conn.execute(
-                "SELECT DISTINCT graph_name FROM graph_edges WHERE axis = ? ORDER BY graph_name",
-                (self._axis,),
-            )
-            names.update(r[0] for r in rows)
-        except sqlite3.OperationalError:
-            pass
+        for table in ("graph_edges", "graph_meta"):
+            try:
+                rows = self._conn.execute(
+                    f"SELECT DISTINCT graph_name FROM {table} WHERE axis = ? ORDER BY graph_name",
+                    (self._axis,),
+                )
+                names.update(r[0] for r in rows)
+            except sqlite3.OperationalError:
+                pass
         return sorted(names)
 
 
 class CytomeDataset:
     """SQLite-backed single-cell multi-omics dataset."""
 
-    def __init__(self, path: str | Path, mode: str = "r", force: bool = False) -> None:
+    def __init__(self, path: str | Path, mode: str = "r+", force: bool = False) -> None:
+        """``mode``: ``"r+"`` read and write (falls back to reading, with a
+        warning, when the store cannot be written); ``"r"`` read only, the
+        file is never changed; ``"w"`` create."""
         self.path = Path(path)
         self.mode = mode
         self._pending_writes: dict[str, Any] = {}
@@ -198,8 +215,31 @@ class CytomeDataset:
             # so an existing cytome is never silently truncated.
             self._conn = create_database(self.path, force=force)
         else:
-            self._conn = open_database(self.path)
+            self._conn = open_database(self.path, mode="r" if mode == "r" else "r+")
         self._manifest = self._read_manifest()
+        _handles.track(self)
+
+    @property
+    def read_only(self) -> bool:
+        """Whether this store was opened for reading only: asked for with
+        ``mode="r"``, or because it cannot be written."""
+        return is_read_only(self._conn)
+
+    def require_writable(self, what: str = "this operation") -> None:
+        """Raise :class:`cytome.ReadOnlyError` now if the store is read only.
+
+        For functions that compute before they write: they call it first, so
+        a read-only store fails in a second, not at the end of the run.
+        """
+        if self.read_only:
+            raise ReadOnlyError(
+                f"{what} writes to {self.path.name}, which was opened read-only "
+                f"because {self._conn.read_only_reason}. Copy the store somewhere "
+                f"writable, or open it where you have write access."
+            )
+
+    def _reopen_mode(self) -> str:
+        return "r" if self.mode == "r" else "r+"
 
     @property
     def cells(self) -> EntityTable:
@@ -751,13 +791,25 @@ class CytomeDataset:
         """Atomically persist all buffered writes."""
         if not self._pending_writes:
             return
+        self.require_writable("flush()")
         with self._conn:
-            for key, payload in list(self._pending_writes.items()):
+            items = list(self._pending_writes.items())
+            i = 0
+            while i < len(items):
+                key, payload = items[i]
+                i += 1
                 if key.startswith("entity:"):
                     assert isinstance(payload, _EntityWrite)
-                    EntityTable(self._conn, payload.table_name)._apply_column_write(
-                        payload.column_name, payload.values
-                    )
+                    # Adjacent column writes to one table go in one pass: each
+                    # pass rewrites the whole table. Only adjacent ones, so a
+                    # column is never moved across a write it came before or
+                    # after (a whole-table replacement, say).
+                    run = [(payload.column_name, payload.values)]
+                    while (i < len(items) and items[i][0].startswith("entity:")
+                           and items[i][1].table_name == payload.table_name):
+                        run.append((items[i][1].column_name, items[i][1].values))
+                        i += 1
+                    EntityTable(self._conn, payload.table_name)._apply_column_writes(run)
                 elif key.startswith("entity_table:"):
                     table = key.split(":", 1)[1]
                     self._write_entity_table(table, payload)
@@ -782,9 +834,29 @@ class CytomeDataset:
             self._manifest = self._read_manifest()
 
     def close(self) -> None:
-        """Flush pending writes then close the database."""
+        """Flush pending writes then close the database. A store opened
+        read-only is always closed."""
+        if self.read_only:
+            self._pending_writes.clear()
         self.flush()
+        if immutable_store_changed(self._conn):
+            import warnings
+            warnings.warn(
+                f"{self.path.name} changed while it was open read-only. It was "
+                f"read without locks (its folder is not writable), so what was "
+                f"read may mix the old and the new file; reopen it to read again.",
+                ReadOnlyWarning, stacklevel=2)
         close_database(self._conn)
+        _handles.forget(self._conn)
+
+    def chunk_source(self, matrix_name: str, n_readers: int = 4, cache: bool = False,
+                     cache_budget_bytes: int | None = None):
+        """The stored chunks of ``matrix_name`` as compressed blobs, for a
+        compute kernel that must not open the file itself. See
+        :class:`cytome.io.chunk_source.ChunkSource`."""
+        from cytome.io.chunk_source import ChunkSource
+        return ChunkSource(self, matrix_name, n_readers=n_readers, cache=cache,
+                           cache_budget_bytes=cache_budget_bytes)
 
     def reopen(self) -> "CytomeDataset":
         """Flush + close + reopen the underlying connection in place.
@@ -805,8 +877,9 @@ class CytomeDataset:
         if not self.is_closed:
             self.flush()
             close_database(self._conn)
-        self._conn = open_database(self.path)
-        self._refresh_after_reopen()
+        old = self._conn
+        self._conn = open_database(self.path, mode=self._reopen_mode())
+        self._refresh_after_reopen(old)
         self._manifest = self._read_manifest()
         return self
 
@@ -1046,6 +1119,13 @@ class CytomeDataset:
 
         return subset(self, mask=mask, output=output, **kwargs)
 
+    def split(self, labels, outputs, matrices, **kwargs):
+        """One new store per group, each matrix read once. See
+        :func:`cytome.io.subset.split`."""
+        from cytome.io.subset import split
+
+        return split(self, labels, outputs, matrices, **kwargs)
+
     def matrix_meta(self, name: str) -> dict[str, Any] | None:
         """Return matrix metadata as a dict, or *None* if not found.
 
@@ -1204,6 +1284,7 @@ class CytomeDataset:
         For very large datasets, prefer ``subset(mask, output=...)`` which
         explicitly writes to a chosen path without touching the original.
         """
+        self.require_writable("filter_cells()")
         from cytome.io.subset import subset as _subset
         from cytome.io.subset import _resolve_keep_indices
 
@@ -1252,8 +1333,9 @@ class CytomeDataset:
             tmp_path.replace(original)
         except Exception:
             # Restore connection on failure
-            self._conn = open_database(self.path)
-            self._refresh_after_reopen()
+            old = self._conn
+            self._conn = open_database(self.path, mode=self._reopen_mode())
+            self._refresh_after_reopen(old)
             raise
         # Any sidecars the temp left behind are stale relative to the moved file —
         # drop them too (the data is already in the main file).
@@ -1261,8 +1343,9 @@ class CytomeDataset:
             Path(str(tmp_path) + ext).unlink(missing_ok=True)
 
         # Reopen the underlying connection on the same path
-        self._conn = open_database(self.path)
-        self._refresh_after_reopen()
+        old = self._conn
+        self._conn = open_database(self.path, mode=self._reopen_mode())
+        self._refresh_after_reopen(old)
         del n_before
         return int(n_after)
 
@@ -1290,6 +1373,7 @@ class CytomeDataset:
             ``wal_checkpoint`` result (``busy=1`` means a reader prevented a full
             truncate). Returns ``{'busy': -1, ...}`` if the pragma is unavailable.
         """
+        self.require_writable("compact()")
         self.flush()
         try:
             row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
@@ -1480,7 +1564,12 @@ class CytomeDataset:
         Call this before copying the file with an external tool (``cp``,
         ``rsync``, an upload), or use :meth:`copy` / :meth:`backup`, which no
         longer need it.
+
+        On a store opened read-only there is nothing of this process to fold,
+        and it does nothing.
         """
+        if self.read_only:
+            return
         self.flush()
         self._conn.commit()
         self._conn.execute(f"PRAGMA wal_checkpoint({mode})")
@@ -1517,7 +1606,7 @@ class CytomeDataset:
             raise FileExistsError(
                 f"{out} already exists; pass force=True to overwrite.")
         self._snapshot_to(out)
-        return CytomeDataset(out, mode="r")
+        return CytomeDataset(out, mode="r+")
 
     def backup(self, output, force: bool = False):
         """Snapshot this cytome to ``output`` (e.g. before a destructive
@@ -1684,6 +1773,8 @@ class CytomeDataset:
         # is exactly the "categories not updated" bug. The stale-only check
         # also never fired when the new labels were a subset of the old order,
         # so the old colours silently mapped to different cells.
+        # Refused here, where the caller wrote it, not at a later flush().
+        self.require_writable(f"writing {key.split(':', 1)[-1]!r}")
         if key.startswith("entity:cells:") and isinstance(payload, _EntityWrite):
             self._drop_categories_on_overwrite(payload.column_name)
         self._pending_writes[key] = payload
@@ -1879,7 +1970,7 @@ class CytomeDataset:
         n_cells = int(self._conn.execute("SELECT COUNT(*) FROM cells").fetchone()[0])
         self._write_manifest_key("n_cells", n_cells)
 
-    def _refresh_after_reopen(self) -> None:
+    def _refresh_after_reopen(self, old_conn=None) -> None:
         """Reset connection-bound caches after ``self._conn`` reopens.
 
         ``MetadataStore`` (exposed via ``self.metadata``) caches the
@@ -1889,10 +1980,11 @@ class CytomeDataset:
         ``ds.metadata.get(...)`` raises
         ``ProgrammingError: cannot operate on a closed database``.
 
-        All other accessors (``ds.cells``, ``ds.embeddings``,
+        Every other accessor (``ds.cells``, ``ds.embeddings``,
         ``ds.provenance``, ``ds.graphs``, modalities, fragments,
-        measurement layers) construct fresh on each property access
-        and don't need refreshing.
+        measurement layers) is built fresh on each property access, and
+        one the caller kept in a variable is moved to the new connection
+        by ``_handles.rebind``.
 
         New cached attributes registered in ``__init__`` MUST be
         added here too — otherwise they'll be stale-cache vectors
@@ -1900,6 +1992,10 @@ class CytomeDataset:
         """
         self._metadata_obj = None
         self._manifest = self._read_manifest()
+        if old_conn is not None and old_conn is not self._conn:
+            # Accessors the caller kept (``cells = ds.cells``) follow the
+            # dataset to its new connection.
+            _handles.rebind(old_conn, self._conn)
 
     def _read_manifest(self) -> dict[str, Any]:
         rows = self._conn.execute("SELECT key, value FROM _manifest").fetchall()

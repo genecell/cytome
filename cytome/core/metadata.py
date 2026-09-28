@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from cytome.core import _handles
+
+import io
 import json
 import base64
 from dataclasses import dataclass
@@ -29,6 +32,7 @@ class MetadataStore:
         enqueue_write: Optional[Callable[[str, object], None]] = None,
     ) -> None:
         self._conn = conn
+        _handles.bind(self, conn)
         self._enqueue_write = enqueue_write
 
     def __getitem__(self, key: str) -> Any:
@@ -172,10 +176,12 @@ def _deserialize_value(value_json: str, value_type: str) -> Any:
         if isinstance(obj, dict) and "base64" in obj:
             return base64.b64decode(obj["base64"].encode("ascii"))
         return value_json.encode("utf-8")
+    # read_json takes a buffer, not the JSON text itself: pandas 3 reads a
+    # string as a path, and a stored DataFrame came back as FileNotFoundError.
     if value_type == "dataframe":
-        return pd.read_json(value_json, orient="split")
+        return pd.read_json(io.StringIO(value_json), orient="split")
     if value_type == "series":
-        return pd.read_json(value_json, orient="index", typ="series")
+        return pd.read_json(io.StringIO(value_json), orient="index", typ="series")
     return _restore_json_types(json.loads(value_json))
 
 

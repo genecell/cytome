@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from cytome.core import _handles
+
 import importlib.metadata as importlib_metadata
 import json
 import logging
@@ -19,6 +21,7 @@ class ProvenanceLog:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+        _handles.bind(self, conn)
 
     def log(
         self,
@@ -116,6 +119,20 @@ class ProvenanceLog:
 
 
 def _capture_dependency_versions() -> dict[str, str]:
+    """Installed distributions and their versions. Read once per process: it
+    parses every installed package's metadata (0.4 s here), and a process
+    that writes many stores -- a split into one store per group -- would
+    otherwise pay that for each."""
+    global _DEPENDENCY_VERSIONS
+    if _DEPENDENCY_VERSIONS is None:
+        _DEPENDENCY_VERSIONS = _read_dependency_versions()
+    return dict(_DEPENDENCY_VERSIONS)
+
+
+_DEPENDENCY_VERSIONS = None
+
+
+def _read_dependency_versions() -> dict[str, str]:
     versions: dict[str, str] = {}
     for dist in importlib_metadata.distributions():
         name = dist.metadata.get("Name")

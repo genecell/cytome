@@ -142,6 +142,18 @@ x = ds.RNA.counts[:200, :200]
 ds.close()
 ```
 
+### Read without writing
+
+```python
+ds = cytome.open("downloaded.cytome", mode="r")   # the file is never changed
+ds.read_only                                       # True
+ds.close()
+```
+
+A store that cannot be written (a read-only file, or a read-only folder such
+as a shared data directory) opens for reading on its own, with a warning; a
+write to it raises `cytome.ReadOnlyError` saying why.
+
 ### Merge datasets
 
 ```python

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from cytome.core import _handles
+
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -18,6 +20,7 @@ class FragmentStore:
 
     def __init__(self, conn: sqlite3.Connection, dataset) -> None:
         self._conn = conn
+        _handles.bind(self, conn)
         self._dataset = dataset
 
     @property
