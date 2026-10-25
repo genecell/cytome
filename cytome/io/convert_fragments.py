@@ -445,6 +445,7 @@ def import_fragments_streaming(
             pass  # table may not exist yet; schema creation handles it
 
     stats: Dict[str, int] = {}
+    max_ends: Dict[str, int] = {}          # {chrom: largest fragment end}
     n_dropped_chr = 0
 
     # Auto-detection state (resolved on first block)
@@ -550,8 +551,11 @@ def import_fragments_streaming(
         )
         block_chunk_idx[current_chrom] = ci
 
-        # Accumulate fragment count
+        # Accumulate fragment count and the largest end
         stats[current_chrom] = stats.get(current_chrom, 0) + len(starts)
+        if len(ends):
+            max_ends[current_chrom] = max(max_ends.get(current_chrom, int(ends[0])),
+                                          int(ends.max()))
 
         # Inline tile computation
         if tile_sizes:
@@ -629,7 +633,7 @@ def import_fragments_streaming(
 
     # Update fragment_meta for all chromosomes
     for chrom, n_frags in stats.items():
-        _update_fragment_meta(conn, chrom, n_frags)
+        _update_fragment_meta(conn, chrom, n_frags, max_end=max_ends.get(chrom))
 
     # Store genome version in manifest if provided
     if genome:
@@ -781,41 +785,38 @@ def _write_block_chunks(
     return chunk_idx
 
 
-def _update_fragment_meta(conn, chrom, n_frags):
-    """Update fragment_meta after all blocks for a chromosome are written."""
-    # Get min_start and max_end from the stored chunks
-    row = conn.execute(
-        "SELECT MIN(row_start), MAX(row_end) FROM fragment_chunks WHERE chrom = ?",
-        (chrom,),
-    ).fetchone()
+def _update_fragment_meta(conn, chrom, n_frags, max_end=None):
+    """Update fragment_meta after all blocks for a chromosome are written.
 
-    # Get actual coordinate bounds from first and last chunks
+    ``min_start`` is the first stored start (chunks are sorted by start).
+    ``max_end`` is the largest end of the chromosome, which is not the last
+    fragment's end: an earlier, longer fragment can end after it. Writers that
+    saw every fragment pass it; without it every chunk's ends are decoded.
+    Readers size per-chromosome arrays by it (coverage tracks, for one).
+    """
+    from cytome.io.compression import decode_ends, decode_starts
     first_chunk = conn.execute(
         "SELECT starts_blob, compression, COALESCE(encoding, 0) "
         "FROM fragment_chunks "
         "WHERE chrom = ? ORDER BY chunk_idx ASC LIMIT 1",
         (chrom,),
     ).fetchone()
-    last_chunk = conn.execute(
-        "SELECT starts_blob, ends_blob, compression, COALESCE(encoding, 0) "
-        "FROM fragment_chunks "
-        "WHERE chrom = ? ORDER BY chunk_idx DESC LIMIT 1",
-        (chrom,),
-    ).fetchone()
 
     min_start = None
-    max_end = None
     if first_chunk:
-        from cytome.io.compression import decode_starts
         starts_arr = decode_starts(first_chunk[0], first_chunk[1], first_chunk[2])
         if len(starts_arr) > 0:
             min_start = int(starts_arr[0])
-    if last_chunk:
-        from cytome.io.compression import decode_starts, decode_ends
-        last_starts = decode_starts(last_chunk[0], last_chunk[2], last_chunk[3])
-        last_ends = decode_ends(last_chunk[1], last_chunk[2], last_starts, last_chunk[3])
-        if len(last_ends) > 0:
-            max_end = int(last_ends[-1])
+    if max_end is None:
+        for s_blob, e_blob, comp, enc in conn.execute(
+                "SELECT starts_blob, ends_blob, compression, COALESCE(encoding, 0) "
+                "FROM fragment_chunks WHERE chrom = ?", (chrom,)):
+            ends_arr = decode_ends(e_blob, comp, decode_starts(s_blob, comp, enc), enc)
+            if len(ends_arr) > 0:
+                m = int(ends_arr.max())
+                max_end = m if max_end is None else max(max_end, m)
+    else:
+        max_end = int(max_end)
 
     conn.execute(
         """INSERT OR REPLACE INTO fragment_meta
@@ -996,5 +997,5 @@ def _write_chrom_chunks(
         (chrom, n_frags,
          f"fragment_chunks:{chrom}", f"fragments_{chrom}_rtree",
          int(starts[0]) if n_frags > 0 else None,
-         int(ends[-1]) if n_frags > 0 else None),
+         int(ends.max()) if n_frags > 0 else None),
     )

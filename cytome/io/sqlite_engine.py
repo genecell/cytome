@@ -34,6 +34,11 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
     conn
         Open SQLite connection.
     """
+    # No page_size pragma: stores have SQLite's default 4,096-byte pages. A 65,536-byte request used
+    # to follow the switch to WAL, which writes the header of a new file and so fixes the default
+    # first; no store cytome created ever had 64 KB pages. Measured on a 1.5 GB ATAC store, 64 KB
+    # pages changed no read by more than about a third (the fragment chunks read from disk were
+    # slower) and make an empty store 13 MB instead of 0.9 MB (223 tables and indexes, a page each).
     try:
         conn.execute("PRAGMA journal_mode=WAL")
     except sqlite3.OperationalError as exc:
@@ -62,7 +67,6 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
             f"      cp '{db_path}' /tmp/local.cytome  # or /dev/shm/local.cytome\n"
         ) from exc
     conn.execute("PRAGMA busy_timeout=60000")  # 60s retry for concurrent access
-    conn.execute("PRAGMA page_size=65536")
     conn.execute("PRAGMA cache_size=-64000")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA temp_store=MEMORY")
@@ -107,13 +111,15 @@ def create_database(path: PathLike, force: bool = False) -> sqlite3.Connection:
             f"(guards against accidentally truncating an existing cytome)."
         )
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    if db_path.exists():
-        # force=True: drop the old DB (+ WAL/SHM sidecars) so we start from a
-        # clean schema rather than reopening a partial/foreign file.
-        for sfx in ("", "-wal", "-shm"):
-            p = Path(str(db_path) + sfx)
-            if p.exists():
-                p.unlink()
+    # Drop the old DB and its WAL/SHM/journal sidecars, so we start from a clean schema
+    # rather than reopening a partial or foreign file. The sidecars go even when the main
+    # file is already gone: a crashed writer can leave a -wal behind a deleted main file,
+    # and SQLite would replay it into the new store. (Without force, an existing main
+    # file raised above; leftover sidecars alone are never valid data.)
+    for sfx in ("", "-wal", "-shm", "-journal"):
+        p = Path(str(db_path) + sfx)
+        if p.exists():
+            p.unlink()
     conn = sqlite3.connect(str(db_path))
     _configure_connection(conn)
     _create_schema(conn)
@@ -327,6 +333,7 @@ def _install_read_shims(conn: sqlite3.Connection) -> list[str]:
             "SELECT name FROM main.sqlite_master WHERE type = 'table'"):
         have[name] = None
     made = []
+    views = set()
     for name, sql, virtual, cols in _reference_schema():
         if name not in have:
             if virtual:
@@ -344,9 +351,25 @@ def _install_read_shims(conn: sqlite3.Connection) -> list[str]:
         lack = [c for c in cols if c.lower() not in lower]
         if lack:
             extra = ", ".join(f'NULL AS "{c}"' for c in lack)
-            conn.execute(f'CREATE TEMP VIEW "{name}" AS SELECT *, {extra} FROM main."{name}"')
+            # A view has no ROWID, and readers order entity tables by it (cytome's entity lookups, PIASO's
+            # runSVD, clustering and plots): the base table's rowid is exposed as a column named rowid, last,
+            # so ``ORDER BY rowid`` resolves to it and SQLite still scans the base table in rowid order (no
+            # sort). Column listings hide it (visible_columns).
+            conn.execute(f'CREATE TEMP VIEW "{name}" AS SELECT *, {extra}, main."{name}".rowid AS rowid '
+                         f'FROM main."{name}"')
             made.append(f"{name}({', '.join(lack)})")
+            views.add(name)
+    conn.shim_views = views
     return made
+
+
+def visible_columns(conn: sqlite3.Connection, table: str) -> list:
+    """``PRAGMA table_info`` rows of ``table`` as its readers should see them: a read shim's view exposes the
+    base table's rowid as a column (see ``_install_read_shims``), which is not one of the table's columns."""
+    rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+    if table in getattr(conn, "shim_views", ()):
+        rows = [r for r in rows if r[1] != "rowid"]
+    return rows
 
 
 def open_read_only(path: PathLike, reason: str = "it was opened with mode='r'") -> sqlite3.Connection:

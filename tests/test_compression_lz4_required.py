@@ -36,15 +36,3 @@ def test_missing_lz4_raises_something_actionable(monkeypatch):
     monkeypatch.setattr(C, "_LZ4_AVAILABLE", False)
     with pytest.raises(ImportError, match="pip install lz4"):
         C.compress_blob(b"x" * 100, "lz4")
-
-
-def test_zstd_still_degrades_to_zlib(monkeypatch):
-    """zstd is genuinely optional and must keep degrading, unlike lz4.
-
-    This asymmetry is the whole point: zstd falls through to zlib, lz4 cannot,
-    and that is why one is an extra and the other is a core dependency.
-    """
-    monkeypatch.setattr(C, "_ZSTD_AVAILABLE", False)
-    payload = b"y" * 500
-    blob = C.compress_blob(payload, "zstd")
-    assert C.decompress_blob(blob, "zstd") == payload

@@ -35,13 +35,19 @@ _REQUIRED_TABLES = {
 }
 
 
-def validate(ds) -> ValidationReport:
+def validate(ds, integrity: bool = True) -> ValidationReport:
     """Run structural and consistency checks on a dataset.
 
     Parameters
     ----------
     ds
         Open ``CytomeDataset`` instance.
+    integrity
+        Run SQLite's own ``PRAGMA integrity_check`` first (default). It reads
+        every page of the file in tree order: two hours for an 80 GB store
+        that is not in the page cache. ``False`` keeps cytome's own checks
+        (the required tables, and the row and chunk counts against the
+        entity tables and the metadata), which never read a blob.
 
     Returns
     -------
@@ -52,11 +58,12 @@ def validate(ds) -> ValidationReport:
     passed: list[str] = []
     failed: list[str] = []
 
-    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-    if integrity == "ok":
-        passed.append("sqlite_integrity")
-    else:
-        failed.append(f"sqlite_integrity: {integrity}")
+    if integrity:
+        result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if result == "ok":
+            passed.append("sqlite_integrity")
+        else:
+            failed.append(f"sqlite_integrity: {result}")
 
     tables = {
         r[0]

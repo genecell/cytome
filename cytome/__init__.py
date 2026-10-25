@@ -55,6 +55,7 @@ __all__ = [
     "from_barcodes",
     "merge",
     "import_gtf",
+    "read_gtf",
     # modality routing -- see the note above before changing any of these
     "MODALITY_REGISTRY",
     "MODALITY_VAR_ENTITY",
@@ -73,13 +74,20 @@ __all__ = [
 # The manifest's writer_version reads THIS, not the installed distribution
 # metadata: a source tree run against a stale editable install would otherwise
 # stamp files with the version of code that did not write them.
-__version__ = "0.3.6"
+__version__ = "0.3.7"
 
 
 def import_gtf(ds, gtf_path, **kwargs):
     """Convenience: forward to :func:`cytome.io.gtf_import.import_gtf`."""
     from cytome.io.gtf_import import import_gtf as _impl
     return _impl(ds, gtf_path, **kwargs)
+
+
+def read_gtf(gtf_path, **kwargs):
+    """Convenience: forward to :func:`cytome.io.gtf_import.read_gtf` (a GTF as gene and feature
+    DataFrames, read the way :func:`import_gtf` reads it)."""
+    from cytome.io.gtf_import import read_gtf as _impl
+    return _impl(gtf_path, **kwargs)
 
 
 def open(path: str | Path, mode: str = "r+") -> CytomeDataset:

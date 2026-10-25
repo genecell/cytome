@@ -411,11 +411,13 @@ def test_from_h5ad_backed_uint16_preserved(tmp_path):
 # =====================================================================
 
 def test_from_h5ad_backed_no_pyarrow_import(tmp_path):
-    """User constraint: backed-mode conversion must NOT pull pyarrow.
+    """User constraint: backed-mode conversion must NOT need pyarrow.
 
-    Runs the conversion in a subprocess, then asserts pyarrow is not
-    in sys.modules. Done in a subprocess so other tests' state can't
-    pollute the import surface.
+    The conversion runs in a subprocess in which pyarrow cannot be imported (a
+    meta-path finder refuses it), so it must succeed and write the whole store
+    without it. Asserting only that pyarrow is absent from ``sys.modules``
+    failed wherever pandas loads pyarrow on its own (pandas 2.x does at import
+    when pyarrow is installed), which says nothing about the conversion.
     """
     h5ad_path, _ = _build_rich_h5ad(tmp_path, n_obs=80, n_vars=30)
     out = tmp_path / "nopyarrow.cytome"
@@ -423,40 +425,38 @@ def test_from_h5ad_backed_no_pyarrow_import(tmp_path):
 
     runner = tmp_path / "run.py"
     runner.write_text(textwrap.dedent(f"""
-        import json, sys
+        import importlib.abc, json, sys
+
+        class _NoPyarrow(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path=None, target=None):
+                if name == "pyarrow" or name.startswith("pyarrow."):
+                    raise ModuleNotFoundError(f"No module named {{name!r}} (blocked by the test)")
+                return None
+
+        sys.meta_path.insert(0, _NoPyarrow())
         sys.path.insert(0, {repr(str(Path(cytome.__file__).resolve().parents[1]))})
         import cytome
-        cytome.from_h5ad(
+        ds = cytome.from_h5ad(
             {repr(str(h5ad_path))},
             output={repr(str(out))},
             modality='RNA', backed=True, verbose=False,
         )
-        # Filter pandas's own pyarrow-compat shim — it's a pure-Python
-        # module that registers as 'pandas.compat.pyarrow' but does NOT
-        # import the pyarrow package itself. The user constraint is no
-        # ACTUAL pyarrow dependency. Anything starting with 'pyarrow.'
-        # or equal to 'pyarrow' indicates a real import.
-        actual_pyarrow = sorted(
-            m for m in sys.modules
-            if m == 'pyarrow' or m.startswith('pyarrow.')
-        )
+        n_cells = ds.n_cells
+        ds.close()
+        loaded = sorted(m for m in sys.modules if m == 'pyarrow' or m.startswith('pyarrow.'))
         with open({repr(str(result_file))}, 'w') as f:
-            json.dump({{'pyarrow_modules': actual_pyarrow}}, f)
+            json.dump({{'pyarrow_modules': loaded, 'n_cells': n_cells}}, f)
     """))
     proc = subprocess.run(
         [sys.executable, str(runner)],
         capture_output=True, text=True, check=False,
     )
     assert proc.returncode == 0, (
-        f"subprocess failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        f"the conversion failed without pyarrow\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
     with open(result_file) as f:
         r = json.load(f)
-    assert r["pyarrow_modules"] == [], (
-        f"pyarrow was imported by from_h5ad(backed=True): "
-        f"{r['pyarrow_modules']}. The conversion path must not depend "
-        f"on pyarrow (user constraint)."
-    )
+    assert r["pyarrow_modules"] == [] and r["n_cells"] == 80
 
 
 # =====================================================================

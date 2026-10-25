@@ -5,23 +5,31 @@ from __future__ import annotations
 import zlib
 
 
+# zstandard and lz4 are dependencies of cytome; the guards keep a broken
+# install's failure an error that says what to install, at the first write or
+# read that needs the codec.
 _ZSTD_AVAILABLE = True
 try:
     import zstandard as zstd
-except ImportError:  # pragma: no cover - optional dependency
+except ImportError:  # pragma: no cover - a required dependency
     _ZSTD_AVAILABLE = False
     zstd = None
 
 _LZ4_AVAILABLE = True
 try:
     import lz4.block as _lz4_block
-except ImportError:  # pragma: no cover - optional dependency
+except ImportError:  # pragma: no cover - a required dependency
     _LZ4_AVAILABLE = False
     _lz4_block = None
 
 
 def compress_blob(data: bytes, method: str = "zstd", level: int | None = None) -> bytes:
-    """Compress bytes using zstd (preferred), lz4, or zlib.
+    """Compress bytes using zstd (the default), lz4, or zlib.
+
+    The method a writer passes is the one it records beside the blob, so a
+    method whose codec is missing raises instead of falling back to another:
+    zlib bytes under a zstd or lz4 label cannot be decoded by a reader that
+    trusts the label.
 
     Parameters
     ----------
@@ -38,7 +46,7 @@ def compress_blob(data: bytes, method: str = "zstd", level: int | None = None) -
         Compressed data.
     """
     chosen = _resolve_method(method)
-    if chosen == "zstd" and _ZSTD_AVAILABLE:
+    if chosen == "zstd":
         return zstd.ZstdCompressor(level=level if level is not None else 3).compress(data)
     if chosen == "lz4":
         if not _LZ4_AVAILABLE:
@@ -155,7 +163,13 @@ def _resolve_method(method: str) -> str:
     if method not in {"zstd", "zlib", "lz4"}:
         raise ValueError(f"Unsupported compression method: {method}")
     if method == "zstd" and not _ZSTD_AVAILABLE:
-        return "zlib"
+        # Not a fallback to zlib: the caller records "zstd" beside the blob.
+        # cytome 0.3.6 and earlier fell back here and labelled zlib bytes
+        # "zstd"; decompress_blob still decodes those stores by their bytes.
+        raise ImportError(
+            "zstd compression was requested but zstandard is not installed. "
+            "It is a required dependency of cytome: pip install zstandard"
+        )
     if method == "lz4" and not _LZ4_AVAILABLE:
         raise ImportError("lz4 not installed. pip install lz4")
     return method

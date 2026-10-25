@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import json
+import os
+import shutil
+import sqlite3
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -21,6 +27,8 @@ def subset(
     include_graphs: bool = False,
     copy_annotations: bool = True,
     matrices: "list[str] | None" = None,
+    check_free_space: bool = True,
+    check_integrity: bool = False,
 ):
     """Subset cells to a new Cytome dataset.
 
@@ -40,16 +48,139 @@ def subset(
     calls ``filter_cells``). **Spatial coordinates** are cell-indexed data and
     are always subset + remapped (independent of ``copy_annotations``).
     **Cell×cell graphs** are intentionally dropped (with a warning) — removing
-    cells makes such a graph incomplete, so it must be re-derived.
+    cells makes such a graph incomplete, so it must be re-derived. For the same
+    reason, when cells are removed, the per-feature sums over cells that a feature
+    table may cache (``n_cells_accessible`` and ``<feature>_total_counts``, e.g.
+    ``tile_total_counts``) would describe the cells removed. Where the importer's
+    guard vouches for them (``importer_stats:<matrix>``, written by the fragment
+    importer and the peak quantifier), they are computed again for the kept cells
+    while the matrix streams, with a new guard, so PIASO's ``selectPeaks`` reads
+    them instead of a pass over the matrix. Columns without a guard are not
+    carried.
+
+    The new store is built as ``<output>.partial`` without a journal and without
+    syncs (as a fresh import is built), then switched to WAL, synced to disk and
+    renamed to ``output``. Writing through the WAL wrote every fragment and matrix
+    blob twice, and held them in the log until the commit (up to twice the output's
+    size on disk); a crash now leaves only the partial file, which the next run
+    removes. ``check_free_space`` (default True) estimates the bytes the subset
+    writes and raises ``OSError(ENOSPC)`` before writing anything when the output's
+    file system has less free.
+
+    After it is written, the new store gets cytome's own consistency checks (rows
+    against the entity tables, chunks against the metadata), which a wrong subset
+    would fail. ``check_integrity`` (default False) also runs SQLite's
+    ``PRAGMA integrity_check`` on it, which reads every page of the file in the
+    order of its trees: seconds while the new store is still in the page cache,
+    hours for a large one that no longer fits there (two hours for an 80 GB store
+    on a spinning disk). Turn it on to rule out damage to the file itself; a failed
+    check warns, as a failed count does. ``CytomeDataset.validate()`` runs the same
+    check on any store.
     """
     del include_graphs
     ds.flush()            # what the caller has written so far is part of the source
     keep_idx = _resolve_keep_indices(ds.n_cells, mask)
-    out = _begin_output(ds, keep_idx, output, matrices, copy_annotations)
-    _subset_matrices_streaming(ds, out, keep_idx, matrices=matrices)
-    _finish_output(ds, out, keep_idx, output, include_embeddings, include_fragments,
-                   copy_annotations)
-    return out
+    output = Path(output)
+    partial = Path(str(output) + ".partial")
+    _remove_store_files(partial)
+    if check_free_space:
+        _check_free_space(ds, keep_idx, output.parent, matrices, include_fragments)
+    out = _begin_output(ds, keep_idx, partial, matrices, copy_annotations)
+    try:
+        _bulk_begin(out)
+        sums = _feature_sums_plan(ds, out, keep_idx, matrices)
+        _subset_matrices_streaming(ds, out, keep_idx, matrices=matrices, sums=sums)
+        _finish_output(ds, out, keep_idx, output, include_embeddings, include_fragments,
+                       copy_annotations, feature_sums=sums, check_integrity=check_integrity)
+        _bulk_end(out)
+        out.close()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            out.close()
+        _remove_store_files(partial)
+        raise
+    _sync_path(partial)
+    for sfx in ("-wal", "-shm", "-journal"):      # an older output's sidecars must not
+        Path(str(output) + sfx).unlink(missing_ok=True)   # be replayed into the new file
+    os.replace(partial, output)
+    _sync_path(output.parent)
+    return CytomeDataset(output, mode="r+")
+
+
+def _remove_store_files(path) -> None:
+    """Delete a store file and its sidecars, whichever exist."""
+    for sfx in ("", "-wal", "-shm", "-journal"):
+        Path(str(path) + sfx).unlink(missing_ok=True)
+
+
+def _bulk_begin(out: CytomeDataset) -> None:
+    """Write a fresh store without a journal and without syncs while it is built."""
+    out.flush()
+    out._conn.commit()
+    out._conn.execute("PRAGMA journal_mode=OFF")
+    out._conn.execute("PRAGMA synchronous=OFF")
+
+
+def _bulk_end(out: CytomeDataset) -> None:
+    """Back to the store's normal mode: WAL, synchronous NORMAL."""
+    out.flush()
+    out._conn.commit()
+    out._conn.execute("PRAGMA synchronous=NORMAL")
+    out._conn.execute("PRAGMA journal_mode=WAL")
+
+
+def _sync_path(path) -> None:
+    """fsync a file or directory; file systems that cannot sync a directory are skipped."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _bytes_to_write(ds, keep_frac: float, matrices, include_fragments: bool) -> int:
+    """Estimated bytes a subset writes: the compressed blobs of the matrices, embeddings
+    and fragments it carries, scaled by the share of cells kept. Blob lengths come from
+    the record headers, so the estimate reads no blob content."""
+    conn = ds._conn
+
+    def q(sql, args=()):
+        try:
+            return int(conn.execute(sql, args).fetchone()[0] or 0)
+        except sqlite3.OperationalError:            # table absent in this store
+            return 0
+
+    names = ([r[0] for r in conn.execute("SELECT matrix_name FROM matrix_meta")]
+             if matrices is None else list(matrices))
+    total = 0
+    for name in names:
+        for tbl in ("matrix_chunks", "matrix_csc_chunks"):
+            total += q(f"SELECT SUM(length(data_blob) + length(indices_blob) + "
+                       f"length(indptr_blob)) FROM {tbl} WHERE matrix_name = ?", (name,))
+    total += q("SELECT SUM(length(data_blob)) FROM dense_chunks")
+    if include_fragments:
+        total += q("SELECT SUM(length(starts_blob) + length(ends_blob) + "
+                   "length(cell_idx_blob)) FROM fragment_chunks")
+    return int(total * keep_frac)
+
+
+def _check_free_space(ds, keep_idx, directory, matrices, include_fragments) -> None:
+    """Raise ``OSError(ENOSPC)`` before writing when ``directory`` lacks room for the subset."""
+    keep_frac = len(keep_idx) / max(int(ds.n_cells), 1)
+    need = int(_bytes_to_write(ds, keep_frac, matrices, include_fragments) * 1.05) + (256 << 20)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(directory).free
+    if free < need:
+        raise OSError(errno.ENOSPC,
+                      f"subset needs about {need / 1e9:.1f} GB free in {directory}; "
+                      f"{free / 1e9:.1f} GB available (pass check_free_space=False to skip "
+                      f"this check)")
 
 
 def _begin_output(ds, keep_idx, output, matrices, copy_annotations):
@@ -80,17 +211,154 @@ def _begin_output(ds, keep_idx, output, matrices, copy_annotations):
     _feature_tables = ["genes", "peaks", "tiles", "proteins"]
     if copy_annotations:
         _feature_tables.append("GA_genes")
+    removed = len(keep_idx) < int(ds.n_cells)
     for tbl in _feature_tables:
         if _wanted(tbl):
-            _copy_feature_table(ds._conn, out._conn, tbl)
+            _copy_feature_table(ds._conn, out._conn, tbl,
+                                skip=_feature_stat_columns(tbl) if removed else ())
     _copy_feature_table(ds._conn, out._conn, "samples")
     out.flush()
 
     return out
 
 
+def _feature_stat_columns(table: str) -> "tuple[str, str]":
+    """The per-feature sums over cells a feature table may cache: cells with a count
+    and total counts, as the importer and ``selectPeaks`` name them
+    (``n_cells_accessible``, ``tile_total_counts`` on ``tiles``)."""
+    singular = table[:-1] if table.endswith("s") else table
+    return ("n_cells_accessible", f"{singular}_total_counts")
+
+
+# On by default; the benchmark of the two behaviours turns it off.
+_RECOMPUTE_FEATURE_SUMS = True
+
+
+class _FeatureSums:
+    """One matrix's per-feature sums over the kept cells, written into its feature table.
+
+    ``n_cells_accessible`` counts the entries above zero of each column and
+    ``<feature>_total_counts`` sums them, as PIASO's ``selectPeaks`` does. A
+    column-major chunk holds whole columns, so its sums are final when it is
+    written and go into the table at once, one ``UPDATE ... FROM (VALUES ...)``
+    per chunk: no temporary table, memory of one chunk (6.2 million tiles: 7 s,
+    against 23 s through a temporary table). A row-major matrix sums into arrays
+    of its width first. Only features with a count are written; the columns
+    default to 0.
+    """
+
+    def __init__(self, conn, table, pk, nca_col, tot_col, n_cols, guard):
+        self.conn, self.table, self.pk = conn, table, pk
+        self.nca_col, self.tot_col, self.n_cols, self.guard = nca_col, tot_col, int(n_cols), guard
+        self.full = None
+        try:                                   # bound parameters a statement may take
+            limit = conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+        except (AttributeError, sqlite3.Error):  # Python < 3.11: SQLite's old default
+            limit = 999
+        self.rows_per_statement = max(1, min(4096, int(limit) // 3))
+
+    @staticmethod
+    def column_sums(data, ptr):
+        """Entries above zero and totals of each column of one CSC chunk."""
+        ptr = np.asarray(ptr, dtype=np.int64)
+        width = ptr.size - 1
+        nca = np.zeros(width, dtype=np.int32)
+        tot = np.zeros(width, dtype=np.float64)
+        counts = np.diff(ptr)
+        cols = np.flatnonzero(counts > 0)
+        if cols.size:
+            # over the non-empty columns only: their starts increase strictly, so each
+            # segment ends where the next non-empty column starts (or at the end)
+            starts = ptr[:-1][cols]
+            # an importer's counts store no zeros: then the entries above zero are the
+            # stored entries, and only the totals need a pass over the values
+            nca[cols] = (counts[cols] if data.min() > 0
+                         else np.add.reduceat(data > 0, starts, dtype=np.int64))
+            tot[cols] = np.add.reduceat(data, starts, dtype=np.float64)
+        return nca, tot
+
+    def write(self, idx, nca, tot):
+        q = _q(self.table)
+        step = self.rows_per_statement
+        for s in range(0, len(idx), step):
+            i, n, t = idx[s:s + step].tolist(), nca[s:s + step].tolist(), tot[s:s + step].tolist()
+            args = [x for row in zip(i, n, t) for x in row]
+            self.conn.execute(
+                f"WITH v(idx, nca, tot) AS (VALUES {','.join(['(?,?,?)'] * len(i))}) "
+                f"UPDATE {q} SET {_q(self.nca_col)} = v.nca, {_q(self.tot_col)} = v.tot "
+                f"FROM v WHERE v.idx = {q}.{_q(self.pk)}", args)
+
+    def add_columns(self, col_start, nca, tot):
+        nz = np.flatnonzero((nca != 0) | (tot != 0))
+        if nz.size:
+            self.write(nz + int(col_start), nca[nz], tot[nz])
+
+    def add_rows(self, block):
+        if self.full is None:
+            self.full = [np.zeros(self.n_cols, dtype=np.int32), np.zeros(self.n_cols, dtype=np.float64)]
+        pos = block.data > 0
+        self.full[0] += np.bincount(block.indices[pos], minlength=self.n_cols).astype(np.int32)
+        self.full[1] += np.bincount(block.indices, weights=block.data, minlength=self.n_cols)
+
+    def finish(self, matrix_name):
+        """Write what is left, and the guard naming the new matrix."""
+        if self.full is not None:
+            nca, tot = self.full
+            nz = np.flatnonzero((nca != 0) | (tot != 0))
+            self.write(nz, nca[nz], tot[nz])
+            self.full = None
+        meta = self.conn.execute("SELECT n_rows, n_cols, n_nonzero FROM matrix_meta "
+                                 "WHERE matrix_name = ?", (matrix_name,)).fetchone()
+        guard = {"matrix": matrix_name, "n_rows": int(meta[0]), "n_cols": int(meta[1]),
+                 "n_nonzero": int(meta[2]), "counting": self.guard.get("counting")}
+        self.conn.execute("INSERT OR REPLACE INTO _metadata (key, value, value_type) "
+                          "VALUES (?, ?, 'scalar')",
+                          (f"importer_stats:{matrix_name}", json.dumps(guard)))
+
+
+def _feature_sums_plan(ds, out, keep_idx, matrices) -> dict:
+    """The matrices whose feature sums a subset computes again: those whose guard the
+    source carries (``importer_stats:<matrix>``), whose feature table the output
+    carries, and whose two columns the source has. ``{matrix: _FeatureSums}``; empty
+    when every cell is kept (the columns are then copied as they are)."""
+    if not _RECOMPUTE_FEATURE_SUMS or len(keep_idx) >= int(ds.n_cells):
+        return {}
+    src, dst = ds._conn, out._conn
+    names = ([r[0] for r in src.execute("SELECT matrix_name FROM matrix_meta")]
+             if matrices is None else list(matrices))
+    plan, tables = {}, set()
+    for name in names:
+        try:
+            row = src.execute("SELECT value FROM _metadata WHERE key = ?",
+                              (f"importer_stats:{name}",)).fetchone()
+            guard = json.loads(row[0]) if row else None
+        except (sqlite3.OperationalError, ValueError, TypeError):
+            guard = None
+        meta = src.execute("SELECT n_cols, col_entity FROM matrix_meta WHERE matrix_name = ?",
+                           (name,)).fetchone()
+        if not isinstance(guard, dict) or meta is None or not meta[1] or meta[1] in tables:
+            continue
+        table = str(meta[1])
+        nca_col, tot_col = _feature_stat_columns(table)
+        src_cols = {r[1].lower(): r for r in src.execute(f"PRAGMA table_info({_q(table)})")}
+        dst_cols = dst.execute(f"PRAGMA table_info({_q(table)})").fetchall()
+        if nca_col.lower() not in src_cols or tot_col.lower() not in src_cols or not dst_cols:
+            continue
+        pk = next((r[1] for r in dst_cols if r[5]), None)
+        if pk is None:
+            continue
+        have = {r[1].lower() for r in dst_cols}
+        for col in (nca_col, tot_col):
+            if col.lower() not in have:
+                decl = src_cols[col.lower()][2] or ""
+                dst.execute(f"ALTER TABLE {_q(table)} ADD COLUMN {_q(col)} {decl} DEFAULT 0")
+        plan[name] = _FeatureSums(dst, table, pk, nca_col, tot_col, int(meta[0]), guard)
+        tables.add(table)
+    return plan
+
+
 def _finish_output(ds, out, keep_idx, output, include_embeddings, include_fragments,
-                   copy_annotations):
+                   copy_annotations, feature_sums=None, check_integrity=False):
     """Everything a subset carries after its matrices: embeddings, annotations, spatial
     coordinates, fragments, metadata, provenance; then the consistency check."""
 
@@ -136,10 +404,19 @@ def _finish_output(ds, out, keep_idx, output, include_embeddings, include_fragme
         return key.endswith(("_cell_depth", "_log1p_params",
                              "_infog_params", "_tfidf_params"))
 
+    # The importer's guard over the per-feature columns names the matrix's old
+    # shape. When cells are removed the columns are left out at copy
+    # (_begin_output), and computed again only where ``feature_sums`` says so,
+    # each with a new guard; the old guard is never carried.
+    removed = len(keep_idx) < int(ds.n_cells)
     for key, value in ds.metadata.items():
         if _is_cell_dependent_stat(key):
             continue
+        if removed and key.startswith("importer_stats:"):
+            continue
         out.metadata[key] = value
+    for name, sums in (feature_sums or {}).items():
+        sums.finish(name)          # the recomputed columns' last batch, and their new guard
 
     out.provenance.log(
         operation="subset",
@@ -152,9 +429,12 @@ def _finish_output(ds, out, keep_idx, output, include_embeddings, include_fragme
     )
     out.flush()
 
-    # Post-subset consistency check
+    # Post-subset consistency check: cytome's own counts, which are what a subset can get wrong.
+    # SQLite's integrity check of the file SQLite has just written only when asked
+    # (check_integrity): it reads every page in tree order, cheap while the new file is still in
+    # the page cache and two hours for an 80 GB copy that no longer fits there.
     from cytome.utils.validation import validate
-    report = validate(out)
+    report = validate(out, integrity=check_integrity)
     if not report.passed:
         import warnings
         warnings.warn(
@@ -191,7 +471,7 @@ def _feature_tables_of(ds, matrices) -> "set[str] | None":
 
 
 def _subset_matrices_streaming(ds: CytomeDataset, out: CytomeDataset, keep_idx: np.ndarray,
-                               matrices: "list[str] | None" = None) -> None:
+                               matrices: "list[str] | None" = None, sums: "dict | None" = None) -> None:
     """Subset every matrix into ``out`` **without** materialising the whole
     matrix in RAM.
 
@@ -233,8 +513,10 @@ def _subset_matrices_streaming(ds: CytomeDataset, out: CytomeDataset, keep_idx: 
         if "_" in matrix_name and matrix_name.split("_", 1)[0]:
             # Neither writer below registers the modality in the manifest.
             out_modalities.add(matrix_name.split("_", 1)[0])
+        fsum = (sums or {}).get(matrix_name)
         if _is_column_major(ds._conn, matrix_name):
-            _subset_csc_matrix(ds, out, matrix_name, int(n_cols), dtype, col_entity, keep_idx)
+            _subset_csc_matrix(ds, out, matrix_name, int(n_cols), dtype, col_entity, keep_idx,
+                               sums=fsum)
             continue
         writer = out.create_layer_writer(
             matrix_name, n_rows=n_out, n_cols=int(n_cols),
@@ -257,11 +539,15 @@ def _subset_matrices_streaming(ds: CytomeDataset, out: CytomeDataset, keep_idx: 
             if buf_rows >= ROW_CAP or buf_nnz >= NNZ_CAP:
                 block = sp.vstack(buf, format="csr") if len(buf) > 1 else buf[0].tocsr()
                 writer.write_chunk(block, row_offset=out_off)
+                if fsum is not None:
+                    fsum.add_rows(block)
                 out_off += block.shape[0]
                 buf, buf_rows, buf_nnz = [], 0, 0
         if buf_rows:
             block = sp.vstack(buf, format="csr") if len(buf) > 1 else buf[0].tocsr()
             writer.write_chunk(block, row_offset=out_off)
+            if fsum is not None:
+                fsum.add_rows(block)
             out_off += block.shape[0]
         writer.finalize()
 
@@ -286,25 +572,94 @@ def _is_column_major(conn, matrix_name: str) -> bool:
     return bool(row) and row[0] == 0 and bool(row[1])
 
 
-def _subset_csc_matrix(ds, out, matrix_name: str, n_cols: int, dtype, col_entity, keep_idx) -> None:
+def _subset_csc_matrix(ds, out, matrix_name: str, n_cols: int, dtype, col_entity, keep_idx,
+                       threads: "int | None" = None, sums: "_FeatureSums | None" = None) -> None:
     """Row-select a column-major matrix, chunk by chunk, into ``out``.
 
-    A CSC chunk holds all rows of a run of columns, so keeping rows is a
-    fancy index on each chunk and the column ranges are unchanged. Nothing
-    is transposed and one chunk is resident at a time. The result keeps the
-    layout: CSC chunks only, ``matrix_meta.layout = 'csc'``.
+    A CSC chunk holds all rows of a run of columns, so keeping rows changes
+    every chunk but not the column ranges. Nothing is transposed. The result
+    keeps the layout: CSC chunks only, ``matrix_meta.layout = 'csc'``.
+
+    Chunks are independent: worker threads decompress a chunk, select its rows
+    and recompress it, while the main thread reads the next blobs and writes
+    finished chunks in order (at most two per worker in flight). The selection
+    works on the raw arrays with a keep mask and the new row numbers. Kept rows
+    are sorted and unique, so this is the same matrix, in the same bytes, as
+    scipy's fancy index followed by ``sort_indices``, without the per-chunk
+    argsort of all kept rows; a chunk whose row indices are not sorted within
+    its columns takes the scipy path.
     """
-    from cytome.core.measurement import MeasurementLayer
-    src = MeasurementLayer(ds._conn, matrix_name)
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    from cytome.io.compression import compress_blob, decompress_blob
+
     keep = np.asarray(keep_idx, dtype=np.int64)
+    n_src = int(ds._conn.execute("SELECT n_rows FROM matrix_meta WHERE matrix_name = ?",
+                                 (matrix_name,)).fetchone()[0])
+    mask = np.zeros(n_src, dtype=bool)
+    mask[keep] = True
+    remap = np.full(n_src, -1, dtype=np.int32)
+    remap[keep] = np.arange(len(keep), dtype=np.int32)
+    out_dtype = np.dtype(dtype)
+
+    def work(item):
+        col_start, col_end, data_b, idx_b, ptr_b, src_dtype, comp = item
+        data = np.frombuffer(decompress_blob(data_b, comp), dtype=np.dtype(src_dtype))
+        idx = np.frombuffer(decompress_blob(idx_b, comp), dtype=np.int32)
+        ptr = np.frombuffer(decompress_blob(ptr_b, comp), dtype=np.int32)
+        width = int(col_end) - int(col_start)
+        # sorted within every column: consecutive entries increase except where a column starts
+        steps = np.diff(idx)
+        col_first = np.zeros(idx.size, dtype=bool)
+        col_first[ptr[:-1][ptr[:-1] < idx.size]] = True
+        if idx.size > 1 and np.any((steps <= 0) & ~col_first[1:]):
+            sub = sp.csc_matrix(sp.csc_matrix((data, idx, ptr), shape=(n_src, width))[keep])
+            sub.sort_indices()
+            new_data, new_idx, new_ptr, nnz = sub.data, sub.indices, sub.indptr, sub.nnz
+        else:
+            sel = mask[idx]
+            kept_before = np.concatenate(([0], np.cumsum(sel, dtype=np.int64)))
+            new_ptr = kept_before[ptr]
+            new_idx = remap[idx[sel]]
+            new_data = data[sel]
+            nnz = int(kept_before[-1])
+        # every column of the chunk is complete here
+        stats = None if sums is None else _FeatureSums.column_sums(np.asarray(new_data), new_ptr)
+        return (int(col_start), int(col_end), nnz,
+                compress_blob(np.ascontiguousarray(new_data, dtype=out_dtype).tobytes(), "lz4"),
+                compress_blob(np.asarray(new_idx).astype(np.int32).tobytes(), "lz4"),
+                compress_blob(np.asarray(new_ptr).astype(np.int32).tobytes(), "lz4"),
+                stats)
+
     out._conn.execute("DELETE FROM matrix_csc_chunks WHERE matrix_name = ?", (matrix_name,))
+    rows = ds._conn.execute(
+        "SELECT col_start, col_end, data_blob, indices_blob, indptr_blob, dtype, compression "
+        "FROM matrix_csc_chunks WHERE matrix_name = ? ORDER BY chunk_idx", (matrix_name,))
+    n_threads = max(1, int(threads) if threads else min(8, os.cpu_count() or 1))
     total_nnz = 0
     n_chunks = 0
-    for col_start, col_end, chunk in src.iter_columns():
-        sub = sp.csc_matrix(chunk[keep])        # CSC stays CSC; rows in keep order
-        sub.sort_indices()
-        total_nnz += _write_csc_chunk(out._conn, matrix_name, n_chunks, col_start, col_end, sub, dtype)
+
+    def write(result):
+        nonlocal total_nnz, n_chunks
+        col_start, col_end, nnz, d_blob, i_blob, p_blob, stats = result
+        if stats is not None:
+            sums.add_columns(col_start, *stats)
+        out._conn.execute(
+            "INSERT INTO matrix_csc_chunks (matrix_name, chunk_idx, col_start, col_end, n_nonzero, "
+            "data_blob, indices_blob, indptr_blob, dtype, compression) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (matrix_name, n_chunks, col_start, col_end, nnz, d_blob, i_blob, p_blob,
+             str(out_dtype), "lz4"))
+        total_nnz += nnz
         n_chunks += 1
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        pending = deque()
+        for item in rows:
+            pending.append(pool.submit(work, item))
+            if len(pending) >= 2 * n_threads:
+                write(pending.popleft().result())
+        while pending:
+            write(pending.popleft().result())
     _write_csc_meta(ds, out._conn, matrix_name, int(len(keep)), n_cols, total_nnz, dtype,
                     col_entity, n_chunks)
 
@@ -342,6 +697,22 @@ def _write_csc_meta(ds, conn, matrix_name, n_rows, n_cols, total_nnz, dtype, col
     conn.commit()
 
 
+def _split_bytes_to_write(ds, fracs, matrices, include_fragments) -> int:
+    """Estimated bytes a split writes: each group's share of the matrices (as a subset of
+    that share would write) plus one copy of the feature tables it carries per group."""
+    blobs = sum(_bytes_to_write(ds, f, matrices, include_fragments) for f in fracs)
+    carried = _feature_tables_of(ds, matrices)
+    tables = ["genes", "peaks", "tiles", "proteins"] if carried is None else sorted(carried)
+    rows = 0
+    for t in tables:
+        try:
+            rows += int(ds._conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] or 0)
+        except sqlite3.OperationalError:
+            pass
+    # about 70 bytes a row in practice (a 150,638-row peaks table took 10.7 MB); 128 for margin
+    return int(blobs * 1.05) + len(fracs) * (rows * 128 + (16 << 20))
+
+
 def split(
     ds: CytomeDataset,
     labels,
@@ -350,13 +721,19 @@ def split(
     include_fragments: bool = False,
     include_embeddings: bool = False,
     copy_annotations: bool = True,
+    check_free_space: bool = True,
+    check_integrity: bool = False,
 ):
     """Split the cells into one new store per group, reading each matrix once.
 
     ``labels`` holds one group label per cell; ``outputs`` maps each group to
     split off to the path of its store (cells of groups not in ``outputs``
-    go nowhere). Each output is exactly what ``subset(ds, labels == group,
-    output, matrices=matrices, ...)`` writes, cell order included.
+    go nowhere). Each output is what ``subset(ds, labels == group, output,
+    matrices=matrices, ...)`` writes, cell order included, except the
+    per-feature sums over cells (``n_cells_accessible``,
+    ``<feature>_total_counts``), which ``subset`` computes again and ``split``
+    leaves out: for many groups their arrays would cost groups x features
+    of memory, and a group's own store is small enough to read again.
 
     ``subset`` reads a whole column-major matrix for every group; this reads
     it once and hands every column chunk's rows to their groups' stores as
@@ -364,10 +741,19 @@ def split(
     groups. A row-major matrix is split group by group, as ``subset`` does.
 
 
+    Each store is written as ``<path>.partial`` without a journal or syncs (as
+    ``subset`` writes), then switched to WAL, closed, synced and renamed into place,
+    so a crash never leaves a half-written store under its final name, and no
+    write-ahead log holds a second copy of a store while it is written. With
+    ``check_free_space`` (default), the space all the stores need is compared with
+    the free space of their folders before anything is written, and a short disk
+    stops the call with both numbers. A failure removes every partial file.
+    ``check_integrity`` (default False) runs SQLite's integrity check on each
+    new store, as in :func:`subset`.
+
     Returns the open output datasets, keyed by group. The caller closes
     them.
     """
-    from cytome.core.measurement import MeasurementLayer
     ds.flush()
     labels = np.asarray(labels)
     if labels.shape[0] != ds.n_cells:
@@ -388,8 +774,58 @@ def split(
     for keep in keeps:
         rank[keep] = np.arange(len(keep))
 
-    stores = {g: _begin_output(ds, keeps[i], outputs[g], matrices, copy_annotations)
-              for i, g in enumerate(groups)}
+    finals = {g: Path(outputs[g]) for g in groups}
+    partials = {g: Path(str(finals[g]) + ".partial") for g in groups}
+    for g in groups:
+        _remove_store_files(partials[g])
+    if check_free_space:
+        by_dir: dict = {}
+        for i, g in enumerate(groups):
+            by_dir.setdefault(finals[g].parent, []).append(len(keeps[i]) / max(int(ds.n_cells), 1))
+        for directory, fracs in by_dir.items():
+            need = _split_bytes_to_write(ds, fracs, matrices, include_fragments) + (256 << 20)
+            directory.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(directory).free
+            if free < need:
+                raise OSError(errno.ENOSPC,
+                              f"split into {len(fracs)} stores needs about {need / 1e9:.1f} GB "
+                              f"free in {directory}; {free / 1e9:.1f} GB available (pass "
+                              f"check_free_space=False to skip this check)")
+    stores = {}
+    try:
+        for i, g in enumerate(groups):
+            stores[g] = _begin_output(ds, keeps[i], partials[g], matrices, copy_annotations)
+            _bulk_begin(stores[g])
+        _split_matrices(ds, stores, groups, keeps, gid, rank, matrices)
+        for i, g in enumerate(groups):
+            out = stores[g]
+            modalities = set(out.modalities) | {m.split("_", 1)[0] for m in matrices if "_" in m}
+            out._write_manifest_key("modalities", sorted(modalities))
+            out._manifest = out._read_manifest()
+            _finish_output(ds, out, keeps[i], finals[g], include_embeddings, include_fragments,
+                           copy_annotations, check_integrity=check_integrity)
+            _bulk_end(out)
+            out.close()
+    except BaseException:
+        for st in stores.values():
+            with contextlib.suppress(Exception):
+                st.close()
+        for g in groups:
+            _remove_store_files(partials[g])
+        raise
+    for g in groups:
+        _sync_path(partials[g])
+        for sfx in ("-wal", "-shm", "-journal"):      # an older output's sidecars must not
+            Path(str(finals[g]) + sfx).unlink(missing_ok=True)   # be replayed into the new file
+        os.replace(partials[g], finals[g])
+    for directory in {f.parent for f in finals.values()}:
+        _sync_path(directory)
+    return {g: CytomeDataset(finals[g], mode="r+") for g in groups}
+
+
+def _split_matrices(ds, stores, groups, keeps, gid, rank, matrices) -> None:
+    """Every group's rows of every matrix, each matrix read once (column-major ones)."""
+    from cytome.core.measurement import MeasurementLayer
     mat_rows = {r[0]: r[1:] for r in ds._conn.execute(
         "SELECT matrix_name, n_cols, dtype, col_entity FROM matrix_meta").fetchall()}
     missing = sorted(set(matrices) - set(mat_rows))
@@ -429,14 +865,6 @@ def split(
         for i, g in enumerate(groups):
             _write_csc_meta(ds, stores[g]._conn, name, len(keeps[i]), n_cols, int(totals[i]),
                             dtype, col_entity, n_chunks)
-    for i, g in enumerate(groups):
-        out = stores[g]
-        modalities = set(out.modalities) | {m.split("_", 1)[0] for m in matrices if "_" in m}
-        out._write_manifest_key("modalities", sorted(modalities))
-        out._manifest = out._read_manifest()
-        _finish_output(ds, out, keeps[i], outputs[g], include_embeddings, include_fragments,
-                       copy_annotations)
-    return stores
 
 
 def downsample(
@@ -447,8 +875,10 @@ def downsample(
     groupby: str | None = None,
     seed: int = 42,
     output=None,
+    check_integrity: bool = False,
 ):
-    """Downsample cells randomly or stratified."""
+    """Downsample cells randomly or stratified; with ``output``, write them as :func:`subset` does
+    (``check_integrity`` as there)."""
     if n_cells is None and fraction is None:
         raise ValueError("Provide n_cells or fraction")
     if n_cells is not None and fraction is not None:
@@ -477,7 +907,7 @@ def downsample(
 
     if output is None:
         return keep
-    return subset(ds, keep, output)
+    return subset(ds, keep, output, check_integrity=check_integrity)
 
 
 def _read_entity_dataframe(conn, table_name: str) -> pd.DataFrame:
@@ -509,11 +939,12 @@ def _copy_table_rows(src_conn, dst_conn, table: str) -> int:
     return len(rows)
 
 
-def _copy_feature_table(src_conn, dst_conn, table: str, batch: int = 50_000) -> int:
+def _copy_feature_table(src_conn, dst_conn, table: str, batch: int = 50_000,
+                        skip: "Iterable[str]" = ()) -> int:
     """Copy a whole table from one store to another, as stored.
 
     Columns the destination lacks are added with the source's declared
-    type. The rows are copied by SQLite itself, from the source file
+    type; columns named in ``skip`` (any case) are neither added nor copied. The rows are copied by SQLite itself, from the source file
     attached read-only to the destination connection: no Python object per
     row, and memory does not grow with the table. Where the source cannot be
     attached (an in-memory source), rows move in batches through Python. A
@@ -521,7 +952,9 @@ def _copy_feature_table(src_conn, dst_conn, table: str, batch: int = 50_000) -> 
     number of rows copied.
     """
     try:
-        src_cols = src_conn.execute(f"PRAGMA table_info({_q(table)})").fetchall()
+        # the source table's own columns (main): a read-only source's shim view adds NULL columns the attached
+        # file does not have, and the base table's rowid
+        src_cols = src_conn.execute(f"PRAGMA main.table_info({_q(table)})").fetchall()
         if not src_cols or not src_conn.execute(f"SELECT 1 FROM {_q(table)} LIMIT 1").fetchone():
             return 0
         dst_cols = dst_conn.execute(f"PRAGMA table_info({_q(table)})").fetchall()
@@ -529,6 +962,8 @@ def _copy_feature_table(src_conn, dst_conn, table: str, batch: int = 50_000) -> 
         return 0
     if not dst_cols:
         return 0                                  # not a table of this schema
+    skip = {str(c).lower() for c in skip}
+    src_cols = [c for c in src_cols if c[1].lower() not in skip]
     have = {c[1].lower() for c in dst_cols}
     for _cid, name, decl, *_rest in src_cols:
         if name.lower() not in have:
@@ -725,6 +1160,7 @@ def _subset_from_chunks(frags, conn, remap, max_src_idx, chunk_size):
         buf_n = 0
         next_idx = 0
         n_keep_total = 0
+        max_end = None
         prev_last = None
         sorted_ok = True
 
@@ -743,6 +1179,8 @@ def _subset_from_chunks(frags, conn, remap, max_src_idx, chunk_size):
                 continue
             buf_s.append(src_s[keep]); buf_e.append(src_e[keep]); buf_c.append(mapped[keep])
             buf_n += int(keep.sum())
+            m = int(buf_e[-1].max())
+            max_end = m if max_end is None else max(max_end, m)
 
             # flush whole chunks as the buffer fills (order preserved)
             if buf_n >= chunk_size:
@@ -773,7 +1211,7 @@ def _subset_from_chunks(frags, conn, remap, max_src_idx, chunk_size):
             )
             n_keep_total += cs.size
         if n_keep_total > 0:
-            _update_fragment_meta(conn, chrom, n_keep_total)
+            _update_fragment_meta(conn, chrom, n_keep_total, max_end=max_end)
 
 
 def _subset_chromosome_sorted(frags, conn, chrom, remap, max_src_idx, chunk_size):
@@ -788,6 +1226,8 @@ def _subset_chromosome_sorted(frags, conn, chrom, remap, max_src_idx, chunk_size
         "Re-import the cytome to restore the sorted-chunk invariant.",
         RuntimeWarning, stacklevel=2,
     )
+    # the streaming pass may have written chunks before it found the disorder
+    conn.execute("DELETE FROM fragment_chunks WHERE chrom = ?", (chrom,))
     all_s, all_e, all_c = [], [], []
     for src_s, src_e, src_c in frags.iter_chromosome_chunks(chrom):
         valid = src_c < max_src_idx
@@ -802,7 +1242,7 @@ def _subset_chromosome_sorted(frags, conn, chrom, remap, max_src_idx, chunk_size
     starts, ends, cells = starts[order].astype(np.int32), ends[order].astype(np.int32), cells[order].astype(np.int32)
     _write_block_chunks(conn, chrom, starts, ends, cells, chunk_size=chunk_size,
                         compression="lz4", compression_level=1, chunk_idx_start=0, encoding=1)
-    _update_fragment_meta(conn, chrom, len(starts))
+    _update_fragment_meta(conn, chrom, len(starts), max_end=int(ends.max()))
 
 
 def _subset_from_rows(frags, conn, remap, max_src_idx, chunk_size):
@@ -847,4 +1287,4 @@ def _subset_from_rows(frags, conn, remap, max_src_idx, chunk_size):
             chunk_idx_start=0,
             encoding=1,
         )
-        _update_fragment_meta(conn, chrom, n_keep)
+        _update_fragment_meta(conn, chrom, n_keep, max_end=int(ends.max()))

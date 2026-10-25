@@ -7,6 +7,7 @@ from cytome.core import _handles
 import json
 import logging
 import shutil
+import os
 from pathlib import Path
 from typing import Any
 
@@ -191,6 +192,34 @@ class _GraphAccessor:
             except sqlite3.OperationalError:
                 pass
         return sorted(names)
+
+
+def _keep_store_as(src: Path, dst: Path, check_free_space: bool = True) -> None:
+    """Make ``dst`` the store ``src`` is now (``src`` closed): hard links of the file and
+    of a non-empty ``-wal``, so nothing is copied; a copy where links are not possible.
+    ``dst`` and its sidecars are replaced. Used before ``src``'s path is given a new
+    file, so the link is then the only name of the old one."""
+    import errno
+    import shutil
+    for ext in ("", "-wal", "-shm", "-journal"):
+        Path(str(dst) + ext).unlink(missing_ok=True)
+    wal = Path(str(src) + "-wal")
+    pairs = [(src, dst)]
+    if wal.exists() and wal.stat().st_size > 0:
+        pairs.append((wal, Path(str(dst) + "-wal")))
+    try:
+        for a, b in pairs:
+            os.link(a, b)
+        return
+    except OSError:
+        for _, b in pairs:
+            b.unlink(missing_ok=True)
+    need = sum(a.stat().st_size for a, _ in pairs)
+    if check_free_space and shutil.disk_usage(dst.parent).free < need * 1.05:
+        raise OSError(errno.ENOSPC, f"keeping the original as {dst} needs a copy of "
+                      f"{need / 1e9:.1f} GB (no hard link possible); not enough free space")
+    for a, b in pairs:
+        shutil.copy2(a, b)
 
 
 class CytomeDataset:
@@ -916,11 +945,11 @@ class CytomeDataset:
                 f"instead of the closed Dataset object."
             )
 
-    def validate(self):
-        """Run dataset validation checks."""
+    def validate(self, integrity: bool = True):
+        """Run dataset validation checks (``integrity=False`` skips SQLite's full-file check)."""
         from cytome.utils.validation import validate
 
-        return validate(self)
+        return validate(self, integrity=integrity)
 
     def repair(self) -> None:
         """Attempt repair of recoverable integrity issues."""
@@ -1249,6 +1278,9 @@ class CytomeDataset:
         include_fragments: bool = True,
         include_embeddings: bool = True,
         copy_annotations: bool = True,
+        keep_original=None,
+        check_free_space: bool = True,
+        check_integrity: bool = False,
     ) -> int:
         """Filter cells in place: keep cells where ``mask`` is True.
 
@@ -1273,6 +1305,22 @@ class CytomeDataset:
             cell-indexed and always carried over (subset + remapped). Cell×cell
             graphs are intentionally dropped (with a warning) — incomplete once
             cells are removed.
+        keep_original
+            Path to keep the unfiltered store at (e.g. ``<store>_raw.cytome``), or None.
+            The original becomes the backup by a hard link before the filtered store
+            replaces it: no bytes are copied and the store's path is never missing.
+            Where hard links are not possible (another file system), it is copied. When
+            the mask keeps every cell nothing is replaced and no backup is made: the
+            store still holds everything.
+        check_free_space
+            Check, before writing, that the store's file system has room for the
+            filtered store (see :func:`cytome.io.subset.subset`).
+        check_integrity
+            Also run SQLite's integrity check on the filtered store before it
+            replaces the original (default False; see
+            :func:`cytome.io.subset.subset`). cytome's own consistency checks run
+            either way; SQLite's reads every page of the file, hours for a large
+            store that no longer fits in the page cache.
 
         Returns
         -------
@@ -1300,8 +1348,11 @@ class CytomeDataset:
             return int(n_before)
 
         tmp_path = Path(str(self.path) + ".filter_tmp")
-        if tmp_path.exists():
-            tmp_path.unlink()
+        # A crashed earlier run can leave the temp store and its -wal/-shm; all go,
+        # or SQLite would replay the old log into the new temp store.
+        for ext in ("", "-wal", "-shm", "-journal", ".partial", ".partial-wal",
+                    ".partial-shm", ".partial-journal"):
+            Path(str(tmp_path) + ext).unlink(missing_ok=True)
 
         # Flush pending writes so they make it into the subset
         self.flush()
@@ -1312,6 +1363,8 @@ class CytomeDataset:
             include_fragments=include_fragments,
             include_embeddings=include_embeddings,
             copy_annotations=copy_annotations,
+            check_free_space=check_free_space,
+            check_integrity=check_integrity,
         )
         n_after = out.n_cells
         out.close()
@@ -1327,6 +1380,13 @@ class CytomeDataset:
         # never fails on a busy/huge WAL), then replace.
         original = Path(self.path)
         close_database(self._conn)
+        if keep_original is not None:
+            try:
+                _keep_store_as(original, Path(keep_original), check_free_space)
+            except Exception:
+                self._conn = open_database(self.path, mode=self._reopen_mode())
+                self._refresh_after_reopen(None)
+                raise
         for ext in ("-wal", "-shm"):
             Path(str(original) + ext).unlink(missing_ok=True)
         try:
@@ -1390,6 +1450,7 @@ class CytomeDataset:
         start=None,
         end=None,
         gene_names=None,
+        gene_ids=None,
     ):
         """Return overlapping genes from the imported GTF annotation.
 
@@ -1403,7 +1464,11 @@ class CytomeDataset:
             Coordinates are 0-based half-open, matching cytome's
             internal convention.
         gene_names : list[str], optional
-            Filter to a specific list of gene names.
+            Filter to a specific list of gene names. A name can belong to several genes (NCBI
+            suffixes repeated symbols in ``gene_id``: ``TRNAK-UUU_1``); all of them are returned.
+        gene_ids : list[str], optional
+            Filter to a specific list of gene IDs (e.g. Ensembl IDs of unnamed genes). With
+            ``gene_names`` too, genes matching either are returned.
 
         Returns
         -------
@@ -1423,16 +1488,23 @@ class CytomeDataset:
             # Overlap test: gene's [start, end) overlaps [start, end)
             clauses.append("start < ? AND end > ?")
             params.extend([end, start])
-        if gene_names is not None:
-            if len(gene_names) == 0:
+        if gene_names is not None or gene_ids is not None:
+            names = list(gene_names or [])
+            ids = list(gene_ids or [])
+            if not names and not ids:
                 # Empty filter returns empty DataFrame
                 return pd.DataFrame(columns=[
                     "gene_id", "chrom", "start", "end", "strand",
                     "gene_name", "gene_type", "source",
                 ])
-            placeholders = ",".join("?" * len(gene_names))
-            clauses.append(f"gene_name IN ({placeholders})")
-            params.extend(list(gene_names))
+            either = []
+            if names:
+                either.append(f"gene_name IN ({','.join('?' * len(names))})")
+                params.extend(names)
+            if ids:
+                either.append(f"gene_id IN ({','.join('?' * len(ids))})")
+                params.extend(ids)
+            clauses.append("(" + " OR ".join(either) + ")")
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = self._conn.execute(
             f"SELECT gene_id, chrom, start, end, strand, gene_name, "
@@ -1517,10 +1589,11 @@ class CytomeDataset:
         Returns
         -------
         dict or None
-            ``{'source': str, 'n_genes': int, 'n_exons': int}`` if
-            annotation has been imported via
-            :func:`cytome.import_gtf`. ``None`` if the annotation
-            tables are empty.
+            ``None`` if the annotation tables are empty, else ``source``, ``n_genes``,
+            ``n_exons`` (``exon`` rows), ``n_features`` (all non-gene rows), ``features`` (rows per
+            type), ``n_genes_named``, ``n_feature_gene_ids`` (gene IDs among the non-gene rows)
+            and ``reader_version`` (``None`` for an annotation imported before cytome 0.3.7,
+            which took genes from ``gene`` lines only).
         """
         n_genes = int(
             self._conn.execute(
@@ -1529,21 +1602,33 @@ class CytomeDataset:
         )
         if n_genes == 0:
             return None
-        n_exons = int(
-            self._conn.execute(
-                "SELECT COUNT(*) FROM _exon_annotation"
-            ).fetchone()[0]
-        )
+        features = {
+            str(f): int(n) for f, n in self._conn.execute(
+                "SELECT feature, COUNT(*) FROM _exon_annotation GROUP BY feature"
+            ).fetchall()
+        }
+        n_named = int(self._conn.execute(
+            "SELECT COUNT(*) FROM _gene_annotation WHERE gene_name IS NOT NULL AND gene_name != ''"
+        ).fetchone()[0])
+        n_feature_ids = int(self._conn.execute(
+            "SELECT COUNT(DISTINCT gene_id) FROM _exon_annotation"
+        ).fetchone()[0])
         sources = [
             r[0] for r in self._conn.execute(
                 "SELECT DISTINCT source FROM _gene_annotation"
             ).fetchall() if r[0]
         ]
+        meta = self.metadata.get("gene_annotation")
         return {
             "source": sources[0] if len(sources) == 1
                 else sources or None,
             "n_genes": n_genes,
-            "n_exons": n_exons,
+            "n_exons": int(features.get("exon", 0)),
+            "n_features": int(sum(features.values())),
+            "features": features,
+            "n_genes_named": n_named,
+            "n_feature_gene_ids": n_feature_ids,
+            "reader_version": meta.get("reader_version") if isinstance(meta, dict) else None,
         }
 
     def downsample(self, n_cells=None, fraction=None, **kwargs):

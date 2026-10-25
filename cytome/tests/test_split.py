@@ -1,7 +1,9 @@
 """split(): one store per group, each matrix read once, and every store exactly what subset() writes."""
 from __future__ import annotations
 
+import errno
 import sqlite3
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -9,6 +11,7 @@ import pytest
 import scipy.sparse as sp
 
 import cytome
+import cytome.io.subset as subset_mod
 from cytome.io.subset import split, subset
 from cytome.core.measurement import MeasurementLayer
 
@@ -92,3 +95,79 @@ def test_dataset_method(tmp_path):
     stores = ds.split(grp, {"a": str(tmp_path / "m.cytome")}, ["ATAC_counts"])
     assert stores["a"].n_cells == int((grp == "a").sum())
     stores["a"].close(); ds.close()
+
+
+def test_stores_are_renamed_into_place_in_wal_mode(tmp_path):
+    """Each store is built as ``<path>.partial`` and renamed; an older store's sidecars
+    at the final path are removed first, so SQLite cannot replay them into the new one."""
+    ds, X, grp = _store(tmp_path)
+    outs = {g: str(tmp_path / f"split_{g}.cytome") for g in ("a", "b")}
+    Path(outs["a"]).write_bytes(b"an older store")
+    Path(outs["a"] + "-wal").write_bytes(b"\0" * 4096)
+    Path(outs["a"] + "-shm").write_bytes(b"\0" * 4096)
+    stores = split(ds, grp, outs, matrices=["ATAC_counts"])
+    for g, st in stores.items():
+        assert st.n_cells == int((grp == g).sum())
+        assert st._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert (_matrix(st) != X[np.flatnonzero(grp == g)]).nnz == 0
+        st.close()
+    ds.close()
+    assert not list(tmp_path.glob("*.partial*"))
+
+
+def test_free_space_is_checked_before_anything_is_written(tmp_path, monkeypatch):
+    ds, X, grp = _store(tmp_path)
+    outs = {g: str(tmp_path / "out" / f"split_{g}.cytome") for g in ("a", "b", "c")}
+
+    class _Usage:
+        total, used, free = 10**12, 10**12, 1
+    monkeypatch.setattr(subset_mod.shutil, "disk_usage", lambda _: _Usage)
+    with pytest.raises(OSError) as err:
+        split(ds, grp, outs, matrices=["ATAC_counts"])
+    assert err.value.errno == errno.ENOSPC
+    assert "split into 3 stores" in str(err.value) and "GB available" in str(err.value)
+    assert not list((tmp_path / "out").iterdir())
+    stores = split(ds, grp, outs, matrices=["ATAC_counts"], check_free_space=False)
+    assert sorted(stores) == ["a", "b", "c"]
+    for st in stores.values():
+        st.close()
+    ds.close()
+
+
+def test_the_estimate_counts_every_store(tmp_path):
+    """Three stores of a third each write the matrix once, but the feature tables three times."""
+    ds, X, grp = _store(tmp_path)
+    one = subset_mod._split_bytes_to_write(ds, [1.0], ["ATAC_counts"], False)
+    three = subset_mod._split_bytes_to_write(ds, [1 / 3] * 3, ["ATAC_counts"], False)
+    assert subset_mod._bytes_to_write(ds, 1.0, ["ATAC_counts"], False) > 0
+    assert abs((three - one) - 2 * (400 * 128 + (16 << 20))) <= 8     # 400 peaks
+    ds.close()
+
+
+@pytest.mark.parametrize("csc", [True, False])
+def test_a_failure_leaves_no_store_and_keeps_an_older_one(tmp_path, monkeypatch, csc):
+    """A store fails while it is finished: no partial file is left, no store appears under a
+    final name, and a store written there by an earlier run is left as it was."""
+    ds, X, grp = _store(tmp_path, csc=csc)
+    outs = {g: str(tmp_path / f"split_{g}.cytome") for g in ("a", "b", "c")}
+    Path(outs["b"]).write_bytes(b"an earlier run's store")
+    real = subset_mod._finish_output
+    calls = []
+
+    def failing(ds_, out, *args, **kw):
+        calls.append(out.path)
+        if len(calls) == 2:
+            raise RuntimeError("disk full")
+        return real(ds_, out, *args, **kw)
+    monkeypatch.setattr(subset_mod, "_finish_output", failing)
+    with pytest.raises(RuntimeError, match="disk full"):
+        split(ds, grp, outs, matrices=["ATAC_counts"])
+    assert not list(tmp_path.glob("*.partial*"))
+    assert not Path(outs["a"]).exists() and not Path(outs["c"]).exists()
+    assert Path(outs["b"]).read_bytes() == b"an earlier run's store"
+    monkeypatch.setattr(subset_mod, "_finish_output", real)
+    stores = split(ds, grp, outs, matrices=["ATAC_counts"])
+    assert stores["b"].n_cells == int((grp == "b").sum())
+    for st in stores.values():
+        st.close()
+    ds.close()

@@ -52,6 +52,11 @@ dependencies = [
     # path hardcodes it, so this is not optional: without it `pip install
     # cytome` cannot import or merge fragments at all.
     "lz4>=4.0",
+    # Matrices, embeddings and images are compressed with zstd by default, and
+    # the method is recorded beside each blob. Without zstandard the writers
+    # used zlib under the label "zstd" (cytome 0.3.6 and earlier), which a
+    # reader that trusts the label cannot decode, so this is not optional either.
+    "zstandard>=0.20",
 ]
 
 [project.urls]
@@ -69,7 +74,6 @@ full = [
     # dependency -- the point of the base install is that it is small -- but
     # "full" should mean every reader works.
     "h5py>=3.0",
-    "zstandard>=0.20",
     "pysam>=0.22",
     "pyBigWig>=0.3",
 ]
@@ -78,7 +82,6 @@ dev = [
     "anndata>=0.10",
     "h5py>=3.0",
     "mudata>=0.2",
-    "zstandard>=0.20",
     "pysam>=0.22",
     "pyBigWig>=0.3",
     "torch>=2.0",

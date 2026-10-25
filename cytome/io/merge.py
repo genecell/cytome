@@ -527,7 +527,7 @@ def _merge_fragments(datasets, out, cell_offsets) -> None:
                 chunk_size=CHUNK_SIZE, compression="lz4", compression_level=1,
                 chunk_idx_start=0, encoding=1,
             )
-            _update_fragment_meta(out._conn, chrom, len(starts))
+            _update_fragment_meta(out._conn, chrom, len(starts), max_end=int(ends.max()))
 
     from cytome.index.builder import build_fragment_indices
 

@@ -191,13 +191,17 @@ class FragmentStore:
 
         Each chunk contains ~500K fragments as int32 arrays.
         Handles encoding=0 (raw) and encoding=1 (delta/length).
+
+        Chunks are read one at a time through the cursor, so memory holds one
+        chunk, not a whole chromosome's compressed blobs (several GB for chr1 of
+        a store with tens of billions of fragments).
         """
         rows = self._conn.execute(
             "SELECT starts_blob, ends_blob, cell_idx_blob, compression, "
             "COALESCE(encoding, 0) as encoding "
             "FROM fragment_chunks WHERE chrom = ? ORDER BY chunk_idx",
             (chrom,),
-        ).fetchall()
+        )
         for starts_b, ends_b, cells_b, comp, enc in rows:
             starts = decode_starts(starts_b, comp, enc)
             ends = decode_ends(ends_b, comp, starts, enc)

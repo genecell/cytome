@@ -325,3 +325,90 @@ def test_filter_cells_on_read_only_store_fails_before_work(folder):
             ds.filter_cells(np.ones(40, dtype=bool))
     finally:
         ds.close()
+
+
+# ------------------------------------------------- a shim view and ORDER BY rowid (2026-10-21)
+def _store_missing_cell_column(folder, name="v.cytome"):
+    """An older store whose cells table lacks a column of today's schema (n_fragments), so a read-only open
+    shims it with a TEMP view."""
+    path = _old_store(folder, name)
+    con = sqlite3.connect(str(path))
+    con.execute("ALTER TABLE cells DROP COLUMN n_fragments")
+    con.commit()
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.close()
+    return path
+
+
+def test_entity_reads_on_a_shim_view_keep_rowid_order(folder):
+    path = _store_missing_cell_column(folder)
+    ds, _ = _open(path, mode="r")
+    try:
+        assert list(ds.cells["group"][:4]) == ["a", "b", "a", "b"]       # EntityTable: ORDER BY ROWID
+        assert "cells" in ds._conn.shim_views
+        assert list(ds.cells["n_fragments"][:2]) == [None, None]          # the shimmed column reads as NULL
+        raw = [r[0] for r in ds._conn.execute('SELECT "group" FROM cells ORDER BY rowid')]
+        key = [r[0] for r in ds._conn.execute('SELECT "group" FROM cells ORDER BY cell_idx')]
+        assert raw == key and len(raw) == 40                                 # PIASO's raw readers
+        mask = ds.cells.query_mask('"group" = \'a\'')
+        assert mask.sum() == 20 and bool(mask[0]) and not bool(mask[1])
+    finally:
+        ds.close()
+
+
+def test_the_exposed_rowid_is_hidden_from_listings(folder):
+    path = _store_missing_cell_column(folder)
+    ds, _ = _open(path, mode="r")
+    try:
+        assert "rowid" not in ds.cells.columns and "n_fragments" in ds.cells.columns
+        assert "rowid" not in ds.cells.to_pandas().columns
+        assert "rowid" not in ds.cells.query("1 = 1").columns
+    finally:
+        ds.close()
+
+
+def test_order_by_rowid_on_a_shim_view_needs_no_sort(folder):
+    path = _store_missing_cell_column(folder)
+    ds, _ = _open(path, mode="r")
+    try:
+        plan = " ".join(str(r) for r in ds._conn.execute(
+            'EXPLAIN QUERY PLAN SELECT "group" FROM cells ORDER BY rowid'))
+        assert "TEMP B-TREE" not in plan.upper()
+    finally:
+        ds.close()
+
+
+def test_a_current_store_gets_no_view_shim(folder):
+    path = folder / "new.cytome"
+    a = anndata.AnnData(X=np.ones((6, 3), dtype=np.float32),
+                        obs=pd.DataFrame({"g": list("abcabc")}, index=[f"c{i}" for i in range(6)]))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cytome.from_anndata(a, output=str(path), force=True).close()
+    ds, _ = _open(path, mode="r")
+    try:
+        assert ds._conn.shim_views == set()
+        assert "rowid" not in ds.cells.columns
+        assert list(ds.cells["g"]) == list("abcabc")
+    finally:
+        ds.close()
+
+
+def test_subset_of_a_shimmed_read_only_store_copies_only_real_columns(folder):
+    path = _store_missing_cell_column(folder)
+    ds, _ = _open(path, mode="r")
+    out = folder / "sub.cytome"
+    try:
+        from cytome.io.subset import subset
+        mask = np.zeros(40, dtype=bool)
+        mask[:10] = True
+        sub = subset(ds, mask, str(out))
+        sub.close()
+    finally:
+        ds.close()
+    con = sqlite3.connect(str(out))
+    cols = [r[1] for r in con.execute("PRAGMA table_info(cells)")]
+    groups = [r[0] for r in con.execute('SELECT "group" FROM cells ORDER BY rowid')]
+    con.close()
+    assert "rowid" not in cols
+    assert groups == list("ab") * 5

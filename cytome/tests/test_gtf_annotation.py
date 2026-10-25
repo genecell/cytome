@@ -498,3 +498,225 @@ def test_import_gtf_combined_biotype_and_tag_filter(tmp_path):
     tx_df = ds.query_exon_annotation(features=['transcript'])
     assert len(tx_df) == 1 and tx_df.iloc[0]['transcript_id'] == 'T1'
     ds.close()
+
+
+# ---------------------------------------------------------------------------
+# 0.3.7 — one reader for every GTF convention
+# ---------------------------------------------------------------------------
+
+def _gtf(path, rows):
+    with open(path, "wt") as f:
+        for r in rows:
+            f.write("\t".join(r[:8]) + "\t" + r[8] + "\n")
+
+
+# NCBI RefSeq style, as in the Cell Ranger ARC Mmul_10 reference: names in `gene`, gene_id = the
+# symbol (suffixed where it repeats), `gene` lines for some genes only, transcript_id "" on them.
+_NCBI_ROWS = [
+    ("chr1", "Gnomon", "gene", "1001", "5000", ".", "-", ".",
+     'gene_id "PGBD2"; transcript_id ""; gbkey "Gene"; gene "PGBD2"; gene_biotype "protein_coding";'),
+    ("chr1", "Gnomon", "transcript", "1001", "5000", ".", "-", ".",
+     'gene_id "PGBD2"; transcript_id "XM_1"; gene "PGBD2"; transcript_biotype "mRNA";'),
+    ("chr1", "Gnomon", "exon", "4001", "5000", ".", "-", ".",
+     'gene_id "PGBD2"; transcript_id "XM_1"; gene "PGBD2";'),
+    # no gene line: spans its two transcripts
+    ("chr8", "Gnomon", "transcript", "27727647", "27747523", ".", "-", ".",
+     'gene_id "CHRNA2"; transcript_id "XM_2"; gene "CHRNA2"; product "a; b"; transcript_biotype "mRNA";'),
+    ("chr8", "Gnomon", "exon", "27747013", "27747523", ".", "-", ".",
+     'gene_id "CHRNA2"; transcript_id "XM_2"; gene "CHRNA2";'),
+    ("chr8", "Gnomon", "CDS", "27747013", "27747400", ".", "-", ".",
+     'gene_id "CHRNA2"; transcript_id "XM_2"; gene "CHRNA2";'),
+    ("chr8", "BestRefSeq", "transcript", "27729000", "27747600", ".", "-", ".",
+     'gene_id "CHRNA2"; transcript_id "NM_3"; gene "CHRNA2";'),
+    ("chr8", "BestRefSeq", "exon", "27747100", "27747600", ".", "-", ".",
+     'gene_id "CHRNA2"; transcript_id "NM_3"; gene "CHRNA2";'),
+    # one symbol, two genes
+    ("chr2", "tRNAscan-SE", "transcript", "100", "172", ".", "+", ".",
+     'gene_id "TRNAK-UUU"; transcript_id "tx-1"; gene "TRNAK-UUU";'),
+    ("chr2", "tRNAscan-SE", "exon", "100", "172", ".", "+", ".",
+     'gene_id "TRNAK-UUU"; transcript_id "tx-1"; gene "TRNAK-UUU";'),
+    ("chr5", "tRNAscan-SE", "transcript", "900", "972", ".", "-", ".",
+     'gene_id "TRNAK-UUU_1"; transcript_id "tx-2"; gene "TRNAK-UUU";'),
+    ("chr5", "tRNAscan-SE", "exon", "900", "972", ".", "-", ".",
+     'gene_id "TRNAK-UUU_1"; transcript_id "tx-2"; gene "TRNAK-UUU";'),
+    # plain GTF 2.2: exons only, no transcript or gene line
+    ("chr3", "x", "exon", "501", "600", ".", "+", ".", 'gene_id "EXONLY"; transcript_id "t9"; gene "EXONLY";'),
+    ("chr3", "x", "exon", "801", "900", ".", "+", ".", 'gene_id "EXONLY"; transcript_id "t9"; gene "EXONLY";'),
+]
+
+
+def test_ncbi_style_gtf_every_gene_gets_a_named_row(tmp_path):
+    g = str(tmp_path / "genes.gtf")
+    _gtf(g, _NCBI_ROWS)
+    ds = cytome.create(str(tmp_path / "n.cytome"))
+    out = cytome.import_gtf(ds, g, verbose=False)
+    assert out["n_genes"] == 5 and out["n_gene_lines"] == 1 and out["n_genes_inferred"] == 4
+    assert out["n_genes_named"] == 5
+    assert out["features"] == {"transcript": 5, "exon": 7, "CDS": 1} and out["n_exons"] == 7
+    c = ds.query_gene_annotation(gene_names=["CHRNA2"])
+    assert c[["chrom", "start", "end", "strand"]].values.tolist() == [["chr8", 27727646, 27747600, "-"]]
+    p = ds.query_gene_annotation(gene_names=["PGBD2"])          # gene line present, named by `gene`
+    assert p[["start", "end", "gene_type"]].values.tolist() == [[1000, 5000, "protein_coding"]]
+    info = ds.gene_annotation_info()
+    assert info["n_genes"] == 5 and info["n_genes_named"] == 5 and info["reader_version"] == 2
+    assert info["n_feature_gene_ids"] == 5 and info["n_exons"] == 7 and info["n_features"] == 13
+    ds.close()
+
+
+def test_exon_only_gene_spans_its_exons_and_repeated_symbols_return_every_gene(tmp_path):
+    g = str(tmp_path / "genes.gtf")
+    _gtf(g, _NCBI_ROWS)
+    ds = cytome.create(str(tmp_path / "n.cytome"))
+    cytome.import_gtf(ds, g, verbose=False)
+    e = ds.query_gene_annotation(gene_names=["EXONLY"])
+    assert e[["start", "end"]].values.tolist() == [[500, 900]]
+    t = ds.query_gene_annotation(gene_names=["TRNAK-UUU"])
+    assert sorted(t.gene_id) == ["TRNAK-UUU", "TRNAK-UUU_1"] and sorted(t.chrom) == ["chr2", "chr5"]
+    one = ds.query_gene_annotation(gene_ids=["TRNAK-UUU_1"])
+    assert one.chrom.tolist() == ["chr5"]
+    both = ds.query_gene_annotation(gene_names=["PGBD2"], gene_ids=["EXONLY"])
+    assert sorted(both.gene_id) == ["EXONLY", "PGBD2"]
+    ds.close()
+
+
+def test_gene_line_after_its_rows_still_wins(tmp_path):
+    g = str(tmp_path / "late.gtf")
+    _gtf(g, [
+        ("chr1", "x", "exon", "201", "300", ".", "+", ".", 'gene_id "G"; transcript_id "T"; gene "Gchild";'),
+        ("chr1", "x", "gene", "101", "900", ".", "+", ".", 'gene_id "G"; gene_name "Gline"; gene_type "lncRNA";'),
+    ])
+    ds = cytome.create(str(tmp_path / "l.cytome"))
+    out = cytome.import_gtf(ds, g, verbose=False)
+    assert out["n_genes_inferred"] == 0
+    r = ds.query_gene_annotation(gene_ids=["G"]).iloc[0]
+    assert (r.start, r.end, r.gene_name, r.gene_type) == (100, 900, "Gline", "lncRNA")
+    ds.close()
+
+
+def test_gene_split_across_chromosomes_is_kept_on_the_locus_with_most_rows(tmp_path):
+    g = str(tmp_path / "split.gtf")
+    _gtf(g, [
+        ("chr1", "x", "exon", "101", "200", ".", "+", ".", 'gene_id "S"; transcript_id "T1";'),
+        ("chr1", "x", "exon", "301", "400", ".", "+", ".", 'gene_id "S"; transcript_id "T1";'),
+        ("chr2", "x", "exon", "101", "900", ".", "+", ".", 'gene_id "S"; transcript_id "T2";'),
+    ])
+    ds = cytome.create(str(tmp_path / "s.cytome"))
+    out = cytome.import_gtf(ds, g, verbose=False)
+    assert out["genes_split_across_loci"] == 1
+    r = ds.query_gene_annotation(gene_ids=["S"]).iloc[0]
+    assert (r.chrom, r.start, r.end) == ("chr1", 100, 400) and r.gene_name is None   # never an ID as a name
+    ds.close()
+
+
+def test_biotype_filter_does_not_need_gene_lines(tmp_path):
+    g = str(tmp_path / "bt.gtf")
+    _gtf(g, _NCBI_ROWS + [
+        # Ensembl style without a gene line: the biotype is on the rows
+        ("chr4", "ensembl", "transcript", "11", "90", ".", "+", ".",
+         'gene_id "ENSG1"; transcript_id "ENST1"; gene_name "EN"; gene_biotype "protein_coding";'),
+        ("chr4", "ensembl", "exon", "11", "40", ".", "+", ".",
+         'gene_id "ENSG1"; transcript_id "ENST1"; gene_name "EN"; gene_biotype "protein_coding";'),
+    ])
+    ds = cytome.create(str(tmp_path / "b.cytome"))
+    out = cytome.import_gtf(ds, g, gene_biotypes=["protein_coding"], verbose=False)
+    assert sorted(ds.query_gene_annotation().gene_id) == ["ENSG1", "PGBD2"]
+    assert set(ds.query_exon_annotation().gene_id) == {"ENSG1", "PGBD2"}
+    # CHRNA2, both TRNAK-UUU and EXONLY carry no biotype on any row: dropped, and counted
+    assert out["genes_dropped_biotype"] == 4 and out["genes_dropped_no_biotype"] == 4
+    ds.close()
+
+
+def test_tag_filter_does_not_depend_on_line_order(tmp_path):
+    g = str(tmp_path / "tags.gtf")
+    _gtf(g, [
+        ("chr1", "x", "exon", "101", "200", ".", "+", ".", 'gene_id "G"; transcript_id "T1"; gene_name "G";'),
+        ("chr1", "x", "transcript", "101", "500", ".", "+", ".",
+         'gene_id "G"; transcript_id "T1"; gene_name "G"; tag "basic";'),
+        ("chr1", "x", "exon", "301", "500", ".", "+", ".", 'gene_id "G"; transcript_id "T2"; gene_name "G";'),
+    ])
+    ds = cytome.create(str(tmp_path / "t.cytome"))
+    cytome.import_gtf(ds, g, transcript_tags=["basic"], verbose=False)
+    ex = ds.query_exon_annotation(features=["exon"])
+    assert ex.transcript_id.tolist() == ["T1"]                 # T1's exon precedes its transcript line
+    assert len(ds.query_gene_annotation()) == 1
+    ds.close()
+
+
+def test_harmonize_chrom_maps_only_to_names_the_store_has():
+    from cytome.io.gtf_import import harmonize_chrom
+    assert harmonize_chrom("8", {"chr8"}) == "chr8"
+    assert harmonize_chrom("chr8", {"8"}) == "8"
+    assert harmonize_chrom("MT", {"chrM"}) == "chrM"
+    assert harmonize_chrom("chrM", {"MT"}) == "MT"
+    assert harmonize_chrom("8", {"8", "chr8"}) == "8"
+    assert harmonize_chrom("KZ1234.1", {"chr1"}) == "KZ1234.1"   # no other spelling: unchanged
+
+
+def _store_with_peaks(path, chroms):
+    ds = cytome.create(path)
+    for i, c in enumerate(chroms):
+        ds._conn.execute("INSERT INTO peaks (peak_idx, peak_id, chr, start, end_) VALUES (?, ?, ?, 1, 100)",
+                         (i, f"{c}:1-100", c))
+    ds._conn.commit()
+    return ds
+
+
+def test_chrom_names_auto_follows_the_store_spelling(tmp_path):
+    g = str(tmp_path / "ens.gtf")
+    _gtf(g, [
+        ("8", "ensembl", "gene", "1001", "2000", ".", "-", ".", 'gene_id "ENSG8"; gene_name "CHRNA2";'),
+        ("8", "ensembl", "exon", "1001", "1200", ".", "-", ".", 'gene_id "ENSG8"; transcript_id "ENST8";'),
+        ("MT", "ensembl", "gene", "1", "500", ".", "+", ".", 'gene_id "ENSGM"; gene_name "MT-ND1";'),
+        ("KZ1.1", "ensembl", "gene", "1", "50", ".", "+", ".", 'gene_id "ENSGK"; gene_name "SCAF";'),
+    ])
+    ds = _store_with_peaks(str(tmp_path / "a.cytome"), ["chr8", "chrM", "chr1"])
+    out = cytome.import_gtf(ds, g, verbose=False)
+    assert out["chrom_renamed"] == {"8": "chr8", "MT": "chrM"}
+    got = dict(zip(ds.query_gene_annotation().gene_id, ds.query_gene_annotation().chrom))
+    assert got == {"ENSG8": "chr8", "ENSGM": "chrM", "ENSGK": "KZ1.1"}
+    assert ds.query_exon_annotation().chrom.tolist() == ["chr8"]
+    cytome.import_gtf(ds, g, chrom_names="keep", force=True, verbose=False)
+    assert sorted(set(ds.query_gene_annotation().chrom)) == ["8", "KZ1.1", "MT"]
+    ds.close()
+    bare = cytome.create(str(tmp_path / "b.cytome"))           # no fragments, peaks or tiles
+    assert cytome.import_gtf(bare, g, verbose=False)["chrom_renamed"] == {}
+    assert sorted(set(bare.query_gene_annotation().chrom)) == ["8", "KZ1.1", "MT"]
+    bare.close()
+
+
+def test_read_gtf_gives_what_import_gtf_writes(tmp_path):
+    g = str(tmp_path / "genes.gtf")
+    _gtf(g, _NCBI_ROWS)
+    genes, feats = cytome.read_gtf(g)
+    ds = cytome.create(str(tmp_path / "r.cytome"))
+    cytome.import_gtf(ds, g, verbose=False)
+    a = ds.query_gene_annotation().sort_values("gene_id").reset_index(drop=True)
+    b = genes.sort_values("gene_id").reset_index(drop=True)[a.columns]
+    pd.testing.assert_frame_equal(a, b, check_dtype=False)
+    x = ds.query_exon_annotation()
+    assert len(x) == len(feats) and sorted(x.gene_id) == sorted(feats.gene_id)
+    ds.close()
+
+
+def test_gene_annotation_info_marks_an_import_by_an_older_reader(tmp_path):
+    ds = cytome.create(str(tmp_path / "o.cytome"))
+    # what cytome <= 0.3.6 wrote for a GTF with gene lines for one gene only, unnamed
+    ds._conn.execute("INSERT INTO _gene_annotation VALUES ('A', 'chr1', 0, 10, '+', NULL, NULL, 'genes')")
+    ds._conn.executemany("INSERT INTO _exon_annotation (gene_id, chrom, start, end, feature) VALUES (?, 'chr1', 0, 5, 'exon')",
+                         [("A",), ("B",), ("C",)])
+    ds._conn.commit()
+    info = ds.gene_annotation_info()
+    assert info["reader_version"] is None and info["n_genes"] == 1 and info["n_genes_named"] == 0
+    assert info["n_feature_gene_ids"] == 3
+    ds.close()
+
+
+def test_import_gtf_refuses_a_read_only_store_before_reading(tmp_path):
+    p = str(tmp_path / "ro.cytome")
+    g = str(tmp_path / "genes.gtf")
+    _gtf(g, _NCBI_ROWS)
+    cytome.create(p).close()
+    ds = cytome.open(p, mode="r")
+    with pytest.raises(cytome.ReadOnlyError):
+        cytome.import_gtf(ds, g, verbose=False)
+    ds.close()

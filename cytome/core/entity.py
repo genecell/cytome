@@ -47,7 +47,8 @@ class EntityTable:
     def columns(self) -> list[str]:
         """Return list of table column names, including columns written and
         not yet flushed."""
-        rows = self._conn.execute(f"PRAGMA table_info({self._table_name})").fetchall()
+        from cytome.io.sqlite_engine import visible_columns
+        rows = visible_columns(self._conn, self._table_name)
         cols = [r[1] for r in rows]
         lowered = {c.lower() for c in cols}
         cols += [c for c in self._pending_columns() if c.lower() not in lowered]
@@ -171,7 +172,13 @@ class EntityTable:
         """Run SQL WHERE query and return matching rows as DataFrame."""
         self._settle()
         sql = f"SELECT * FROM {self._table_name} WHERE {expression}"
-        return pd.read_sql_query(sql, self._conn)
+        return self._hide_shim_rowid(pd.read_sql_query(sql, self._conn))
+
+    def _hide_shim_rowid(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Drop the rowid a read shim's view exposes (not a column of the table)."""
+        if self._table_name in getattr(self._conn, "shim_views", ()) and "rowid" in df.columns:
+            return df.drop(columns="rowid")
+        return df
 
     def query_mask(self, expression: str) -> np.ndarray:
         """Return boolean mask for rows satisfying SQL expression."""
@@ -189,7 +196,7 @@ class EntityTable:
     def to_pandas(self) -> pd.DataFrame:
         """Materialize table as pandas DataFrame."""
         self._settle()
-        return pd.read_sql_query(f"SELECT * FROM {self._table_name}", self._conn)
+        return self._hide_shim_rowid(pd.read_sql_query(f"SELECT * FROM {self._table_name}", self._conn))
 
     def _apply_column_write(self, column_name: str, values: np.ndarray) -> None:
         self._apply_column_writes([(column_name, values)])
@@ -274,7 +281,9 @@ def _numpy_to_sqlite_type(dtype: np.dtype) -> str:
 
 
 def _infer_primary_key(conn: sqlite3.Connection, table_name: str) -> str:
-    info = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    # the base table's: a read shim's view (temp) reports no primary key
+    info = conn.execute(f"PRAGMA main.table_info({table_name})").fetchall() or \
+        conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     for col in info:
         if col[5] == 1:
             return col[1]
