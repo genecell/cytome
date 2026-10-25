@@ -491,7 +491,7 @@ def from_anndata(
             _write_uns_spatial(ds, value)
             continue
         try:
-            ds.metadata[key] = value
+            ds.metadata[_metadata_name(key)] = _metadata_value(value)
         except TypeError:
             continue
 
@@ -860,7 +860,7 @@ def from_h5ad(
                     gc.collect()
                     continue
                 try:
-                    ds.metadata[key] = value
+                    ds.metadata[_metadata_name(key)] = _metadata_value(value)
                 except (TypeError, ValueError, OverflowError) as exc:
                     if verbose:
                         print(f"  [skip] uns/{key} ({exc})")
@@ -1047,6 +1047,54 @@ def _emit_backed_inventory(
             print(f"    - uns ({n_uns} entries; unpickleable skipped at write)")
         except Exception:
             pass
+
+
+def _h5ad_name(name):
+    """``name`` as a key in an h5ad file: "/" written as "%2F"."""
+    return name.replace("/", "%2F") if isinstance(name, str) and "/" in name else name
+
+
+def _metadata_name(name):
+    """A key read from an h5ad file as the metadata key it stands for: "%2F" back to "/"."""
+    return name.replace("%2F", "/") if isinstance(name, str) and "%2F" in name else name
+
+
+def _uns_value(value):
+    """A metadata value as it goes into ``uns``: no "/" in a mapping's keys or a table's columns.
+
+    An h5ad (or zarr) file stores each key of a mapping and each column of a table as a name
+    in the file, where "/" separates groups. anndata 0.13 refuses such a name by default
+    (``anndata.settings.disallow_forward_slash_in_h5ad``), and earlier versions split it into
+    nested groups, so a key "L2/3 IT" (a cell type, in the marker tables PIASO records)
+    came back as "L2". Such names are written with "/" as "%2F", and :func:`from_anndata`
+    turns "%2F" back into "/". A value with no such name is returned as it is.
+    """
+    if isinstance(value, dict):
+        return _renamed(value, _h5ad_name, _uns_value)
+    if isinstance(value, pd.DataFrame) and any(isinstance(c, str) and "/" in c for c in value.columns):
+        return value.rename(columns=_h5ad_name)
+    return value
+
+
+def _metadata_value(value):
+    """The reverse of :func:`_uns_value`, for a value read from ``uns``."""
+    if isinstance(value, dict):
+        return _renamed(value, _metadata_name, _metadata_value)
+    if isinstance(value, pd.DataFrame) and any(isinstance(c, str) and "%2F" in c for c in value.columns):
+        return value.rename(columns=_metadata_name)
+    return value
+
+
+def _renamed(mapping, rename, recurse):
+    """``mapping`` with its keys renamed and its values converted, refusing two keys made one."""
+    out = {}
+    for k, v in mapping.items():
+        nk = rename(k)
+        if nk in out:
+            raise ValueError(f"the keys {k!r} and {next(o for o in mapping if rename(o) == nk)!r} "
+                             f"would both be stored as {nk!r} in an h5ad file; rename one of them.")
+        out[nk] = recurse(v)
+    return out
 
 
 def _writable_frame(df):
@@ -1286,7 +1334,7 @@ def to_anndata(
     for key, value in ds.metadata.items():
         if key.startswith("_anndata_"):
             continue
-        adata.uns[key] = value
+        adata.uns[_h5ad_name(key)] = _uns_value(value)   # no "/" in h5ad names (_uns_value)
 
     # Materialised, not lazy: `to_anndata` hands back a *detached* object that
     # people write to disk, and anndata's h5ad writer type-checks the values in
