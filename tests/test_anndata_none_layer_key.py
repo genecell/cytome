@@ -61,10 +61,21 @@ needs_none_key = pytest.mark.skipif(
 def test_no_phantom_matrix_is_written(tmp_path):
     p = tmp_path / "d.cytome"
     cytome.from_anndata(_adata(), output=str(p),
-                        counts_layer="count", main_layer_name="lognorm").close()
+                        counts_layer="count", main_layer_name="x").close()
     names = _matrix_names(p)
     assert not [n for n in names if n.endswith("_None")], (
         f"a None layer key produced a matrix: {names}")
+
+
+@needs_none_key
+def test_add_modality_writes_no_phantom_matrix(tmp_path):
+    """ds.add_modality(name, adata) looped over .layers too, and wrote X again as GA_None."""
+    p = tmp_path / "m.cytome"
+    ds = cytome.from_anndata(_adata(), output=str(p), counts_layer="count", main_layer_name="x")
+    ds.add_modality("GA", _adata())
+    ds.flush()
+    ds.close()
+    assert [n for n in _matrix_names(p) if n.startswith("GA_")] == ["GA_count", "GA_counts", "GA_lognorm"]
 
 
 @needs_none_key
@@ -79,8 +90,14 @@ def test_a_bad_counts_layer_still_explains_itself(tmp_path):
 
 
 def test_the_real_anndata_is_handled_whatever_version_this_is(tmp_path):
-    """No simulation: whatever `.layers` yields here must convert cleanly."""
+    """No simulation: whatever `.layers` yields here must convert cleanly.
+
+    X is named "x" here. The test used main_layer_name="lognorm" beside a
+    different layer called "lognorm", and expected two matrices: one of the
+    two sources silently replaced the other (audit 2026-10-27, part 4
+    critical 7); that call is now refused (tests/test_anndata_conversion_names.py).
+    """
     p = tmp_path / "real.cytome"
     cytome.from_anndata(_adata(), output=str(p), counts_layer="count",
-                        main_layer_name="lognorm").close()
-    assert _matrix_names(p) == ["RNA_counts", "RNA_lognorm"]
+                        main_layer_name="x").close()
+    assert _matrix_names(p) == ["RNA_counts", "RNA_lognorm", "RNA_x"]

@@ -17,6 +17,8 @@ class _EntityWrite:
     table_name: str
     column_name: str
     values: np.ndarray
+    #: the SQL type of a column the write creates; None infers it from ``values``
+    sql_type: Optional[str] = None
 
 
 class EntityTable:
@@ -112,7 +114,15 @@ class EntityTable:
     def __contains__(self, column_name: str) -> bool:
         """Return True if the column exists in the table (case-insensitive,
         matching SQLite's own identifier semantics)."""
+        if not isinstance(column_name, str):
+            return False
         return self.resolve_column(column_name) is not None
+
+    def __iter__(self):
+        """The column names, as a DataFrame iterates its columns. Without it
+        ``list(table)`` fell back to ``table[0]``, ``table[1]``, ..., which
+        raised on the first index."""
+        return iter(self.columns)
 
     def has_column(self, column_name: str) -> bool:
         """Return True if the column exists in the table.
@@ -143,13 +153,10 @@ class EntityTable:
         values
             Values with length equal to row count.
         """
-        if isinstance(values, np.ndarray) and values.ndim == 1 and values.dtype != object:
-            # What np.asarray(list(values)) gives for such an array, without
-            # making one Python object per row. A copy, as before, so a later
-            # change to the caller's array does not reach the pending write.
-            values_arr = values.copy()
-        else:
-            values_arr = np.asarray(list(values))
+        from cytome.core.column_meta import column_values
+        # missing values become NULL (they were the text 'nan', or failed the
+        # flush for pd.NA); a categorical keeps its categories' type
+        values_arr, sql_type = column_values(values)
         if values_arr.shape[0] != self.n:
             raise ValueError(
                 f"Length mismatch for {self._table_name}.{column_name}: "
@@ -160,13 +167,18 @@ class EntityTable:
         actual = self.resolve_column(column_name, warn=True)
         if actual is not None:
             column_name = actual
+        key_col = _infer_primary_key(self._conn, self._table_name)
+        if column_name.lower() == str(key_col).lower():
+            raise ValueError(
+                f"{column_name!r} is the key of {self._table_name}: the rows of every matrix, "
+                f"embedding and fragment refer to it, so it is not written as a column")
         if self._enqueue_write is not None:
             self._enqueue_write(
                 f"entity:{self._table_name}:{column_name}",
-                _EntityWrite(self._table_name, column_name, values_arr),
+                _EntityWrite(self._table_name, column_name, values_arr, sql_type),
             )
             return
-        self._apply_column_write(column_name, values_arr)
+        self._apply_column_writes([(column_name, values_arr, sql_type)])
 
     def query(self, expression: str) -> pd.DataFrame:
         """Run SQL WHERE query and return matching rows as DataFrame."""
@@ -193,10 +205,42 @@ class EntityTable:
         id_set = {h[0] for h in hit_ids}
         return np.asarray([i[0] in id_set for i in all_ids], dtype=bool)
 
-    def to_pandas(self) -> pd.DataFrame:
-        """Materialize table as pandas DataFrame."""
+    def to_pandas(self, restore_dtypes: bool = False) -> pd.DataFrame:
+        """Materialize table as pandas DataFrame.
+
+        ``restore_dtypes=True`` gives each column the pandas dtype recorded
+        for it when it was written from a DataFrame (``from_anndata``,
+        ``update_from_anndata``): categoricals with their categories in their
+        order (and ``ordered``), nullable integers and booleans -- what
+        ``to_anndata`` puts in ``obs`` and ``var``. By default the values come
+        as SQLite stores them.
+        """
         self._settle()
-        return self._hide_shim_rowid(pd.read_sql_query(f"SELECT * FROM {self._table_name}", self._conn))
+        df = self._hide_shim_rowid(pd.read_sql_query(f"SELECT * FROM {self._table_name}", self._conn))
+        if restore_dtypes:
+            from cytome.core.column_meta import restore_column_dtypes
+            df = restore_column_dtypes(self._conn, self._table_name, df)
+        return df
+
+    def categories(self, column_name: str):
+        """The categories of a categorical column, in their stored order.
+
+        The order is the one the column had as a pandas categorical when it
+        was written (``from_anndata`` of an ``obs`` column, say), kept in
+        ``_column_meta``; ``None`` when the column was not written as a
+        categorical. Not the display order and colors of
+        :meth:`CytomeDataset.set_categories` (``ds.get_categories``), which a
+        user sets for plotting.
+        """
+        actual = self.resolve_column(column_name)
+        if actual is None:
+            raise KeyError(f"Column {column_name!r} not in {self._table_name}")
+        from cytome.core.column_meta import read_records
+        import json
+        for col, dtype, cats in read_records(self._conn, self._table_name):
+            if col == actual and dtype in ("categorical", "ordered_categorical"):
+                return json.loads(cats) if cats else []
+        return None
 
     def _apply_column_write(self, column_name: str, values: np.ndarray) -> None:
         self._apply_column_writes([(column_name, values)])
@@ -210,11 +254,12 @@ class EntityTable:
         checkpoint. One UPDATE setting all the columns pays that once.
         A name given twice keeps its last values, as in sequence.
         """
+        writes = [tuple(w) + (None,) * (3 - len(w)) for w in writes]
         names = []
-        for column_name, values in writes:
+        for column_name, values, sql_type in writes:
             actual = self.resolve_column(column_name)
             if actual is None:
-                sqlite_type = _numpy_to_sqlite_type(values.dtype)
+                sqlite_type = sql_type or _numpy_to_sqlite_type(np.asarray(values).dtype)
                 # No blanket except here. The old `except Exception: pass` was
                 # load-bearing for a bug: it swallowed SQLite's *duplicate column*
                 # error when a case-variant of the column already existed, and the

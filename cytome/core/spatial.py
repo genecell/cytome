@@ -222,7 +222,17 @@ class _SpatialImageAccessor:
         return [r[0] for r in rows]
 
     def __contains__(self, lk: Tuple[str, str]) -> bool:
-        return tuple(lk) in self.keys()
+        if isinstance(lk, str):
+            return False
+        try:
+            return tuple(lk) in self.keys()
+        except TypeError:
+            return False
+
+    def __iter__(self):
+        """The ``(library_id, img_key)`` pairs; ``list()`` fell back to
+        ``self[0]`` and failed without it."""
+        return iter(self.keys())
 
     def __len__(self) -> int:
         return len(self.keys())
@@ -375,30 +385,38 @@ class LazyImage:
         self._array = None
         self._path = path
 
-    def _accessor(self):
-        """The accessor, reconnecting if the dataset it came from was closed.
+    def _with_accessor(self, fn):
+        """``fn(accessor)``, reconnecting if the dataset it came from was closed.
 
         A proxy commonly outlives its Dataset: ``adata = ds.to_anndata()``
         then ``ds.close()``, and any reader that returns an AnnData does the
         same. Without this the image would raise "Cannot operate on a closed
         database" at plot time, a long way from the close that caused it, so
-        the proxy reopens the file read-only instead.
+        the proxy reads the file through a read-only connection of its own --
+        opened for the read and closed after it: kept, it held a handle on the
+        store that ``cytome.released`` could not close.
         """
         try:
             self._images._conn.execute("SELECT 1").fetchone()
-            return self._images
-        except (sqlite3.ProgrammingError, sqlite3.Error):
-            if not self._path:
-                raise
-            from cytome.io.sqlite_engine import open_read_only
-            conn = open_read_only(self._path, reason="an image is read after its dataset closed")
-            self._images = type(self._images)(conn)
-            return self._images
+            alive = True
+        except sqlite3.Error:
+            alive = False
+        if alive:
+            return fn(self._images)
+        if not self._path:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+        from cytome.io.sqlite_engine import open_read_only
+        conn = open_read_only(self._path, reason="an image is read after its dataset closed")
+        try:
+            return fn(type(self._images)(conn))
+        finally:
+            conn.close()
+            _handles.forget(conn)
 
     # -- metadata, without decoding ------------------------------------
     @property
     def _info(self) -> Dict:
-        return self._accessor().info(self._library_id, self._img_key)
+        return self._with_accessor(lambda acc: acc.info(self._library_id, self._img_key))
 
     @property
     def shape(self) -> Tuple[int, ...]:
@@ -430,8 +448,7 @@ class LazyImage:
     def compute(self) -> np.ndarray:
         """The decoded array (cached)."""
         if self._array is None:
-            acc = self._accessor()
-            self._array = acc[self._library_id, self._img_key]
+            self._array = self._with_accessor(lambda acc: acc[self._library_id, self._img_key])
         return self._array
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
@@ -564,10 +581,13 @@ def cells_in_region(conn: sqlite3.Connection, x, y) -> np.ndarray:
     x0, x1 = sorted(float(v) for v in x)
     y0, y1 = sorted(float(v) for v in y)
     try:
+        # the R*-tree's 32-bit bounds, rounded outward, filter; the stored
+        # coordinates decide (a cell on the rectangle's edge was missed)
         rows = conn.execute(
-            "SELECT id FROM spatial_rtree "
-            "WHERE min_x >= ? AND max_x <= ? AND min_y >= ? AND max_y <= ?",
-            (x0, x1, y0, y1)).fetchall()
+            "SELECT r.id FROM spatial_rtree AS r JOIN spatial_coords AS c ON c.cell_idx = r.id "
+            "WHERE r.max_x >= ? AND r.min_x <= ? AND r.max_y >= ? AND r.min_y <= ? "
+            "AND c.x >= ? AND c.x <= ? AND c.y >= ? AND c.y <= ?",
+            (x0, x1, y0, y1, x0, x1, y0, y1)).fetchall()
     except sqlite3.OperationalError:
         return np.empty(0, dtype=np.int64)
     return np.array(sorted(r[0] for r in rows), dtype=np.int64)

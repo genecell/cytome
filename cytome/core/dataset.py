@@ -46,28 +46,11 @@ _KNOWN_MODALITY_NAMES = frozenset({"RNA", "GA", "ATAC", "tiles"})
 
 
 def _sql_column_type(series) -> str:
-    """SQLite column type for a pandas column.
-
-    **TEXT is the fallback, not INTEGER.** The old order defaulted to INTEGER
-    and only reached TEXT through ``is_object_dtype``; pandas 3 turns on
-    ``future.infer_string`` by default, so a string column is ``StringDtype``
-    rather than ``object``, missed every branch, and was declared INTEGER.
-    Cluster labels written as ``"0"``, ``"1"``, ``"2"`` came back as ``0``,
-    ``1``, ``2`` -- silently, because SQLite stores what it is handed and only
-    the read is typed. Anything comparing a label to a string, or looking it up
-    in a stored category order, then quietly stopped matching.
-
-    Defaulting to TEXT means an unrecognised dtype loses its type rather than
-    its value, which is the recoverable direction.
-    """
-    dtype = series.dtype
-    if pd.api.types.is_bool_dtype(dtype):
-        return "INTEGER"
-    if pd.api.types.is_float_dtype(dtype):
-        return "REAL"
-    if pd.api.types.is_integer_dtype(dtype):
-        return "INTEGER"
-    return "TEXT"
+    """SQLite column type for a pandas column (see
+    :func:`cytome.core.column_meta.sql_type_of`; a categorical's is its
+    categories')."""
+    from cytome.core.column_meta import sql_type_of
+    return sql_type_of(series)
 
 
 class Modality:
@@ -136,25 +119,38 @@ class Modality:
 
 
 class _EmbeddingAccessor:
-    def __init__(self, conn: sqlite3.Connection, entity: str = "cells") -> None:
+    """Embeddings of one entity (``cells``), or with ``var=True`` of every
+    feature entity (``genes``, ``peaks``, ``tiles``, ``GA_genes``, ...)."""
+
+    def __init__(self, conn: sqlite3.Connection, entity: str = "cells", var: bool = False) -> None:
         self._conn = conn
         _handles.bind(self, conn)
         self._entity = entity
+        self._var = var
+
+    def _where(self):
+        return ("entity != 'cells'", ()) if self._var else ("entity = ?", (self._entity,))
 
     def __getitem__(self, name: str) -> np.ndarray:
         return EmbeddingArray(self._conn, name).to_memory()
 
     def keys(self) -> list[str]:
+        cond, args = self._where()
         rows = self._conn.execute(
-            "SELECT array_name FROM embedding_meta WHERE entity = ? ORDER BY array_name",
-            (self._entity,),
+            f"SELECT array_name FROM embedding_meta WHERE {cond} ORDER BY array_name", args,
         )
         return [r[0] for r in rows]
 
+    def entity_of(self, name: str) -> str | None:
+        row = self._conn.execute("SELECT entity FROM embedding_meta WHERE array_name = ?",
+                                 (name,)).fetchone()
+        return None if row is None else row[0]
+
     def __contains__(self, name: str) -> bool:
+        cond, args = self._where()
         row = self._conn.execute(
-            "SELECT 1 FROM embedding_meta WHERE array_name = ? AND entity = ? LIMIT 1",
-            (name, self._entity),
+            f"SELECT 1 FROM embedding_meta WHERE array_name = ? AND {cond} LIMIT 1",
+            (name, *args),
         ).fetchone()
         return row is not None
 
@@ -166,6 +162,16 @@ class _EmbeddingAccessor:
 
 
 class _GraphAccessor:
+    """The graphs of one axis. ``ds.graphs[name]`` is a :class:`GraphStore`
+    for any name, stored or not (writing through it stores the graph); ``in``,
+    iteration and ``len`` see the stored graphs only.
+
+    ``__contains__`` and ``__iter__`` are defined because ``__getitem__``
+    accepts every key: without them Python's ``in`` and ``list()`` fall back to
+    indexing 0, 1, 2, ... until an IndexError that never comes, and
+    ``'knn' in ds.graphs`` never returned.
+    """
+
     def __init__(self, conn: sqlite3.Connection, axis: str = "obs", entity: str = "cells") -> None:
         self._conn = conn
         _handles.bind(self, conn)
@@ -175,12 +181,21 @@ class _GraphAccessor:
     def __getitem__(self, name: str) -> GraphStore:
         return GraphStore(self._conn, name, axis=self._axis, entity_table=self._entity)
 
+    def __contains__(self, name) -> bool:
+        return name in self.keys()
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def __len__(self) -> int:
+        return len(self.keys())
+
     def keys(self) -> list[str]:
         names = set()
         if self._axis == "obs":
-            if self._conn.execute("SELECT COUNT(*) FROM graph_knn").fetchone()[0] > 0:
+            if self._conn.execute("SELECT 1 FROM graph_knn LIMIT 1").fetchone() is not None:
                 names.add("knn")
-            if self._conn.execute("SELECT COUNT(*) FROM graph_peak_gene").fetchone()[0] > 0:
+            if self._conn.execute("SELECT 1 FROM graph_peak_gene LIMIT 1").fetchone() is not None:
                 names.add("peak_gene")
         for table in ("graph_edges", "graph_meta"):
             try:
@@ -192,6 +207,14 @@ class _GraphAccessor:
             except sqlite3.OperationalError:
                 pass
         return sorted(names)
+
+
+def _same_file(a, b) -> bool:
+    """Whether two paths name one file (a hard or symbolic link included)."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.realpath(str(a)) == os.path.realpath(str(b))
 
 
 def _keep_store_as(src: Path, dst: Path, check_free_space: bool = True) -> None:
@@ -232,6 +255,20 @@ class CytomeDataset:
         self.path = Path(path)
         self.mode = mode
         self._pending_writes: dict[str, Any] = {}
+        #: writes a flush could not make, set aside so the rest can be written
+        #: (key -> payload); see flush()
+        self._failed_writes: dict[str, Any] = {}
+        #: layer writers handed out and not yet finalized: their rows are in
+        #: the connection's open transaction (see flush() and close()). Held
+        #: strongly: a writer its caller dropped (an error in the write loop)
+        #: still has its rows in the transaction, and the next commit would
+        #: keep them, the old layer already deleted.
+        self._writers: list = []
+        #: writes a flush made inside an open writer's transaction (see
+        #: flush()): committed by its finalize(), or rolled back with it
+        self._joined_keys: list[str] = []
+        #: accessors of a closed connection, rebound by reopen()
+        self._detached_users = None
         self._auto_flush = False
         # Cached connection-bound accessors. Any new attribute added here
         # that holds a reference to ``self._conn`` MUST also be reset in
@@ -354,7 +391,10 @@ class CytomeDataset:
 
     @property
     def var_embeddings(self) -> _EmbeddingAccessor:
-        return _EmbeddingAccessor(self._conn, entity="genes")
+        """Embeddings of the feature axes: of genes, and of peaks, tiles and
+        gene activity (``ATAC`` varm is stored on ``peaks``; only the genes'
+        were listed before, and ``filter_cells`` dropped the others)."""
+        return _EmbeddingAccessor(self._conn, var=True)
 
     @property
     def spatial_images(self):
@@ -368,12 +408,16 @@ class CytomeDataset:
         (png/jpeg/tiff path, bytes kept verbatim) with its scale factors.
         Scalefactors upsert per key. See ``cytome/core/spatial.py``."""
         from .spatial import add_spatial_image as _add
-        _add(self._conn, library_id, img_key, image,
-             scalefactors=scalefactors, replace=replace)
+        self.require_writable("add_spatial_image()")
+        with self._conn:                  # committed on return, like an embedding
+            _add(self._conn, library_id, img_key, image,
+                 scalefactors=scalefactors, replace=replace)
 
     def delete_spatial_image(self, library_id: str, img_key: str) -> None:
         from .spatial import delete_spatial_image as _del
-        _del(self._conn, library_id, img_key)
+        self.require_writable("delete_spatial_image()")
+        with self._conn:
+            _del(self._conn, library_id, img_key)
 
     def set_spatial_coords(self, coords, cell_idx=None) -> None:
         """Index per-cell spatial coordinates (full-res pixel units) in the
@@ -384,7 +428,10 @@ class CytomeDataset:
         # the cells rows on disk first
         self.flush()
         from .spatial import set_spatial_coords as _set
-        _set(self._conn, coords, cell_idx=cell_idx)
+        # committed on return: left in an open transaction, another process
+        # read no coordinates and a later failed flush rolled them back
+        with self._conn:
+            _set(self._conn, coords, cell_idx=cell_idx)
 
     def cells_in_region(self, x, y):
         """Cell indices whose spatial coordinates fall in the rectangle
@@ -517,6 +564,9 @@ class CytomeDataset:
         if entry and entry.get("order"):
             missing = self._categories_missing_values(column, entry["order"])
             if missing:
+                if self.read_only:
+                    # a read never writes: the stale entry stays on disk, unused
+                    return None
                 self._invalidate_stale_categories(column)
                 return None
         return entry
@@ -528,6 +578,13 @@ class CytomeDataset:
         Fragments are stored per dataset, not per modality, so this is the
         natural place to reach them; ``ds.ATAC.fragments`` returns the same
         object and stays for callers that spell it that way.
+
+        Its queries give ``dup_count`` as a nullable integer (``Int64``):
+        missing (``pd.NA``) for fragments stored in compressed chunks, which
+        keep each fragment once and record no duplicate count, and the stored
+        count for the older per-chromosome tables. An exported fragments file
+        has 1 in that column for chunked fragments, as the format needs an
+        integer there.
         """
         from cytome.core.fragments import FragmentStore
 
@@ -551,6 +608,12 @@ class CytomeDataset:
         RNA+ATAC supervised + QC run since Round 6.
         """
         mods: set[str] = set(self._manifest.get("modalities", []) or [])
+        # matrices written and waiting for the next flush
+        for key in self._pending_writes:
+            if key.startswith("matrix:") and "_" in key[7:]:
+                prefix = key[7:].split("_", 1)[0]
+                if prefix:
+                    mods.add(prefix)
 
         # Matrix-name prefix scan: a matrix called "{X}_counts" etc.
         # implies modality X is present. Restricted to known names so
@@ -595,29 +658,65 @@ class CytomeDataset:
         return int(self._conn.execute("SELECT COUNT(*) FROM peaks").fetchone()[0])
 
     def __getattr__(self, name: str) -> Any:
-        if name in self.modalities:
+        # Only modality names resolve here. A private or special name never
+        # does: copy.copy() looks up __setstate__ on an object whose _conn is
+        # not set yet, and asking for the modalities there recursed. A closed
+        # dataset has no modalities to offer (hasattr() raised).
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            modalities = self.modalities
+        except (sqlite3.ProgrammingError, AttributeError):
+            raise AttributeError(name) from None
+        if name in modalities:
             return Modality(self, name)
         raise AttributeError(name)
+
+    def _queue(self, key: str, payload: Any) -> None:
+        """Queue a write behind the ones already waiting.
+
+        A key written again moves to the end: a dict keeps a re-assigned key in
+        its first slot, so ``cells['x'] = a; set_entity('cells', df);
+        cells['x'] = b`` replaced the table after writing ``b``, and ``x`` was
+        lost.
+        """
+        self._pending_writes.pop(key, None)
+        self._pending_writes[key] = payload
 
     def add_matrix(
         self,
         name: str,
         sparse_matrix: sp.spmatrix,
         provenance: dict[str, Any] | None = None,
+        compression: str = "zstd",
+        col_entity: str | None = None,
     ) -> None:
-        """Buffer a sparse matrix write."""
-        self._pending_writes[f"matrix:{name}"] = {
+        """Buffer a sparse matrix write (made by the next :meth:`flush`).
+
+        ``col_entity`` names the table its columns follow; by default the
+        feature table of the modality its name starts with.
+
+        The modality its name starts with is registered in the manifest by the
+        same flush: written here, it was a write outside any transaction,
+        committed by whatever committed next, and kept by a flush that failed.
+        """
+        self.require_writable(f"add_matrix({name!r})")
+        from cytome.io.compression import _resolve_method
+        _resolve_method(compression)
+        if sp.issparse(sparse_matrix):
+            matrix = sparse_matrix
+        else:
+            dense = np.asarray(sparse_matrix)
+            if not dense.dtype.isnative:            # scipy >= 1.18 refuses a big-endian dtype
+                dense = dense.astype(dense.dtype.newbyteorder("="))
+            matrix = sp.csr_matrix(dense)
+        self._queue(f"matrix:{name}", {
             "name": name,
-            "matrix": sparse_matrix.tocsr(),
+            "matrix": matrix.tocsr(),
             "provenance": provenance,
-        }
-        if "_" in name:
-            modality = name.split("_", 1)[0]
-            if modality:
-                modalities = set(self.modalities)
-                modalities.add(modality)
-                self._write_manifest_key("modalities", sorted(modalities))
-                self._manifest = self._read_manifest()
+            "compression": compression,
+            "col_entity": col_entity,
+        })
 
     def create_layer_writer(
         self,
@@ -655,19 +754,13 @@ class CytomeDataset:
         storage_chunk_size
             Rows per storage blob (default 128).
         """
+        self.require_writable(f"create_layer_writer({layer_name!r})")
         if col_entity is None:
             col_entity = _infer_col_entity(layer_name)
+        if not self._open_writers():
+            self._joined_keys.clear()         # a new writer transaction begins
 
-        # Register modality
-        if "_" in layer_name:
-            modality = layer_name.split("_", 1)[0]
-            if modality:
-                modalities = set(self.modalities)
-                modalities.add(modality)
-                self._write_manifest_key("modalities", sorted(modalities))
-                self._manifest = self._read_manifest()
-
-        return ChunkedLayerWriter(
+        writer = ChunkedLayerWriter(
             conn=self._conn,
             matrix_name=layer_name,
             n_rows=n_rows,
@@ -679,6 +772,18 @@ class CytomeDataset:
             overwrite=overwrite,
             storage_chunk_size=storage_chunk_size,
         )
+        # Register the modality in the writer's own transaction: committed
+        # with the layer by finalize(), rolled back with it by close() when the
+        # writer is never finalized.
+        if "_" in layer_name:
+            modality = layer_name.split("_", 1)[0]
+            if modality:
+                modalities = set(self.modalities)
+                modalities.add(modality)
+                self._write_manifest_key("modalities", sorted(modalities))
+                self._manifest = self._read_manifest()
+        self._open_writers().append(writer)
+        return writer
 
     def add_embedding(
         self,
@@ -694,19 +799,20 @@ class CytomeDataset:
         expectation. Pass ``flush=False`` to batch several writes and call
         :meth:`flush` once at the end (cheaper when adding many at once).
         """
-        arr = np.asarray(ndarray)
+        arr = _embedding_array(name, ndarray)
         # An embedding written here was float64 while the same embedding
         # converted from an h5ad was float32, in the same file. `dtype` lets a
         # caller state the width; None keeps whatever the array already has,
         # so a conversion stays lossless.
         if dtype is not None:
             arr = arr.astype(np.dtype(dtype), copy=False)
-        self._pending_writes[f"embedding:{name}"] = {
+        self.require_writable(f"add_embedding({name!r})")
+        self._queue(f"embedding:{name}", {
             "name": name,
             "array": arr,
             "entity": "cells",
             "provenance": provenance,
-        }
+        })
         if flush:
             self.flush()
 
@@ -718,13 +824,19 @@ class CytomeDataset:
         provenance: dict[str, Any] | None = None,
         flush: bool = True,
     ) -> None:
-        """Add a dense embedding aligned to the variable axis (flushes by default)."""
-        self._pending_writes[f"embedding:{name}"] = {
+        """Add a dense embedding aligned to the variable axis (flushes by default).
+
+        ``entity`` names the feature table its rows follow (``genes``,
+        ``peaks``, ``tiles``, ``GA_genes`` ...).
+        """
+        arr = _embedding_array(name, ndarray)
+        self.require_writable(f"add_var_embedding({name!r})")
+        self._queue(f"embedding:{name}", {
             "name": name,
-            "array": np.asarray(ndarray),
+            "array": arr,
             "entity": entity,
             "provenance": provenance,
-        }
+        })
         if flush:
             self.flush()
 
@@ -742,18 +854,18 @@ class CytomeDataset:
             ds.add_cells_column("leiden", labels)
 
         Validates ``len(values) == n_rows`` and flushes by default
-        (``flush=False`` to batch). Reads + rewrites the (small) entity table;
-        the heavy measurement matrices are untouched.
+        (``flush=False`` to batch). Written as a column (one ``UPDATE`` of the
+        column, the path of ``ds.cells[name] = values``), queued behind the
+        writes already waiting. It read the table and rewrote it whole before:
+        a column written just before and not yet flushed was read as it was on
+        disk and lost, rewriting ``cells`` failed on every spatial store (the
+        coordinates refer to it), and 200,000 cells by 22 columns took 9.1 s
+        against 1.2 s.
         """
-        df = pd.read_sql_query(f"SELECT * FROM {table_name}", self._conn)
-        values = np.asarray(values)
-        if len(values) != len(df):
-            raise ValueError(
-                f"len(values)={len(values)} does not match {table_name} "
-                f"row count ({len(df)})."
-            )
-        df[name] = values
-        self.set_entity(table_name, df)
+        _primary_key_for_table(table_name)          # an entity table, or ValueError
+        if name.lower() == _primary_key_for_table(table_name).lower():
+            raise ValueError(f"{name!r} is the key of {table_name}; it is not written as a column")
+        EntityTable(self._conn, table_name, enqueue_write=self._enqueue_write)[name] = values
         if flush:
             self.flush()
 
@@ -773,12 +885,15 @@ class CytomeDataset:
         entity_table: str = "cells",
     ) -> None:
         """Buffer a graph write."""
-        self._pending_writes[f"graph:{name}"] = {
+        self.require_writable(f"add_graph({name!r})")
+        if not sp.issparse(sparse_matrix) or sparse_matrix.ndim != 2:
+            sparse_matrix = sp.csr_matrix(np.asarray(sparse_matrix))
+        self._queue(f"graph:{name}", {
             "name": name,
             "matrix": sparse_matrix,
             "axis": axis,
             "entity_table": entity_table,
-        }
+        })
 
     def add_var_graph(self, name: str, sparse_matrix: sp.spmatrix, entity_table: str = "genes") -> None:
         """Buffer a variable-axis sparse graph write."""
@@ -789,6 +904,8 @@ class CytomeDataset:
         if hasattr(anndata_or_dict, "X"):
             self.add_matrix(f"{name}_counts", anndata_or_dict.X)
             for layer_name, mat in anndata_or_dict.layers.items():
+                if layer_name is None:      # anndata >= 0.13 lists X here: not a layer
+                    continue
                 self.add_matrix(f"{name}_{layer_name}", mat)
         elif isinstance(anndata_or_dict, dict):
             for key, mat in anndata_or_dict.items():
@@ -809,74 +926,245 @@ class CytomeDataset:
         # Replacing the cells table can overwrite a labelled column — drop any
         # category order that the new values no longer match (covers
         # add_cells_column, which routes through here).
+        self.require_writable(f"set_entity({table_name!r})")
         if table_name == "cells":
             cats = self.metadata.get("categories") or {}
             for col in list(cats):
                 if col in payload.columns:
                     self._invalidate_stale_categories(col, payload[col].to_numpy())
-        self._pending_writes[f"entity_table:{table_name}"] = payload
+        self._queue(f"entity_table:{table_name}", payload)
 
     def flush(self) -> None:
-        """Atomically persist all buffered writes."""
+        """Atomically persist all buffered writes.
+
+        One transaction, begun explicitly: a new column's ``ALTER TABLE`` ran
+        before the first data statement and committed on its own, so a flush
+        that failed later left the column behind. Foreign keys are checked at
+        the commit (``defer_foreign_keys``), so a table that is rewritten whole
+        (``cells``, which the spatial coordinates refer to) can be deleted and
+        written again within it.
+
+        A write that fails is set aside (``ds._failed_writes``) and the error
+        raised; the transaction is rolled back and the other writes stay queued
+        for the next flush. A failed write used to stay first in the queue, so
+        every later flush, and ``close()``, failed on it again.
+
+        While a layer writer (:meth:`create_layer_writer`) is open, its rows
+        are in the connection's transaction and a commit would keep them half
+        written, the old layer already deleted. A flush then writes into that
+        transaction and leaves the commit to the writer's ``finalize()``, which
+        commits the layer and these writes together (cytome's quantifier writes
+        its feature table so); a writer that is rolled back instead
+        (``close()``, ``reopen()`` or :func:`cytome.released` without
+        ``finalize()``) takes them with it, and its warning names them.
+        """
         if not self._pending_writes:
             return
         self.require_writable("flush()")
-        with self._conn:
-            items = list(self._pending_writes.items())
-            i = 0
-            while i < len(items):
-                key, payload = items[i]
-                i += 1
-                if key.startswith("entity:"):
-                    assert isinstance(payload, _EntityWrite)
-                    # Adjacent column writes to one table go in one pass: each
-                    # pass rewrites the whole table. Only adjacent ones, so a
-                    # column is never moved across a write it came before or
-                    # after (a whole-table replacement, say).
-                    run = [(payload.column_name, payload.values)]
-                    while (i < len(items) and items[i][0].startswith("entity:")
-                           and items[i][1].table_name == payload.table_name):
-                        run.append((items[i][1].column_name, items[i][1].values))
-                        i += 1
-                    EntityTable(self._conn, payload.table_name)._apply_column_writes(run)
-                elif key.startswith("entity_table:"):
-                    table = key.split(":", 1)[1]
-                    self._write_entity_table(table, payload)
-                elif key.startswith("matrix:"):
-                    self._write_matrix_payload(payload)
-                elif key.startswith("embedding:"):
-                    self._write_embedding_payload(payload)
-                elif key.startswith("graph:"):
-                    GraphStore(
-                        self._conn,
-                        payload["name"],
-                        axis=payload.get("axis", "obs"),
-                        entity_table=payload.get("entity_table", "cells"),
-                    ).write_sparse(payload["matrix"])
-                elif key.startswith("metadata:"):
-                    assert isinstance(payload, _MetadataWrite)
-                    MetadataStore(self._conn)._apply_write(payload)
-                else:
-                    logger.warning("Unknown pending write key ignored: %s", key)
-            self._pending_writes.clear()
+        if self._open_writers() and self._conn.in_transaction:
+            self._flush_into_layer_transaction()
+            return
+        self._joined_keys.clear()          # committed by the finalize() they joined
+        conn = self._conn
+        items = list(self._pending_writes.items())
+        culprits: list[str] = []
+        try:
+            if not conn.in_transaction:
+                conn.execute("BEGIN")
+            conn.execute("PRAGMA defer_foreign_keys=ON")
+            self._apply_writes(items, culprits)
+            culprits[:] = []
             self._sync_manifest_counts()
-            self._manifest = self._read_manifest()
+            # A deferred foreign key fails here: a rewritten table that lost
+            # rows another table refers to.
+            culprits[:] = [k for k, _ in items if k.startswith("entity_table:")] or \
+                [k for k, _ in items]
+            conn.commit()
+        except BaseException as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            self._set_aside(exc, culprits, "nothing of this flush was written")
+            raise
+        for k, _ in items:
+            self._pending_writes.pop(k, None)
+        self._manifest = self._read_manifest()
+
+    def _flush_into_layer_transaction(self) -> None:
+        """:meth:`flush` while a layer writer is open: the writes go into the
+        writer's transaction, inside a savepoint (a failing write undoes only
+        this flush's writes), and are committed by its ``finalize()``. Foreign
+        keys are checked as each statement runs: a deferred check would fail
+        the writer's commit instead."""
+        conn = self._conn
+        items = list(self._pending_writes.items())
+        culprits: list[str] = []
+        conn.execute("SAVEPOINT cytome_flush")
+        try:
+            self._apply_writes(items, culprits)
+            culprits[:] = []
+            self._sync_manifest_counts()
+        except BaseException as exc:
+            conn.execute("ROLLBACK TO cytome_flush")
+            conn.execute("RELEASE cytome_flush")
+            self._set_aside(exc, culprits, "nothing of this flush was written")
+            raise
+        conn.execute("RELEASE cytome_flush")
+        for k, _ in items:
+            self._pending_writes.pop(k, None)
+            if k not in self._joined_keys:
+                self._joined_keys.append(k)
+        self._manifest = self._read_manifest()
+
+    def _apply_writes(self, items: list, culprits: list) -> None:
+        """Apply queued writes in their order; ``culprits`` names the write
+        being applied, for :meth:`_set_aside`."""
+        i = 0
+        while i < len(items):
+            key, payload = items[i]
+            culprits[:] = [key]
+            i += 1
+            if key.startswith("entity:"):
+                assert isinstance(payload, _EntityWrite)
+                # Adjacent column writes to one table go in one pass: each
+                # pass rewrites the whole table. Only adjacent ones, so a
+                # column is never moved across a write it came before or
+                # after (a whole-table replacement, say).
+                run = [(payload.column_name, payload.values, payload.sql_type)]
+                while (i < len(items) and items[i][0].startswith("entity:")
+                       and items[i][1].table_name == payload.table_name):
+                    culprits.append(items[i][0])
+                    run.append((items[i][1].column_name, items[i][1].values,
+                                items[i][1].sql_type))
+                    i += 1
+                EntityTable(self._conn, payload.table_name)._apply_column_writes(run)
+            elif key.startswith("entity_table:"):
+                table = key.split(":", 1)[1]
+                self._write_entity_table(table, payload)
+            elif key.startswith("matrix:"):
+                self._write_matrix_payload(payload)
+            elif key.startswith("embedding:"):
+                self._write_embedding_payload(payload)
+            elif key.startswith("graph:"):
+                GraphStore(
+                    self._conn,
+                    payload["name"],
+                    axis=payload.get("axis", "obs"),
+                    entity_table=payload.get("entity_table", "cells"),
+                ).write_sparse(payload["matrix"])
+            elif key.startswith("metadata:"):
+                assert isinstance(payload, _MetadataWrite)
+                MetadataStore(self._conn)._apply_write(payload)
+            else:
+                logger.warning("Unknown pending write key ignored: %s", key)
+
+    def _set_aside(self, exc: BaseException, culprits: list, outcome: str) -> None:
+        """Move the writes that failed out of the queue, into ``_failed_writes``."""
+        if isinstance(exc, Exception) and culprits:
+            for k in culprits:
+                if k in self._pending_writes:
+                    self._failed_writes[k] = self._pending_writes.pop(k)
+            import warnings as _w
+            _w.warn(
+                f"flush(): {list(culprits)} could not be written ({type(exc).__name__}: {exc}) "
+                f"and were set aside in ds._failed_writes; {outcome}, and the other writes "
+                f"are still queued.",
+                RuntimeWarning, stacklevel=3)
+
+    def _open_writers(self) -> list:
+        """The layer writers handed out and not finalized (finalized ones are
+        dropped from the list)."""
+        self._writers[:] = [w for w in self._writers if not w.finalized]
+        return self._writers
+
+    def _refuse_open_writers(self, what: str) -> None:
+        """Raise if a layer writer is not finalized: its rows are in the
+        connection's open transaction, and committing them would keep a
+        half-written layer (the old one already deleted)."""
+        open_writers = [w._matrix_name for w in self._open_writers()]
+        if open_writers:
+            raise RuntimeError(
+                f"{what}: the layer writer for {open_writers} is not finalized; its rows are "
+                f"in this connection's transaction and would be committed half written. "
+                f"Call finalize() on it first; close() or reopen() rolls its rows back and "
+                f"writes the rest.")
+
+    def _rollback_open_writers(self) -> None:
+        """Roll back the rows of layer writers that were never finalized (an
+        error in the caller's write loop, say), so closing does not commit a
+        half-written layer over the one it replaced. Writes flushed into their
+        transaction go with them."""
+        open_writers = list(self._open_writers())
+        if not open_writers:
+            self._joined_keys.clear()      # committed by the finalize() they joined
+            return
+        try:
+            self._conn.rollback()
+        except sqlite3.Error:
+            pass
+        for w in open_writers:
+            w._finalized = True               # nothing more can be written through it
+        joined, self._joined_keys = self._joined_keys, []
+        import warnings as _w
+        _w.warn(
+            f"{self.path.name}: the layer writer for {[w._matrix_name for w in open_writers]} "
+            f"was not finalized; what it wrote was rolled back and the matrix is as it was "
+            f"before." + (f" The writes flushed into its transaction were rolled back with "
+                          f"it: {joined}." if joined else ""), RuntimeWarning, stacklevel=3)
+
+    def _close_connection(self) -> None:
+        """Commit and close the connection, whatever happens to the commit; the
+        accessors made from it are kept for :meth:`reopen`."""
+        conn = self._conn
+        self._detached_users = _handles.detach(conn)
+        try:
+            conn.commit()
+        except sqlite3.Error:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        finally:
+            conn.close()
 
     def close(self) -> None:
         """Flush pending writes then close the database. A store opened
-        read-only is always closed."""
-        if self.read_only:
-            self._pending_writes.clear()
-        self.flush()
-        if immutable_store_changed(self._conn):
-            import warnings
-            warnings.warn(
-                f"{self.path.name} changed while it was open read-only. It was "
-                f"read without locks (its folder is not writable), so what was "
-                f"read may mix the old and the new file; reopen it to read again.",
-                ReadOnlyWarning, stacklevel=2)
-        close_database(self._conn)
-        _handles.forget(self._conn)
+        read-only is always closed.
+
+        The connection is closed whatever happens. A pending write that cannot
+        be written is set aside (see :meth:`flush`), the others are written,
+        and then the first error is raised. A second ``close()`` does nothing.
+        """
+        if self.is_closed:
+            return
+        error = None
+        try:
+            if self.read_only:
+                self._pending_writes.clear()
+            self._rollback_open_writers()
+            while self._pending_writes:
+                before = len(self._pending_writes)
+                try:
+                    self.flush()
+                    break
+                except Exception as exc:
+                    error = error or exc
+                    if len(self._pending_writes) >= before:   # nothing was set aside
+                        self._failed_writes.update(self._pending_writes)
+                        self._pending_writes.clear()
+                        break
+            if immutable_store_changed(self._conn):
+                import warnings
+                warnings.warn(
+                    f"{self.path.name} changed while it was open read-only. It was "
+                    f"read without locks (its folder is not writable), so what was "
+                    f"read may mix the old and the new file; reopen it to read again.",
+                    ReadOnlyWarning, stacklevel=2)
+        finally:
+            self._close_connection()
+        if error is not None:
+            raise error
 
     def chunk_source(self, matrix_name: str, n_readers: int = 4, cache: bool = False,
                      cache_budget_bytes: int | None = None):
@@ -896,18 +1184,26 @@ class CytomeDataset:
         another exclusive writer made to the file while it was released.
 
         The intended use is bracketing an out-of-process / different-SQLite
-        writer that needs exclusive access — e.g. the Rust quantify backend:
-        ``ds.close()`` → run the exclusive writer on ``ds.path`` →
+        writer that needs exclusive access — e.g. the Rust quantify backend.
+        :func:`cytome.released` does exactly that for every dataset of this
+        process on the file: ``with cytome.released(ds): run_writer(ds.path)``.
+        By hand: ``ds.close()`` → run the exclusive writer on ``ds.path`` →
         ``ds.reopen()``. Tolerant of an already-closed connection (skips the
-        flush/close in that case). Holding this Dataset open across such a
-        writer can corrupt the file (two SQLite libraries on one WAL DB);
-        reopening around it is the safe pattern. Returns ``self`` for chaining.
+        flush/close in that case). Accessors kept in variables (``cells =
+        ds.cells``, a measurement layer) follow the dataset to its new
+        connection, after ``close()`` too, and read their shape again. Holding
+        this Dataset open across such a writer can corrupt the file (two
+        SQLite libraries on one WAL DB); reopening around it is the safe
+        pattern. Returns ``self`` for chaining.
         """
         if not self.is_closed:
+            self._rollback_open_writers()
             self.flush()
-            close_database(self._conn)
+            self._close_connection()
         old = self._conn
+        detached, self._detached_users = self._detached_users, None
         self._conn = open_database(self.path, mode=self._reopen_mode())
+        _handles.attach(detached, self._conn)
         self._refresh_after_reopen(old)
         self._manifest = self._read_manifest()
         return self
@@ -1005,18 +1301,6 @@ class CytomeDataset:
         matrix_name = f"{modality}_{layer}"
         ml = MeasurementLayer(self._conn, matrix_name)
 
-        if cell_mask is not None:
-            cell_mask = np.asarray(cell_mask)
-            if cell_mask.dtype == bool:
-                keep_idx = np.where(cell_mask)[0]
-            else:
-                keep_idx = np.sort(cell_mask)
-        else:
-            keep_idx = None
-
-        if col_mask is not None:
-            col_mask = np.asarray(col_mask)
-
         # Get entity count to cap yielded indices (prevents IndexError on
         # mismatched matrix_meta.n_rows vs entity table after subset/delete).
         row_entity = self._conn.execute(
@@ -1030,6 +1314,30 @@ class CytomeDataset:
                 entity_count = int(
                     self._conn.execute(f"SELECT COUNT(*) FROM {entity_name}").fetchone()[0]
                 )
+
+        if cell_mask is not None:
+            # A mask that does not fit the rows is an error, not a smaller
+            # selection: a short boolean mask and out-of-range indices used to
+            # drop the cells they missed without a word.
+            cell_mask = np.asarray(cell_mask)
+            n_rows = entity_count if entity_count is not None else ml.shape[0]
+            if cell_mask.dtype == bool:
+                if cell_mask.shape[0] != n_rows:
+                    raise ValueError(
+                        f"iter_chunks: a boolean cell_mask of {cell_mask.shape[0]} entries "
+                        f"for {n_rows} rows of {matrix_name}")
+                keep_idx = np.where(cell_mask)[0]
+            else:
+                keep_idx = np.sort(np.asarray(cell_mask, dtype=np.int64).ravel())
+                if keep_idx.size and (keep_idx[0] < 0 or keep_idx[-1] >= n_rows):
+                    raise IndexError(
+                        f"iter_chunks: cell_mask holds row {int(keep_idx[0] if keep_idx[0] < 0 else keep_idx[-1])}, "
+                        f"outside the {n_rows} rows of {matrix_name}")
+        else:
+            keep_idx = None
+
+        if col_mask is not None:
+            col_mask = np.asarray(col_mask)
 
         raw_iter = self._iter_raw_chunks(ml, keep_idx, entity_count)
 
@@ -1112,7 +1420,7 @@ class CytomeDataset:
                 yield chunk_csr, row_indices
 
     def to_anndata(self, modality: str = "RNA", layer: str | None = None, include_embeddings: bool = True,
-                   include_cross_modality_embeddings: bool = True, cell_mask=None):
+                   include_cross_modality_embeddings: bool = True, cell_mask=None, layers=None):
         """Convert one modality to AnnData.
 
         Parameters
@@ -1123,11 +1431,15 @@ class CytomeDataset:
         cell_mask
             Optional boolean mask or sorted integer indices for
             chunk-selective cell subsetting.
+        layers
+            The other matrices to load as layers: ``None`` all, a list of
+            names, ``[]`` none (see :func:`cytome.io.convert_anndata.to_anndata`).
         """
         from cytome.io.convert_anndata import to_anndata
 
         return to_anndata(self, modality=modality, layer=layer, include_embeddings=include_embeddings,
-                          include_cross_modality_embeddings=include_cross_modality_embeddings, cell_mask=cell_mask)
+                          include_cross_modality_embeddings=include_cross_modality_embeddings, cell_mask=cell_mask,
+                          layers=layers)
 
     def to_mudata(self):
         """Convert dataset to MuData."""
@@ -1171,11 +1483,11 @@ class CytomeDataset:
             Keys: ``matrix_name``, ``n_rows``, ``n_cols``, ``dtype``,
             ``compression``, ``row_entity``, ``col_entity``.
         """
-        cols = [
-            r[1]
-            for r in self._conn.execute("PRAGMA table_info(matrix_meta)").fetchall()
-        ]
-        col_list = ", ".join(cols)
+        from cytome.io.sqlite_engine import visible_columns
+        # visible_columns: a read-only open of an older store adds the missing
+        # columns through a view, which also exposes the base table's rowid
+        cols = [r[1] for r in visible_columns(self._conn, "matrix_meta")]
+        col_list = ", ".join(f'"{c}"' for c in cols)
         row = self._conn.execute(
             f"SELECT {col_list} FROM matrix_meta WHERE matrix_name = ?",
             (name,),
@@ -1262,14 +1574,19 @@ class CytomeDataset:
                 if self.matrix_meta(name_or_pattern) is not None
                 else []
             )
-        for name in names:
-            self._conn.execute(
-                "DELETE FROM matrix_chunks WHERE matrix_name = ?", (name,)
-            )
-            self._conn.execute(
-                "DELETE FROM matrix_meta WHERE matrix_name = ?", (name,)
-            )
-        self._conn.commit()
+        with self._conn:
+            for name in names:
+                # both layouts: a column-major matrix's data is all in
+                # matrix_csc_chunks, which this used to leave behind
+                self._conn.execute(
+                    "DELETE FROM matrix_chunks WHERE matrix_name = ?", (name,)
+                )
+                self._conn.execute(
+                    "DELETE FROM matrix_csc_chunks WHERE matrix_name = ?", (name,)
+                )
+                self._conn.execute(
+                    "DELETE FROM matrix_meta WHERE matrix_name = ?", (name,)
+                )
         return names
 
     def filter_cells(
@@ -1333,8 +1650,17 @@ class CytomeDataset:
         explicitly writes to a chosen path without touching the original.
         """
         self.require_writable("filter_cells()")
+        self._refuse_open_writers("filter_cells()")
         from cytome.io.subset import subset as _subset
         from cytome.io.subset import _resolve_keep_indices
+
+        if keep_original is not None and _same_file(keep_original, self.path):
+            # the backup is made by unlinking its path and linking the store
+            # there: the store itself was unlinked, and only the temporary
+            # filtered copy was left
+            raise ValueError(
+                f"filter_cells(keep_original={str(keep_original)!r}) names the store itself; "
+                f"name another path to keep the unfiltered store at")
 
         n_before = self.n_cells
 
@@ -1358,7 +1684,7 @@ class CytomeDataset:
         self.flush()
         out = _subset(
             self,
-            mask=mask,
+            mask=keep_idx,
             output=tmp_path,
             include_fragments=include_fragments,
             include_embeddings=include_embeddings,
@@ -1379,13 +1705,14 @@ class CytomeDataset:
         # read first). So: close the handle, UNLINK the dead sidecars (instant,
         # never fails on a busy/huge WAL), then replace.
         original = Path(self.path)
+        closed = self._conn
         close_database(self._conn)
         if keep_original is not None:
             try:
                 _keep_store_as(original, Path(keep_original), check_free_space)
             except Exception:
                 self._conn = open_database(self.path, mode=self._reopen_mode())
-                self._refresh_after_reopen(None)
+                self._refresh_after_reopen(closed)       # kept accessors follow
                 raise
         for ext in ("-wal", "-shm"):
             Path(str(original) + ext).unlink(missing_ok=True)
@@ -1431,18 +1758,11 @@ class CytomeDataset:
         dict
             ``{'busy': int, 'log_frames': int, 'checkpointed': int}`` from the
             ``wal_checkpoint`` result (``busy=1`` means a reader prevented a full
-            truncate). Returns ``{'busy': -1, ...}`` if the pragma is unavailable.
+            truncate). An error (a locked or damaged file) is raised; it was
+            returned as ``busy=-1``, which read like "busy".
         """
         self.require_writable("compact()")
-        self.flush()
-        try:
-            row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            self._conn.commit()
-            busy, log_frames, checkpointed = (row or (0, 0, 0))
-            return {"busy": int(busy), "log_frames": int(log_frames),
-                    "checkpointed": int(checkpointed)}
-        except Exception:
-            return {"busy": -1, "log_frames": 0, "checkpointed": 0}
+        return self.checkpoint("TRUNCATE")
 
     def query_gene_annotation(
         self,
@@ -1637,7 +1957,7 @@ class CytomeDataset:
 
         return downsample(self, n_cells=n_cells, fraction=fraction, **kwargs)
 
-    def checkpoint(self, mode: str = "TRUNCATE") -> None:
+    def checkpoint(self, mode: str = "TRUNCATE") -> "dict | None":
         """Fold the write-ahead log back into the ``.cytome`` file.
 
         A cytome is three files: ``x.cytome``, ``x.cytome-wal`` and
@@ -1651,13 +1971,25 @@ class CytomeDataset:
         longer need it.
 
         On a store opened read-only there is nothing of this process to fold,
-        and it does nothing.
+        and it does nothing (and returns None).
+
+        Returns ``{'busy', 'log_frames', 'checkpointed'}`` from SQLite: ``busy``
+        is 1 when another connection's read kept part of the log from being
+        folded (the file is then not yet self-contained). It returned nothing,
+        so a caller could not tell.
         """
         if self.read_only:
-            return
+            return None
+        mode = str(mode).upper()
+        if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            raise ValueError(f"checkpoint mode must be PASSIVE, FULL, RESTART or TRUNCATE, "
+                             f"not {mode!r}")
         self.flush()
         self._conn.commit()
-        self._conn.execute(f"PRAGMA wal_checkpoint({mode})")
+        row = self._conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+        busy, log_frames, checkpointed = (row or (0, 0, 0))
+        return {"busy": int(busy), "log_frames": int(log_frames),
+                "checkpointed": int(checkpointed)}
 
     def _snapshot_to(self, out: "Path") -> None:
         """Write a consistent copy of this database to ``out``.
@@ -1782,6 +2114,8 @@ class CytomeDataset:
         self.close()
 
     def __repr__(self) -> str:
+        if self.is_closed:
+            return f"CytomeDataset: {self.path} (closed)"
         mods = ", ".join(self.modalities) if self.modalities else "none"
         lines = [
             f"CytomeDataset: {self.path}",
@@ -1862,7 +2196,7 @@ class CytomeDataset:
         self.require_writable(f"writing {key.split(':', 1)[-1]!r}")
         if key.startswith("entity:cells:") and isinstance(payload, _EntityWrite):
             self._drop_categories_on_overwrite(payload.column_name)
-        self._pending_writes[key] = payload
+        self._queue(key, payload)
         if self._auto_flush:
             self.flush()
 
@@ -1951,16 +2285,21 @@ class CytomeDataset:
         matrix = payload["matrix"].tocsr()
         chunk_size = compute_chunk_size(matrix.shape[0], matrix.shape[1], int(matrix.nnz))
         row_entity = "cells"
-        col_entity = _infer_col_entity(payload["name"])
+        col_entity = payload.get("col_entity") or _infer_col_entity(payload["name"])
         write_sparse_chunked(
             self._conn,
             payload["name"],
             matrix,
             chunk_size=chunk_size,
-            compression="zstd",
+            compression=payload.get("compression") or "zstd",
             row_entity=row_entity,
             col_entity=col_entity,
         )
+        name = payload["name"]
+        if "_" in name and name.split("_", 1)[0]:
+            on_disk = set(self._read_manifest().get("modalities", []) or [])
+            if name.split("_", 1)[0] not in on_disk:
+                self._write_manifest_key("modalities", sorted(on_disk | {name.split("_", 1)[0]}))
 
     def _write_embedding_payload(self, payload: dict[str, Any]) -> None:
         arr = np.asarray(payload["array"])
@@ -2091,6 +2430,28 @@ class CytomeDataset:
             "INSERT OR REPLACE INTO _manifest(key, value) VALUES (?, ?)",
             (key, json.dumps(value)),
         )
+
+
+def _embedding_array(name: str, values) -> np.ndarray:
+    """``values`` as an embedding: a 2-D array of numbers. Checked when the
+    write is asked for, not at the flush, where a 1-D array failed and took
+    every other pending write with it."""
+    if isinstance(values, pd.DataFrame):
+        if not all(pd.api.types.is_numeric_dtype(t) or pd.api.types.is_bool_dtype(t)
+                   for t in values.dtypes):
+            raise TypeError(
+                f"{name}: an embedding holds numbers; this DataFrame has columns of "
+                f"{sorted({str(t) for t in values.dtypes})} (text or categorical columns "
+                f"belong in the cells table)")
+        values = values.to_numpy(dtype=np.float64)
+    arr = np.asarray(values)
+    if arr.ndim != 2:
+        raise ValueError(f"{name}: an embedding is a 2-D array (rows by components); got "
+                         f"shape {arr.shape}")
+    if arr.dtype.kind not in "biufc" or arr.dtype.fields is not None:
+        raise TypeError(f"{name}: an embedding holds numbers; an array of dtype {arr.dtype} "
+                        f"cannot be stored")
+    return arr
 
 
 def _primary_key_for_table(table_name: str) -> str:

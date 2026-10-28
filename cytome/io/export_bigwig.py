@@ -178,11 +178,16 @@ def _compute_group_coverage(
     normalize: str,
     region: Optional[Tuple[str, int, int]],
 ) -> Dict[str, np.ndarray]:
-    df = dataset.cells.query(f"{groupby} == '{group_name}'")
+    # the group's cells, chosen in pandas: a value written into SQL text broke
+    # on a quote ("Alzheimer's")
+    cells = dataset.cells.to_pandas()
+    df = cells.loc[cells[groupby].astype(str) == str(group_name)]
     if df.empty:
         return {}
     cell_indices = df["cell_idx"].to_numpy(dtype=np.int64)
-    cell_set = set(cell_indices.tolist())
+    # membership by lookup, not one Python test per fragment
+    in_group = np.zeros(int(cells["cell_idx"].max()) + 1, dtype=bool)
+    in_group[cell_indices] = True
 
     chrom_sizes = _dataset_chrom_sizes(dataset)
     if region is not None:
@@ -218,7 +223,9 @@ def _compute_group_coverage(
                     continue
 
                 # Filter to group cells
-                mask = np.array([c in cell_set for c in cells], dtype=bool)
+                ok = (cells >= 0) & (cells < in_group.size)
+                mask = np.zeros(cells.size, dtype=bool)
+                mask[ok] = in_group[cells[ok]]
                 if not mask.any():
                     continue
 
@@ -283,11 +290,39 @@ def _has_fragment_chunks(dataset) -> bool:
 
 
 def _dataset_chrom_sizes(dataset) -> Dict[str, int]:
-    genome = dataset._manifest.get("genome") or "hg38"
+    """Chromosome lengths for the coverage arrays.
+
+    The recorded genome's, each at least as long as the store's largest
+    fragment end on it (``fragment_meta.max_end``); with no genome recorded
+    (the pipeline's stores record none), the chromosomes and extents of the
+    fragments themselves. hg38 was assumed, so a mouse fragment past hg38's
+    chrX length was piled into the last bin, and fragments on a chromosome
+    hg38 lacks were dropped.
+    """
+    genome = dataset._manifest.get("genome")
+    sizes: Dict[str, int] = {}
+    if genome:
+        try:
+            sizes = dict(get_chrom_sizes(genome))
+        except Exception:
+            sizes = {}
     try:
-        return get_chrom_sizes(genome)
+        extents = dataset._conn.execute(
+            "SELECT chrom, max_end FROM fragment_meta WHERE n_fragments > 0").fetchall()
     except Exception:
-        return get_chrom_sizes("hg38")
+        extents = []
+    past = []
+    for chrom, max_end in extents:
+        if max_end is None:
+            continue
+        if genome and chrom in sizes and int(max_end) > sizes[chrom]:
+            past.append(chrom)
+        sizes[str(chrom)] = max(sizes.get(str(chrom), 0), int(max_end))
+    if past:
+        import warnings
+        warnings.warn(f"fragments on {past[:3]} end past the lengths of {genome}: is the "
+                      f"recorded genome the store's?", stacklevel=3)
+    return sizes
 
 
 def _write_bigwig(path: Path, values_by_chrom: Dict[str, np.ndarray], bin_size: int, dataset) -> None:

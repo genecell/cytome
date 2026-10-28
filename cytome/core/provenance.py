@@ -35,8 +35,18 @@ class ProvenanceLog:
         random_seed: int | None = None,
         notes: str | None = None,
     ) -> int:
-        """Write a provenance record and return its ID."""
+        """Write a provenance record and return its ID.
+
+        Committed at once when no transaction is open (a record written inside
+        a flush or a layer write commits with it). It was left uncommitted, and
+        an open write transaction blocks every other writer of the store: the
+        dataset ``merge`` returns held one (its last write was the provenance
+        record), so a following write in the same process waited out the 60 s
+        busy timeout and failed with "database is locked" until the discarded
+        dataset was garbage-collected.
+        """
         deps = _capture_dependency_versions()
+        in_transaction = self._conn.in_transaction
         hardware = {
             "platform": platform.platform(),
             "machine": platform.machine(),
@@ -67,7 +77,10 @@ class ProvenanceLog:
                 notes,
             ),
         )
-        return int(cursor.lastrowid)
+        row_id = int(cursor.lastrowid)
+        if not in_transaction:
+            self._conn.commit()
+        return row_id
 
     def show(self) -> str:
         """Return formatted provenance history text."""

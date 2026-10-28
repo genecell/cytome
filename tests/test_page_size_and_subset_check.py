@@ -103,7 +103,9 @@ def test_validate_runs_sqlite_check_unless_told_not_to(tmp_path):
     assert full.passed and quick.passed
     assert "sqlite_integrity" in full.checks_passed
     assert "sqlite_integrity" not in quick.checks_passed
-    assert set(quick.checks_passed) == set(full.checks_passed) - {"sqlite_integrity"}
+    # the checks that read every page or every value run with integrity only
+    assert set(quick.checks_passed) == set(full.checks_passed) - {"sqlite_integrity",
+                                                                  "metadata_readable"}
 
 
 def test_subset_checks_its_counts_only(tmp_path, monkeypatch):

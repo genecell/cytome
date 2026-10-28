@@ -109,8 +109,8 @@ def subset(
 
 def _remove_store_files(path) -> None:
     """Delete a store file and its sidecars, whichever exist."""
-    for sfx in ("", "-wal", "-shm", "-journal"):
-        Path(str(path) + sfx).unlink(missing_ok=True)
+    from cytome.io._atomic import remove_store_files
+    remove_store_files(path)
 
 
 def _bulk_begin(out: CytomeDataset) -> None:
@@ -131,16 +131,8 @@ def _bulk_end(out: CytomeDataset) -> None:
 
 def _sync_path(path) -> None:
     """fsync a file or directory; file systems that cannot sync a directory are skipped."""
-    try:
-        fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+    from cytome.io._atomic import sync_path
+    sync_path(path)
 
 
 def _bytes_to_write(ds, keep_frac: float, matrices, include_fragments: bool) -> int:
@@ -192,6 +184,13 @@ def _begin_output(ds, keep_idx, output, matrices, copy_annotations):
 
     cells = ds.cells.to_pandas().iloc[keep_idx].copy().reset_index(drop=True)
     cells["cell_idx"] = np.arange(cells.shape[0], dtype=np.int64)
+    # the source's column types, declared first: read back through pandas an
+    # INTEGER column with a NULL is float, and would come out REAL
+    have = {r[1].lower() for r in out._conn.execute("PRAGMA table_info(cells)")}
+    for _cid, name, decl, *_rest in ds._conn.execute("PRAGMA main.table_info(cells)"):
+        if name.lower() not in have:
+            out._conn.execute(f"ALTER TABLE cells ADD COLUMN {_q(name)} {decl or ''}".rstrip())
+            have.add(name.lower())
     out.set_entity("cells", cells)
 
     # Feature tables. A plain subset carries all of them. One that names its
@@ -368,14 +367,19 @@ def _finish_output(ds, out, keep_idx, output, include_embeddings, include_fragme
             out.add_embedding(emb_name, read_dense_rows(ds._conn, emb_name, keep_idx))
 
     if copy_annotations:
-        # GTF gene models — genome-coordinate data, not cell-indexed → copy
-        # verbatim. Without this, an imported GTF is lost on every filter_cells.
-        for tbl in ("_gene_annotation", "_exon_annotation"):
-            _copy_table_rows(ds._conn, out._conn, tbl)
-        # Var (gene-axis) embeddings (varm) — gene-indexed → copy in full.
-        for vname in ds.var_embeddings.keys():
-            out.add_var_embedding(vname, ds.var_embeddings[vname])
+        # Var embeddings (varm) follow features, not cells: copied whole, each
+        # under its own entity (genes, peaks, tiles, GA_genes). Only the genes'
+        # were listed, so the others were dropped.
+        for vname, entity in ds._conn.execute(
+                "SELECT array_name, entity FROM embedding_meta WHERE entity != 'cells' "
+                "ORDER BY rowid").fetchall():
+            out.add_var_embedding(vname, ds.var_embeddings[vname], entity=entity, flush=False)
         out.flush()
+
+    # Tables that do not depend on the cells kept (gene models, the raw var,
+    # the column types, spatial images), the samples (recounted) and the cell
+    # sets (remapped): the same routine for subset, split and merge.
+    carry_tables(ds, out, keep_idx, copy_annotations=copy_annotations)
 
     # Spatial coordinates are CELL-indexed data (like embeddings/fragments) →
     # subset to the kept cells and remap cell_idx. Always carried over.
@@ -386,7 +390,7 @@ def _finish_output(ds, out, keep_idx, output, include_embeddings, include_fragme
     # cell×cell graph is no longer complete) and var graphs.
     _warn_dropped_categories(ds)
 
-    if include_fragments and "ATAC" in ds.modalities:
+    if include_fragments and _has_fragments(ds):
         _subset_fragments(ds, out, keep_idx)
 
     # Copy metadata, but DROP cell-dependent cached normalization stats: they are
@@ -433,13 +437,14 @@ def _finish_output(ds, out, keep_idx, output, include_embeddings, include_fragme
     # SQLite's integrity check of the file SQLite has just written only when asked
     # (check_integrity): it reads every page in tree order, cheap while the new file is still in
     # the page cache and two hours for an 80 GB copy that no longer fits there.
-    from cytome.utils.validation import validate
+    from cytome.utils.validation import REPAIRABLE, validate
     report = validate(out, integrity=check_integrity)
     if not report.passed:
         import warnings
+        fixable = [f for f in report.checks_failed if f.startswith(REPAIRABLE)]
         warnings.warn(
-            f"Subset cytome failed validation: {report.checks_failed}. "
-            f"Run ds.repair() on the output to fix.",
+            f"Subset cytome failed validation: {report.checks_failed}."
+            + (f" ds.repair() on the output fixes {fixable}." if fixable else ""),
             stacklevel=2,
         )
 
@@ -550,6 +555,11 @@ def _subset_matrices_streaming(ds: CytomeDataset, out: CytomeDataset, keep_idx: 
                 fsum.add_rows(block)
             out_off += block.shape[0]
         writer.finalize()
+        # a matrix stored both ways keeps its column chunks (its feature index):
+        # they are row-selected the way a column-major matrix is, chunk by chunk
+        if _has_column_chunks(ds._conn, matrix_name):
+            _subset_csc_matrix(ds, out, matrix_name, int(n_cols), dtype, col_entity, keep_idx,
+                               dual=True)
 
         # ChunkedLayerWriter.finalize writes matrix_meta but not the modality
         # manifest key (add_matrix did). Register it so the output cytome
@@ -572,8 +582,15 @@ def _is_column_major(conn, matrix_name: str) -> bool:
     return bool(row) and row[0] == 0 and bool(row[1])
 
 
+def _has_column_chunks(conn, matrix_name: str) -> bool:
+    row = conn.execute("SELECT COALESCE(has_csc, 0) FROM matrix_meta WHERE matrix_name = ?",
+                       (matrix_name,)).fetchone()
+    return bool(row and row[0])
+
+
 def _subset_csc_matrix(ds, out, matrix_name: str, n_cols: int, dtype, col_entity, keep_idx,
-                       threads: "int | None" = None, sums: "_FeatureSums | None" = None) -> None:
+                       threads: "int | None" = None, sums: "_FeatureSums | None" = None,
+                       dual: bool = False) -> None:
     """Row-select a column-major matrix, chunk by chunk, into ``out``.
 
     A CSC chunk holds all rows of a run of columns, so keeping rows changes
@@ -591,6 +608,7 @@ def _subset_csc_matrix(ds, out, matrix_name: str, n_cols: int, dtype, col_entity
     """
     from collections import deque
     from concurrent.futures import ThreadPoolExecutor
+    from cytome.io.chunked_io import _frombuffer_data, _frombuffer_index, storage_dtype
     from cytome.io.compression import compress_blob, decompress_blob
 
     keep = np.asarray(keep_idx, dtype=np.int64)
@@ -600,14 +618,17 @@ def _subset_csc_matrix(ds, out, matrix_name: str, n_cols: int, dtype, col_entity
     mask[keep] = True
     remap = np.full(n_src, -1, dtype=np.int32)
     remap[keep] = np.arange(len(keep), dtype=np.int32)
-    out_dtype = np.dtype(dtype)
+    out_dtype = storage_dtype(dtype)
 
     def work(item):
         col_start, col_end, data_b, idx_b, ptr_b, src_dtype, comp = item
-        data = np.frombuffer(decompress_blob(data_b, comp), dtype=np.dtype(src_dtype))
-        idx = np.frombuffer(decompress_blob(idx_b, comp), dtype=np.int32)
-        ptr = np.frombuffer(decompress_blob(ptr_b, comp), dtype=np.int32)
         width = int(col_end) - int(col_start)
+        what = f"{matrix_name} columns {int(col_start)}-{int(col_end) - 1}"
+        ptr = _frombuffer_index(decompress_blob(ptr_b, comp), width + 1, f"{what} indptr")
+        nnz_src = int(ptr[-1]) if ptr.size else 0
+        idx = _frombuffer_index(decompress_blob(idx_b, comp), nnz_src, f"{what} indices")
+        data = _frombuffer_data(decompress_blob(data_b, comp), src_dtype, out_dtype, nnz_src,
+                                f"{what} data", matrix_name)
         # sorted within every column: consecutive entries increase except where a column starts
         steps = np.diff(idx)
         col_first = np.zeros(idx.size, dtype=bool)
@@ -625,6 +646,8 @@ def _subset_csc_matrix(ds, out, matrix_name: str, n_cols: int, dtype, col_entity
             nnz = int(kept_before[-1])
         # every column of the chunk is complete here
         stats = None if sums is None else _FeatureSums.column_sums(np.asarray(new_data), new_ptr)
+        if nnz > np.iinfo(np.int32).max:
+            raise ValueError(f"{what}: {nnz:,} entries in one chunk is past an int32 index pointer")
         return (int(col_start), int(col_end), nnz,
                 compress_blob(np.ascontiguousarray(new_data, dtype=out_dtype).tobytes(), "lz4"),
                 compress_blob(np.asarray(new_idx).astype(np.int32).tobytes(), "lz4"),
@@ -660,12 +683,24 @@ def _subset_csc_matrix(ds, out, matrix_name: str, n_cols: int, dtype, col_entity
                 write(pending.popleft().result())
         while pending:
             write(pending.popleft().result())
+    if dual:
+        # the row chunks and their metadata are written: record the column chunks beside them
+        src = ds._conn.execute("SELECT csc_chunk_size FROM matrix_meta WHERE matrix_name = ?",
+                               (matrix_name,)).fetchone()
+        out._conn.execute(
+            "UPDATE matrix_meta SET has_csc = 1, csc_chunk_size = ?, csc_n_chunks = ? "
+            "WHERE matrix_name = ?", (src[0] if src else None, int(n_chunks), matrix_name))
+        out._conn.commit()
+        return
     _write_csc_meta(ds, out._conn, matrix_name, int(len(keep)), n_cols, total_nnz, dtype,
                     col_entity, n_chunks)
 
 
 def _write_csc_chunk(conn, matrix_name, chunk_idx, col_start, col_end, sub, dtype) -> int:
     from cytome.io.compression import compress_blob
+    if int(sub.nnz) > np.iinfo(np.int32).max:
+        raise ValueError(f"{matrix_name}: {int(sub.nnz):,} entries in one chunk is past an "
+                         f"int32 index pointer")
     conn.execute(
         "INSERT INTO matrix_csc_chunks (matrix_name, chunk_idx, col_start, col_end, n_nonzero, "
         "data_blob, indices_blob, indptr_blob, dtype, compression) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -729,11 +764,14 @@ def split(
     ``labels`` holds one group label per cell; ``outputs`` maps each group to
     split off to the path of its store (cells of groups not in ``outputs``
     go nowhere). Each output is what ``subset(ds, labels == group, output,
-    matrices=matrices, ...)`` writes, cell order included, except the
-    per-feature sums over cells (``n_cells_accessible``,
-    ``<feature>_total_counts``), which ``subset`` computes again and ``split``
-    leaves out: for many groups their arrays would cost groups x features
-    of memory, and a group's own store is small enough to read again.
+    matrices=matrices, include_fragments=..., include_embeddings=...)``
+    writes, cell order included, except the per-feature sums over cells
+    (``n_cells_accessible``, ``<feature>_total_counts``), which ``subset``
+    computes again and ``split`` leaves out: for many groups their arrays
+    would cost groups x features of memory, and a group's own store is small
+    enough to read again. Unlike ``subset``, ``split`` leaves fragments and
+    embeddings out unless asked (``include_fragments``,
+    ``include_embeddings``), and carries only the ``matrices`` named.
 
     ``subset`` reads a whole column-major matrix for every group; this reads
     it once and hands every column chunk's rows to their groups' stores as
@@ -892,16 +930,18 @@ def downsample(
     if method == "stratified":
         if not groupby:
             raise ValueError("groupby is required for stratified downsample")
-        df = ds.cells.to_pandas()[["cell_idx", groupby]]
+        # rows, not cell_idx values: subset takes positions, and a store's
+        # cell_idx need not be 0..n-1 (from_anndata kept an incoming one)
+        df = ds.cells.to_pandas()[[groupby]].reset_index(drop=True)
         parts = []
         for _, g in df.groupby(groupby, dropna=False):
             frac = len(g) / max(len(df), 1)
             n = max(1, int(round(target * frac)))
-            idx = rng.choice(g["cell_idx"].to_numpy(), size=min(n, len(g)), replace=False)
+            idx = rng.choice(g.index.to_numpy(), size=min(n, len(g)), replace=False)
             parts.append(idx)
         keep = np.unique(np.concatenate(parts))
         if keep.size > target:
-            keep = rng.choice(keep, size=target, replace=False)
+            keep = np.sort(rng.choice(keep, size=target, replace=False))
     else:
         keep = np.sort(rng.choice(np.arange(total), size=target, replace=False))
 
@@ -913,6 +953,76 @@ def downsample(
 def _read_entity_dataframe(conn, table_name: str) -> pd.DataFrame:
     """Read a full entity table as a pandas DataFrame."""
     return pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
+
+
+def carry_tables(src, out, keep_idx=None, copy_annotations: bool = True) -> None:
+    """Carry what does not depend on which cells are kept from ``src`` to ``out``.
+
+    The one routine ``subset``, ``split`` and ``filter_cells`` use (and
+    ``merge`` per input): the gene models (``_gene_annotation``,
+    ``_exon_annotation``) with ``copy_annotations``; the raw var
+    (``_raw_var``, without which ``to_anndata`` of a store whose source had
+    ``.raw`` failed); the column types (``_column_meta``: categoricals came
+    back as plain text); spatial images and their scale factors; the peak
+    R-tree, built again over the peaks copied; the cell sets, remapped to the
+    kept cells; the samples, with their cells counted again. ``keep_idx``
+    (rows of ``src``) is the cells kept, all when None.
+    """
+    s, o = src._conn, out._conn
+    if copy_annotations:
+        for tbl in ("_gene_annotation", "_exon_annotation"):
+            _copy_feature_table(s, o, tbl)
+    for tbl in ("_raw_var", "_column_meta"):
+        _copy_feature_table(s, o, tbl)
+    if _table_has_rows(s, "spatial_images") or _table_has_rows(s, "spatial_scalefactors"):
+        from cytome.core.spatial import _ensure_tables
+        _ensure_tables(o)
+        for tbl in ("spatial_images", "spatial_scalefactors"):
+            _copy_feature_table(s, o, tbl)
+    if _table_has_rows(s, "peaks_rtree") and _table_has_rows(o, "peaks"):
+        from cytome.index.builder import build_peak_index
+        import warnings
+        with o:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")      # the source said so when it was built
+                build_peak_index(o)
+    src_ci = np.asarray(src.cells["cell_idx"], dtype=np.int64)
+    keep = np.arange(src_ci.size) if keep_idx is None else np.asarray(keep_idx, dtype=np.int64)
+    if _table_has_rows(s, "cell_sets"):
+        new_of = {int(c): i for i, c in enumerate(src_ci[keep])}
+        rows = []
+        for name, members in s.execute("SELECT set_name, cell_indices FROM cell_sets"):
+            try:
+                idx = json.loads(members)
+            except (TypeError, ValueError):
+                continue
+            rows.append((name, json.dumps([new_of[int(i)] for i in idx if int(i) in new_of])))
+        with o:
+            o.execute("DELETE FROM cell_sets")
+            o.executemany("INSERT INTO cell_sets (set_name, cell_indices) VALUES (?, ?)", rows)
+    recount_samples(out)
+
+
+def recount_samples(out) -> None:
+    """Each sample's ``n_cells`` counted from the cells table (a sample left
+    without cells keeps its row, with 0); the samples table was copied with the
+    counts of the cells before."""
+    o = out._conn
+    if not _table_has_rows(o, "samples"):
+        return
+    counts = dict(o.execute("SELECT sample_id, COUNT(*) FROM cells WHERE sample_id IS NOT NULL "
+                            "GROUP BY sample_id").fetchall())
+    with o:
+        for (sid,) in o.execute("SELECT sample_id FROM samples").fetchall():
+            o.execute("UPDATE samples SET n_cells = ? WHERE sample_id = ?",
+                      (int(counts.get(sid, 0)), sid))
+
+
+def _table_has_rows(conn, table: str) -> bool:
+    try:
+        return conn.execute(f"SELECT 1 FROM {_q(table)} LIMIT 1").fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
 
 
 def _copy_table_rows(src_conn, dst_conn, table: str) -> int:
@@ -977,16 +1087,29 @@ def _copy_feature_table(src_conn, dst_conn, table: str, batch: int = 50_000,
         dst_conn.commit()                         # ATTACH is refused inside a transaction
         # Attached by path: the connections are opened without URI support. It
         # is only read, by the same SQLite library as the source's connection.
-        dst_conn.execute("ATTACH DATABASE ? AS cytome_src", (str(src_file),))
+        # A store in a folder that cannot be written cannot be attached (SQLite
+        # would make its -wal and -shm there); it is copied through Python.
         try:
-            cur = dst_conn.execute(
-                f"INSERT INTO main.{_q(table)} ({collist}) "
-                f"SELECT {collist} FROM cytome_src.{_q(table)} ORDER BY rowid")
-            n = cur.rowcount
-            dst_conn.commit()
-        finally:
-            dst_conn.execute("DETACH DATABASE cytome_src")
-        return int(n)
+            dst_conn.execute("ATTACH DATABASE ? AS cytome_src", (str(src_file),))
+            attached = True
+        except sqlite3.OperationalError:
+            attached = False
+        if attached:
+            try:
+                cur = dst_conn.execute(
+                    f"INSERT INTO main.{_q(table)} ({collist}) "
+                    f"SELECT {collist} FROM cytome_src.{_q(table)} ORDER BY rowid")
+                n = cur.rowcount
+                dst_conn.commit()
+                return int(n)
+            except sqlite3.OperationalError as exc:
+                if "readonly" not in str(exc).lower() and "read-only" not in str(exc).lower() \
+                        and "unable to open" not in str(exc).lower():
+                    raise
+                # (no ROLLBACK: a subset writes without a journal, where it is undefined)
+                dst_conn.execute(f"DELETE FROM {_q(table)}")
+            finally:
+                dst_conn.execute("DETACH DATABASE cytome_src")
     insert = f"INSERT INTO {_q(table)} ({collist}) VALUES ({','.join('?' * len(names))})"
     cur = src_conn.execute(f"SELECT {collist} FROM {_q(table)} ORDER BY rowid")
     n = 0
@@ -1061,18 +1184,41 @@ def _warn_dropped_categories(ds) -> None:
             )
 
 
+def _has_fragments(ds) -> bool:
+    """Whether the store holds fragments, in chunks or in the legacy per-row
+    tables (decided by the data, not by the manifest's modalities)."""
+    try:
+        if ds._conn.execute("SELECT 1 FROM fragment_chunks LIMIT 1").fetchone():
+            return True
+        return bool(ds._conn.execute(
+            "SELECT 1 FROM fragment_meta WHERE n_fragments > 0 LIMIT 1").fetchone())
+    except sqlite3.OperationalError:
+        return False
+
+
 def _resolve_keep_indices(n_cells: int, mask) -> np.ndarray:
     arr = np.asarray(mask)
     if arr.dtype == bool:
         if arr.shape[0] != n_cells:
             raise ValueError(f"Boolean mask length mismatch: expected {n_cells}, got {arr.shape[0]}")
         return np.where(arr)[0]
-    idx = np.asarray(arr, dtype=np.int64)
+    idx = np.asarray(arr, dtype=np.int64).ravel()
     if idx.size == 0:
         return idx
     if np.any(idx < 0) or np.any(idx >= n_cells):
         raise ValueError("Subset indices out of range")
-    return np.unique(idx)
+    keep = np.unique(idx)
+    # A subset holds each cell once, in the store's order; say so when the
+    # indices asked for something else (it was done silently).
+    if keep.size != idx.size:
+        import warnings
+        warnings.warn(f"subset: {idx.size - keep.size} repeated indices were dropped; a "
+                      f"subset holds each cell once", UserWarning, stacklevel=3)
+    elif np.any(idx[1:] < idx[:-1]):
+        import warnings
+        warnings.warn("subset: the cells are kept in the store's order, not in the order of "
+                      "the indices given", UserWarning, stacklevel=3)
+    return keep
 
 
 def _subset_fragments(ds: CytomeDataset, out: CytomeDataset, keep_idx: np.ndarray) -> None:
@@ -1081,25 +1227,23 @@ def _subset_fragments(ds: CytomeDataset, out: CytomeDataset, keep_idx: np.ndarra
     Reads from source compressed chunks, filters by cell remap, re-sorts by
     start position, then writes compressed BLOBs (~500K fragments per chunk).
     This is ~10-20x faster than per-row INSERT for large datasets.
+
+    A fragment names its cell by ``cell_idx``; the remap sends each kept
+    cell's ``cell_idx`` to its row in the output (the output's ``cell_idx``)
+    by position. It went through the barcode before, and a store holding one
+    barcode in several libraries (any ``merge`` of 10x libraries) gave each
+    kept cell the fragments of every cell sharing its barcode.
     """
-    from cytome.io.compression import compress_blob
     from cytome.io.convert_fragments import _write_block_chunks, _update_fragment_meta
 
     CHUNK_SIZE = 500_000
 
-    # Build vectorized cell_idx remap: src_cell_idx -> out_cell_idx (or -1)
-    max_src_idx = int(ds.n_cells)
+    # src cell_idx -> out row (or -1). The cells' rows are in rowid order, which
+    # is cell_idx order; keep_idx counts rows.
+    src_ci = np.asarray(ds.cells["cell_idx"], dtype=np.int64)
+    max_src_idx = int(src_ci.max()) + 1 if src_ci.size else 0
     remap = np.full(max_src_idx, -1, dtype=np.int32)
-
-    src_cells = ds.cells.to_pandas()
-    keep_cells = out.cells.to_pandas()
-    barcode_to_out = {}
-    for i, b in zip(keep_cells["cell_idx"], keep_cells["barcode"]):
-        barcode_to_out[str(b)] = int(i)
-    for i, b in zip(src_cells["cell_idx"], src_cells["barcode"]):
-        new_idx = barcode_to_out.get(str(b), -1)
-        if new_idx >= 0 and int(i) < max_src_idx:
-            remap[int(i)] = np.int32(new_idx)
+    remap[src_ci[np.asarray(keep_idx, dtype=np.int64)]] = np.arange(len(keep_idx), dtype=np.int32)
 
     # Ensure fragment_chunks table exists
     out._conn.execute(
@@ -1130,14 +1274,25 @@ def _subset_fragments(ds: CytomeDataset, out: CytomeDataset, keep_idx: np.ndarra
         )"""
     )
 
-    frags = ds.ATAC.fragments
+    frags = ds.fragments
     use_chunks = frags.has_compressed_chunks
 
     with out._conn:
         if use_chunks:
-            _subset_from_chunks(frags, out._conn, remap, max_src_idx, CHUNK_SIZE)
+            kept = _subset_from_chunks(frags, out._conn, remap, max_src_idx, CHUNK_SIZE)
         else:
-            _subset_from_rows(frags, out._conn, remap, max_src_idx, CHUNK_SIZE)
+            kept = _subset_from_rows(frags, out._conn, remap, max_src_idx, CHUNK_SIZE)
+    # What was written is what the kept cells hold: a short count is a bug of
+    # this copy (a chromosome left without its chunks or its meta row), which
+    # an analysis would otherwise meet as cells with fewer fragments.
+    written = int(out._conn.execute(
+        "SELECT COALESCE(SUM(n_fragments), 0) FROM fragment_meta").fetchone()[0])
+    stored = int(out._conn.execute(
+        "SELECT COALESCE(SUM(n_fragments), 0) FROM fragment_chunks").fetchone()[0])
+    if not (written == stored == kept):
+        raise RuntimeError(
+            f"subset: the kept cells hold {kept:,} fragments but {stored:,} were written "
+            f"({written:,} recorded); the output is incomplete")
 
 
 def _subset_from_chunks(frags, conn, remap, max_src_idx, chunk_size):
@@ -1155,6 +1310,7 @@ def _subset_from_chunks(frags, conn, remap, max_src_idx, chunk_size):
     """
     from cytome.io.convert_fragments import _write_block_chunks, _update_fragment_meta
 
+    total_kept = 0
     for chrom in frags.chromosomes:
         buf_s, buf_e, buf_c = [], [], []
         buf_n = 0
@@ -1198,7 +1354,8 @@ def _subset_from_chunks(frags, conn, remap, max_src_idx, chunk_size):
                 buf_n = cs.size - n_full
 
         if not sorted_ok:
-            _subset_chromosome_sorted(frags, conn, chrom, remap, max_src_idx, chunk_size)
+            total_kept += _subset_chromosome_sorted(frags, conn, chrom, remap, max_src_idx,
+                                                    chunk_size)
             continue
 
         # flush the remainder (< chunk_size)
@@ -1212,6 +1369,8 @@ def _subset_from_chunks(frags, conn, remap, max_src_idx, chunk_size):
             n_keep_total += cs.size
         if n_keep_total > 0:
             _update_fragment_meta(conn, chrom, n_keep_total, max_end=max_end)
+        total_kept += n_keep_total
+    return total_kept
 
 
 def _subset_chromosome_sorted(frags, conn, chrom, remap, max_src_idx, chunk_size):
@@ -1235,14 +1394,16 @@ def _subset_chromosome_sorted(frags, conn, chrom, remap, max_src_idx, chunk_size
         keep = mapped >= 0
         if keep.any():
             all_s.append(src_s[keep]); all_e.append(src_e[keep]); all_c.append(mapped[keep])
+    conn.execute("DELETE FROM fragment_meta WHERE chrom = ?", (chrom,))
     if not all_s:
-        return
+        return 0
     starts = np.concatenate(all_s); ends = np.concatenate(all_e); cells = np.concatenate(all_c)
     order = np.argsort(starts, kind="mergesort")
     starts, ends, cells = starts[order].astype(np.int32), ends[order].astype(np.int32), cells[order].astype(np.int32)
     _write_block_chunks(conn, chrom, starts, ends, cells, chunk_size=chunk_size,
                         compression="lz4", compression_level=1, chunk_idx_start=0, encoding=1)
     _update_fragment_meta(conn, chrom, len(starts), max_end=int(ends.max()))
+    return int(len(starts))
 
 
 def _subset_from_rows(frags, conn, remap, max_src_idx, chunk_size):
@@ -1260,6 +1421,7 @@ def _subset_from_rows(frags, conn, remap, max_src_idx, chunk_size):
     )
     from cytome.io.convert_fragments import _write_block_chunks, _update_fragment_meta
 
+    total_kept = 0
     for chrom, frag in frags.iter_chromosomes():
         cell_idx = frag["cell_idx"]
         valid = cell_idx < max_src_idx
@@ -1288,3 +1450,5 @@ def _subset_from_rows(frags, conn, remap, max_src_idx, chunk_size):
             encoding=1,
         )
         _update_fragment_meta(conn, chrom, n_keep, max_end=int(ends.max()))
+        total_kept += n_keep
+    return total_kept

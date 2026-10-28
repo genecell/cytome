@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 import sqlite3
 
 from cytome.io.compression import decompress_blob, decode_starts, decode_ends, decode_lengths
@@ -16,7 +17,19 @@ from cytome.io.convert_fragments import export_fragments, export_fragments_by_gr
 
 
 class FragmentStore:
-    """Access fragment tables and coordinate queries."""
+    """Access fragment tables and coordinate queries.
+
+    The queries return ``start``, ``end_`` and ``cell_idx`` as int64 arrays,
+    and ``dup_count`` -- how many times the fragments file the store was
+    imported from saw each fragment -- as a pandas nullable integer array
+    (``Int64``). Fragments stored in compressed chunks (``fragment_chunks``,
+    which PIASO's importer, the streaming import and every ``subset`` write)
+    keep each fragment once and record no such count, so ``dup_count`` is
+    missing (``pd.NA``) for them; it read 1, which looked like a count. The
+    older per-chromosome tables (``fragments_<chrom>``) give the counts they
+    hold. An exported fragments file has 1 in that column for chunked
+    fragments, as the 10x format needs an integer there (:meth:`export`).
+    """
 
     def __init__(self, conn: sqlite3.Connection, dataset) -> None:
         self._conn = conn
@@ -72,7 +85,12 @@ class FragmentStore:
         barcode_filter: Optional[Sequence[str]] = None,
         region: Optional[Tuple[str, int, int]] = None,
     ) -> Path:
-        """Export fragments to disk."""
+        """Export fragments to a 10x-format file (``chrom, start, end, barcode, count``).
+
+        The fifth column is the stored duplicate count for fragments of the
+        older per-chromosome tables, and 1 for fragments stored in compressed
+        chunks, which record none: the format needs an integer there.
+        """
         return export_fragments(
             self._conn,
             output_path=output,
@@ -238,7 +256,7 @@ class FragmentStore:
                     "start": starts.astype(np.int64),
                     "end_": ends.astype(np.int64),
                     "cell_idx": cells.astype(np.int64),
-                    "dup_count": np.ones(len(starts), dtype=np.int64),
+                    "dup_count": _not_recorded(len(starts)),
                 }
         else:
             for chrom in self.chromosomes:
@@ -266,35 +284,44 @@ class FragmentStore:
                 tuple(int(i) for i in cell_indices),
             ).fetchall()
             if rows:
-                return [(int(r[0]), int(r[1]), int(r[2]), int(r[3]), chrom) for r in rows]
+                return [(int(r[0]), int(r[1]), int(r[2]),
+                         None if r[3] is None else int(r[3]), chrom) for r in rows]
         except sqlite3.OperationalError:
             pass
 
-        # Fallback: scan compressed chunks (subset outputs with empty per-row tables)
+        # Fallback: scan compressed chunks (subset outputs with empty per-row
+        # tables), which record no duplicate count: None, read as missing
         cell_arr = np.array(list(set(int(i) for i in cell_indices)), dtype=np.int32)
         results = []
         for starts, ends, cells in self.iter_chromosome_chunks(chrom):
             mask = np.isin(cells, cell_arr)
             if mask.any():
                 for s, e, c in zip(starts[mask], ends[mask], cells[mask]):
-                    results.append((int(s), int(e), int(c), 1, chrom))
+                    results.append((int(s), int(e), int(c), None, chrom))
         results.sort(key=lambda x: x[0])
         return results
 
 
+def _not_recorded(n: int) -> pd.arrays.IntegerArray:
+    """``dup_count`` for ``n`` fragments of compressed chunks: missing, as none is recorded."""
+    return pd.arrays.IntegerArray(np.zeros(n, dtype=np.int64), np.ones(n, dtype=bool))
+
+
 def _rows_to_fragment_dict(rows) -> Dict[str, np.ndarray]:
+    """Rows ``(start, end, cell_idx, dup_count)`` as arrays; a ``dup_count`` of
+    None (fragments of compressed chunks) is missing in the ``Int64`` array."""
     if not rows:
         empty_i = np.array([], dtype=np.int64)
         return {
             "start": empty_i,
-            "end_": empty_i,
-            "cell_idx": empty_i,
-            "dup_count": empty_i,
+            "end_": empty_i.copy(),
+            "cell_idx": empty_i.copy(),
+            "dup_count": pd.array([], dtype="Int64"),
         }
     start = np.array([r[0] for r in rows], dtype=np.int64)
     end_ = np.array([r[1] for r in rows], dtype=np.int64)
     cell_idx = np.array([r[2] for r in rows], dtype=np.int64)
-    dup_count = np.array([r[3] for r in rows], dtype=np.int64)
+    dup_count = pd.array([r[3] for r in rows], dtype="Int64")
     return {
         "start": start,
         "end_": end_,

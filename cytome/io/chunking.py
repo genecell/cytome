@@ -153,12 +153,15 @@ def _process_chunk(
     """
     Read one chunk file and convert to CSR matrix.
 
-    ``csr_matrix((data, (rows, cols)), shape=...)`` automatically sums
-    duplicate ``(row, col)`` entries — multiple distinct fragments from the
-    same cell overlapping the same feature are summed to give the count of
-    distinct overlapping fragments.
+    Each hit is one ``(row, col)`` pair, so several fragments of one cell in
+    one feature are several pairs. ``csr_matrix((data, (rows, cols)))`` keeps
+    them as separate entries (scipy 1.13 does not sum duplicates at
+    construction), so they are summed here: one stored entry per (cell,
+    feature), holding the number of overlapping fragments. Before that, ``nnz``
+    counted hits, ``binary`` clipped each duplicate to 1 and left their sum,
+    and a transform applied per stored entry (log1p in TF-IDF) was wrong.
 
-    For *binary* mode the result is clipped to 0/1 afterwards.
+    For *binary* mode the summed counts are clipped to 0/1.
     """
     if not os.path.exists(chunk_path) or os.path.getsize(chunk_path) == 0:
         return csr_matrix((chunk_rows, n_cols), dtype=np.float32)
@@ -171,6 +174,7 @@ def _process_chunk(
     chunk_csr = csr_matrix(
         (vals, (rows, cols)), shape=(chunk_rows, n_cols), dtype=np.float32,
     )
+    chunk_csr.sum_duplicates()          # also sorts the indices of each row
 
     if binary:
         chunk_csr.data = np.minimum(chunk_csr.data, 1.0)
@@ -191,9 +195,17 @@ def _assemble_csr(
     Concatenate CSR chunks into a single matrix by splicing arrays.
 
     More efficient than ``scipy.sparse.vstack`` (no intermediate COO).
+
+    Each chunk is brought to canonical form first (duplicate entries summed,
+    indices sorted), so the result stores one entry per (row, column) whatever
+    the caller built its chunks with.
     """
     if not chunks:
         return csr_matrix((n_rows, n_cols), dtype=np.float32)
+
+    for chunk in chunks:
+        if not chunk.has_canonical_format:
+            chunk.sum_duplicates()
 
     total_nnz = sum(c.nnz for c in chunks)
     if total_nnz == 0:
@@ -331,11 +343,9 @@ def _write_chunks_to_cytome(
         writer.write_chunk(chunk_csr, row_offset=chunk_id * chunk_size)
         del chunk_csr
 
-    # Write entity metadata BEFORE finalize() so that if the process is
-    # interrupted between finalize (which commits matrix_meta) and flush,
-    # the entity table is already consistent.  If crash after flush but
-    # before finalize: matrix_meta absent → clean "not found" error.
-    # If crash after finalize: both committed → consistent.
+    # The feature (and cell) tables are flushed into the writer's transaction,
+    # and finalize() commits them with the chunks and matrix_meta: a process
+    # stopped before it leaves the old layer and tables as they were.
 
     # Write cell metadata if not already present
     if ds.n_cells == 0:
@@ -351,8 +361,4 @@ def _write_chunks_to_cytome(
         ds.set_entity(col_entity, feat_df)
 
     ds.flush()
-
-    # Finalize writes matrix_meta and commits — the last step, so a crash
-    # before this leaves no matrix_meta (clean error) rather than a
-    # matrix_meta/entity mismatch (cryptic error).
     writer.finalize()

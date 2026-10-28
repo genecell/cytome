@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from cytome.utils.genome import chrom_to_int
 
 
-FragmentHit = Tuple[int, int, int, int]
+# (start, end, cell_idx, dup_count); dup_count is None for fragments of compressed
+# chunks, which record no duplicate count
+FragmentHit = Tuple[int, int, int, Optional[int]]
 PeakHit = Tuple[int, str, int, int]
+
+
+def _count(v) -> Optional[int]:
+    """A stored duplicate count; a NULL one stays missing."""
+    return None if v is None else int(v)
 
 
 def create_fragment_rtree(conn: sqlite3.Connection, chrom: str) -> None:
@@ -49,7 +56,8 @@ def query_fragment_rtree(
     Tries three strategies in order:
     1. R-tree index join with per-row table (fastest)
     2. Linear scan of per-row table (no R-tree)
-    3. Compressed chunk scan (for subset/chunk-only datasets)
+    3. Compressed chunk scan (for subset/chunk-only datasets), whose fragments
+       record no duplicate count: ``dup_count`` is None for them
 
     Falls through to chunk scan when per-row tables exist but are empty
     (common for subset outputs where schema creates empty tables).
@@ -61,13 +69,13 @@ def query_fragment_rtree(
             SELECT f.start, f.end_, f.cell_idx, f.dup_count
             FROM fragments_{chrom} AS f
             INNER JOIN fragments_{chrom}_rtree AS r ON f.rowid = r.id
-            WHERE r.max_start < ? AND r.min_end > ?
+            WHERE r.min_start < ? AND r.max_end > ? AND f.start < ? AND f.end_ > ?
             ORDER BY f.start
             """,
-            (end, start),
+            (end, start, end, start),
         ).fetchall()
         if rows:
-            return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rows]
+            return [(int(r[0]), int(r[1]), int(r[2]), _count(r[3])) for r in rows]
     except sqlite3.OperationalError:
         pass
 
@@ -83,7 +91,7 @@ def query_fragment_rtree(
             (end, start),
         ).fetchall()
         if rows:
-            return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rows]
+            return [(int(r[0]), int(r[1]), int(r[2]), _count(r[3])) for r in rows]
     except sqlite3.OperationalError:
         pass
 
@@ -99,27 +107,29 @@ def _query_region_from_chunks(
 ) -> List[FragmentHit]:
     """Scan compressed fragment_chunks for overlapping fragments.
 
-    Uses min_start per chunk to skip non-overlapping chunks.
+    Uses min_start per chunk to skip non-overlapping chunks. Chunks keep each
+    fragment once and record no duplicate count, so ``dup_count`` is None.
     Within each chunk, fragments are sorted by start position.
     """
     import numpy as np
     from cytome.io.compression import decompress_blob, decode_starts, decode_ends
 
     try:
+        # Chunks whose first start is at or past the query's end are skipped by
+        # the (chrom, min_start) index, and the rest are read one at a time
+        # through the cursor: fetchall() held every blob of the chromosome.
         rows = conn.execute(
             "SELECT starts_blob, ends_blob, cell_idx_blob, compression, "
             "COALESCE(encoding, 0) as encoding, min_start "
-            "FROM fragment_chunks WHERE chrom = ? ORDER BY chunk_idx",
-            (chrom,),
-        ).fetchall()
+            "FROM fragment_chunks WHERE chrom = ? AND (min_start IS NULL OR min_start < ?) "
+            "ORDER BY chunk_idx",
+            (chrom, int(end)),
+        )
     except sqlite3.OperationalError:
         return []
 
     hits = []
     for starts_b, ends_b, cells_b, comp, enc, min_start in rows:
-        # Skip chunk if all starts are past query end
-        if min_start is not None and min_start >= end:
-            continue
 
         starts = decode_starts(starts_b, comp, enc)
         ends = decode_ends(ends_b, comp, starts, enc)
@@ -129,7 +139,7 @@ def _query_region_from_chunks(
         mask = (starts < end) & (ends > start)
         if mask.any():
             for s, e, c in zip(starts[mask], ends[mask], cells[mask]):
-                hits.append((int(s), int(e), int(c), 1))
+                hits.append((int(s), int(e), int(c), None))
 
     hits.sort(key=lambda x: x[0])
     return hits
@@ -191,7 +201,14 @@ def query_peak_rtree(
     start: int,
     end: int,
 ) -> List[PeakHit]:
-    """Query peaks overlapping a region."""
+    """Query peaks overlapping a region.
+
+    An R*-tree keeps 32-bit float bounds, rounded outward: at 200 Mb a bound
+    moves by up to 32 bp. The tree is asked for the bounds that can only widen
+    the answer (``min_start`` below the end, ``max_end`` above the start), and
+    the peaks' exact coordinates decide; the old test on ``max_start`` and
+    ``min_end``, rounded the other way, missed peaks at a region's edge.
+    """
     chr_i = chrom_to_int(chrom)
     try:
         rows = conn.execute(
@@ -199,10 +216,11 @@ def query_peak_rtree(
             SELECT p.peak_idx, p.chr, p.start, p.end_
             FROM peaks AS p
             INNER JOIN peaks_rtree AS r ON p.peak_idx = r.id
-            WHERE r.min_chr = ? AND r.max_start < ? AND r.min_end > ?
+            WHERE r.min_chr = ? AND r.min_start < ? AND r.max_end > ?
+              AND p.start < ? AND p.end_ > ?
             ORDER BY p.start
             """,
-            (chr_i, end, start),
+            (chr_i, end, start, end, start),
         ).fetchall()
     except sqlite3.OperationalError:
         rows = conn.execute(

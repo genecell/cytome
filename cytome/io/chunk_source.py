@@ -114,6 +114,11 @@ class ChunkSource:
         self._conns: list = []
         self._lock = threading.Lock()
         self._pending = None
+        #: bumped by release_connections(): a reader thread's connection of an
+        #: older generation is closed and opened again on its next read
+        self._gen = 0
+        from cytome.core import _handles
+        _handles.track_source(self)
 
     # -- protocol ---------------------------------------------------------
     def meta(self):
@@ -147,22 +152,33 @@ class ChunkSource:
             self._pending = ((layout, tuple(nxt)), self._executor().submit(self._read, layout, nxt))
         return got
 
-    def close(self) -> None:
+    def release_connections(self) -> None:
+        """Close the readers' connections (they open again on the next fetch).
+
+        :func:`cytome.released` calls it, so a program that must have the file
+        to itself does not meet this source's SQLite handles: they were left
+        open across it before.
+        """
         if self._pending is not None:
             try:
                 self._pending[1].result()
             except Exception:
                 pass
             self._pending = None
-        if self._pool is not None:
-            self._pool.shutdown(wait=True)
-            self._pool = None
-        for c in self._conns:
+        with self._lock:
+            conns, self._conns = self._conns, []
+            self._gen += 1
+        for c in conns:
             try:
                 c.close()
             except Exception:
                 pass
-        self._conns.clear()
+
+    def close(self) -> None:
+        self.release_connections()
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
         self._cache.clear()
         self.cached_bytes = 0
 
@@ -183,6 +199,8 @@ class ChunkSource:
 
     def _conn(self):
         c = getattr(self._local, "conn", None)
+        if c is not None and getattr(self._local, "gen", None) != self._gen:
+            c = None                       # closed by release_connections()
         if c is None:
             import sqlite3
             if self._uri is not None:
@@ -195,6 +213,7 @@ class ChunkSource:
                     c = sqlite3.connect(self.path, check_same_thread=False)
             c.execute("PRAGMA busy_timeout=60000")
             self._local.conn = c
+            self._local.gen = self._gen
             with self._lock:
                 self._conns.append(c)
         return c
@@ -267,8 +286,11 @@ def released(target):
     @contextmanager
     def _cm():
         path = getattr(target, "path", target)
+        for source in _handles.sources_on(path):
+            source.release_connections()
         held = _handles.open_on(path)
         for ds in held:
+            ds._rollback_open_writers()
             ds.flush()
             close_database(ds._conn)
         try:

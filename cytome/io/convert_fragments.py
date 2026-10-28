@@ -116,6 +116,7 @@ def export_fragments(
     format: str = "10x",
     barcode_filter: Optional[Iterable[str]] = None,
     region: Optional[Tuple[str, int, int]] = None,
+    cell_filter: Optional[Iterable[int]] = None,
 ) -> Path:
     """Export fragments to 10x-format file.
 
@@ -130,9 +131,19 @@ def export_fragments(
     format
         Output format. Only ``10x`` is supported.
     barcode_filter
-        Optional barcode whitelist.
+        Optional barcode whitelist. In a store merged from several libraries a
+        barcode can name one cell in each; ``cell_filter`` names cells.
     region
         Optional ``(chrom, start, end)`` region constraint.
+    cell_filter
+        Optional ``cell_idx`` whitelist.
+
+    The fifth column is the duplicate count of the fragments file the store
+    was imported from, where the store kept it (the older per-chromosome
+    tables). Compressed chunks keep each fragment once and record no count:
+    their fragments are written with 1, because the 10x format needs an
+    integer there, while the readers (``ds.fragments``) give them a missing
+    ``dup_count``.
     """
     if format != "10x":
         raise ValueError("Only format='10x' is supported")
@@ -140,12 +151,14 @@ def export_fragments(
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     barcode_filter_set = set(barcode_filter) if barcode_filter is not None else None
+    cell_filter_set = ({int(c) for c in cell_filter} if cell_filter is not None else None)
 
     try:
         import pysam  # type: ignore
 
         with pysam.BGZFile(str(out), "wb") as handle:
-            for line in _iter_export_lines(conn, cell_idx_to_name, barcode_filter_set, region):
+            for line in _iter_export_lines(conn, cell_idx_to_name, barcode_filter_set, region,
+                                           cell_filter_set):
                 handle.write(line.encode())
 
         try:
@@ -154,7 +167,8 @@ def export_fragments(
             logger.warning("Failed to build tabix index for %s: %s", out, exc)
     except ImportError:
         with gzip.open(out, "wt") as handle:
-            for line in _iter_export_lines(conn, cell_idx_to_name, barcode_filter_set, region):
+            for line in _iter_export_lines(conn, cell_idx_to_name, barcode_filter_set, region,
+                                           cell_filter_set):
                 handle.write(line)
 
     return out
@@ -188,10 +202,12 @@ def export_fragments_by_group(
     out_paths: List[Path] = []
     for value in groupby_values:
         rows = conn.execute(
-            f"SELECT cell_idx, barcode FROM {cells_table} WHERE {groupby_column} = ?",
+            f'SELECT cell_idx FROM {cells_table} WHERE "{groupby_column}" = ?',
             (value,),
         ).fetchall()
-        barcodes = [r[1] for r in rows if r[1] is not None]
+        # by cell, not by barcode: in a merged store a barcode names one cell
+        # per library, and filtering by it exported other groups' cells too
+        cells = [int(r[0]) for r in rows]
         out = output_root / f"{groupby_column}_{_safe_name(str(value))}.fragments.tsv.gz"
         out_paths.append(
             export_fragments(
@@ -199,8 +215,8 @@ def export_fragments_by_group(
                 out,
                 cell_idx_to_name=cell_idx_to_name,
                 format=format,
-                barcode_filter=barcodes,
                 region=None,
+                cell_filter=cells,
             )
         )
     return out_paths
@@ -211,6 +227,7 @@ def _iter_export_lines(
     cell_idx_to_name: Dict[int, str],
     barcode_filter_set: Optional[set[str]],
     region: Optional[Tuple[str, int, int]],
+    cell_filter_set: Optional[set[int]] = None,
 ):
     chroms = _chromosomes_with_data(conn)
     if region is not None:
@@ -233,12 +250,16 @@ def _iter_export_lines(
             ).fetchall()
 
         for start, end, cell_idx, dup_count in rows:
+            if cell_filter_set is not None and int(cell_idx) not in cell_filter_set:
+                continue
             barcode = cell_idx_to_name.get(int(cell_idx))
             if barcode is None:
                 continue
             if barcode_filter_set is not None and barcode not in barcode_filter_set:
                 continue
-            yield f"{chrom}\t{int(start)}\t{int(end)}\t{barcode}\t{int(dup_count)}\n"
+            # the 10x format needs an integer: 1 for chunked fragments, which record none
+            count = 1 if dup_count is None else int(dup_count)
+            yield f"{chrom}\t{int(start)}\t{int(end)}\t{barcode}\t{count}\n"
 
 
 def _iter_fragment_lines(path: Path):
@@ -404,7 +425,9 @@ def import_fragments_streaming(
         Maximum fragments per block before flushing. Controls peak RAM.
         Default 50M = ~700 MB peak working set.
     chr_filter
-        Optional set of chromosomes to keep. If None, keeps chr1-22 + chrX/Y.
+        Set of chromosomes to keep. If None, keeps chr1-22 + chrX/Y; ``"all"``
+        keeps every chromosome. Fragments skipped by the filter are reported
+        with a warning (they were dropped silently).
     verbose
         Print progress.
     genome
@@ -425,8 +448,10 @@ def import_fragments_streaming(
         ``{chrom: n_fragments}`` per chromosome.
     """
     path = Path(fragments_path)
+    keep_all = isinstance(chr_filter, str) and chr_filter == "all"
     if chr_filter is None:
         chr_filter = set(f"chr{i}" for i in range(1, 23)) | {"chrX", "chrY"}
+    dropped_chroms: set = set()
 
     # Enable WAL mode for faster writes during import
     _prev_journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
@@ -603,11 +628,15 @@ def import_fragments_streaming(
             chunk_df['cell_idx'] = chunk_df['cell_idx'].astype(np.int32)
 
             # Filter chromosomes
-            n_before = len(chunk_df)
-            chunk_df = chunk_df[chunk_df['chrom'].isin(chr_filter)]
-            n_dropped_chr += n_before - len(chunk_df)
-            if len(chunk_df) == 0:
-                continue
+            if not keep_all:
+                inside = chunk_df['chrom'].isin(chr_filter)
+                if not inside.all():
+                    n_dropped_chr += int((~inside).sum())
+                    if len(dropped_chroms) < 50:
+                        dropped_chroms.update(chunk_df.loc[~inside, 'chrom'].unique().tolist())
+                    chunk_df = chunk_df[inside]
+                if len(chunk_df) == 0:
+                    continue
 
             # Group by chromosome and accumulate
             for chrom, grp in chunk_df.groupby('chrom', sort=False):
@@ -664,6 +693,12 @@ def import_fragments_streaming(
                 )
         conn.commit()
 
+    if n_dropped_chr:
+        import warnings
+        warnings.warn(
+            f"import_fragments_streaming: {n_dropped_chr:,} fragments on chromosomes outside "
+            f"the filter were skipped (e.g. {sorted(dropped_chroms)[:5]}); pass "
+            f"chr_filter='all' (keep_chroms='all') to keep them.", stacklevel=2)
     if verbose:
         total = sum(stats.values())
         print(f"  [fragments] Imported {total:,} fragments across "

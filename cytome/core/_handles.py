@@ -23,6 +23,8 @@ import weakref
 
 _USERS: dict[int, "weakref.WeakSet"] = {}
 _OPEN: "weakref.WeakSet" = weakref.WeakSet()
+#: chunk sources (cytome.ChunkSource) with reader connections of their own
+_SOURCES: "weakref.WeakSet" = weakref.WeakSet()
 
 
 def bind(obj, conn) -> None:
@@ -35,12 +37,33 @@ def bind(obj, conn) -> None:
 
 def rebind(old, new) -> None:
     """Point every live accessor of ``old`` at ``new``."""
-    users = _USERS.pop(id(old), None)
+    attach(_USERS.pop(id(old), None), new)
+
+
+def detach(conn):
+    """Remove and return the accessors of ``conn`` (a dataset closing for now
+    keeps them, to hand them to the connection it reopens)."""
+    return _USERS.pop(id(conn), None)
+
+
+def attach(users, new) -> None:
+    """Point the accessors ``users`` (from :func:`detach`) at ``new``.
+
+    An accessor with a ``_rebound`` method is told, so it can read again what
+    it cached from the old connection: a kept measurement layer's shape is
+    stale after ``filter_cells`` (300 rows read back for a store of 100).
+    """
     if not users:
         return
     for obj in list(users):
         obj._conn = new
         bind(obj, new)
+        hook = getattr(obj, "_rebound", None)
+        if hook is not None:
+            try:
+                hook()
+            except Exception:
+                pass
 
 
 def forget(conn) -> None:
@@ -59,6 +82,23 @@ def open_on(path) -> list:
         try:
             if os.path.realpath(str(ds.path)) == target and not ds.is_closed:
                 out.append(ds)
+        except Exception:
+            pass
+    return out
+
+
+def track_source(source) -> None:
+    _SOURCES.add(source)
+
+
+def sources_on(path) -> list:
+    """The chunk sources of this process reading ``path``."""
+    target = os.path.realpath(str(path))
+    out = []
+    for src in list(_SOURCES):
+        try:
+            if os.path.realpath(str(src.path)) == target:
+                out.append(src)
         except Exception:
             pass
     return out

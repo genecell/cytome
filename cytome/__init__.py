@@ -74,7 +74,7 @@ __all__ = [
 # The manifest's writer_version reads THIS, not the installed distribution
 # metadata: a source tree run against a stale editable install would otherwise
 # stamp files with the version of code that did not write them.
-__version__ = "0.3.8"
+__version__ = "0.3.9"
 
 
 def import_gtf(ds, gtf_path, **kwargs):
@@ -159,7 +159,7 @@ def create(path: str | Path, force: bool = False) -> CytomeDataset:
 
 def from_anndata(adata, modality: str = "RNA", output: str | Path | None = None,
                  force: bool = False, counts_layer: str | None = None,
-                 main_layer_name: str | None = None) -> CytomeDataset:
+                 main_layer_name: str | None = None, **kwargs) -> CytomeDataset:
     """Create a Cytome dataset from an in-memory AnnData object.
 
     Use this when you already have an ``AnnData`` instance (e.g. just
@@ -204,7 +204,7 @@ def from_anndata(adata, modality: str = "RNA", output: str | Path | None = None,
     """
     from cytome.io.convert_anndata import from_anndata as _impl
     return _impl(adata=adata, modality=modality, output=output, force=force,
-                 counts_layer=counts_layer, main_layer_name=main_layer_name)
+                 counts_layer=counts_layer, main_layer_name=main_layer_name, **kwargs)
 
 
 def from_h5ad(
@@ -358,17 +358,22 @@ def to_anndata(
     layer: str | None = None,
     include_embeddings: bool = True,
     cell_mask=None,
+    layers=None,
+    include_cross_modality_embeddings: bool = True,
 ):
     """Convert a Cytome dataset to AnnData (function form).
 
     Equivalent to ``ds.to_anndata(...)`` (the method form). Modality
     routes to its own var entity table: RNA → ``genes``,
-    GA → ``GA_genes``, ATAC → ``peaks``, tiles → ``tiles``.
+    GA → ``GA_genes``, ATAC → ``peaks``, tiles → ``tiles``. ``layers``
+    chooses the other matrices loaded as layers (``None`` all, a list, ``[]``
+    none).
     """
     from cytome.io.convert_anndata import to_anndata as _impl
     return _impl(
         ds=ds, modality=modality, layer=layer,
-        include_embeddings=include_embeddings, cell_mask=cell_mask,
+        include_embeddings=include_embeddings, cell_mask=cell_mask, layers=layers,
+        include_cross_modality_embeddings=include_cross_modality_embeddings,
     )
 
 
@@ -418,7 +423,8 @@ def from_cellranger(path, output: str | Path, sample_name=None,
 
 def from_10x_h5(path: str | Path, output: str | Path, sample_name: str | None = None,
                 build_index: bool = True, modalities: str = "both",
-                force: bool = False, batch_size: int | None = None):
+                force: bool = False, batch_size: int | None = None,
+                keep_chroms: str = "all"):
     """Create a Cytome dataset directly from a CellRanger ``.h5`` (no AnnData).
 
     Gene Expression features → RNA ``genes`` (``gene_id`` = Ensembl id, ``symbol``
@@ -432,7 +438,7 @@ def from_10x_h5(path: str | Path, output: str | Path, sample_name: str | None = 
     from cytome.io.convert_cellranger import from_10x_h5 as _impl
     return _impl(path=path, output=output, sample_name=sample_name,
                  build_index=build_index, modalities=modalities, force=force,
-                 batch_size=batch_size)
+                 batch_size=batch_size, keep_chroms=keep_chroms)
 
 
 def from_cellranger_arc(
@@ -461,7 +467,7 @@ def from_cellranger_arc(
 def merge(
     inputs,
     output,
-    batch_key: str = "sample_id",
+    batch_key: str = "batch",
     batch_labels=None,
     gene_strategy: str = "union",
     peak_strategy: str = "union",
@@ -491,8 +497,12 @@ def merge(
         Output ``.cytome`` path. By default (``force=False``) merge raises
         :class:`FileExistsError` if it already exists; pass ``force=True`` to
         overwrite.
-    batch_key : str, default ``"sample_id"``
+    batch_key : str, default ``"batch"``
         Name of the ``cells`` column written to record each cell's source input.
+        A cell whose ``sample_id`` is empty also gets its input's label there; a
+        cell's own ``sample_id`` is kept (the default was ``"sample_id"`` until
+        0.3.8, which replaced it). ``batch_key="sample_id"`` writes the label as
+        every cell's sample.
     batch_labels : sequence of str, optional
         One label per input, written into ``cells[batch_key]``. Defaults to each
         input's file stem (``Path(ds.path).stem``).
@@ -507,7 +517,9 @@ def merge(
         input (NaN where absent); ``"shared"`` keeps only columns common to all
         inputs; a list keeps exactly those columns (silently ignoring missing ones).
     include_embeddings : bool, default ``False``
-        Reserved — per-input embeddings are not transferred (recompute on the merge).
+        Concatenate each cell embedding over the inputs (NaN rows for an input
+        without it). Embeddings computed per input are not comparable across
+        inputs; recompute them on the merge when they should be.
     include_fragments : bool, default ``True``
         Remap and stream each input's fragments into the merged ``fragment_chunks``.
         Set ``False`` to produce a counts-only merge (faster, smaller).
@@ -589,7 +601,17 @@ def from_barcodes(
     if sample_id:
         bc_df["sample_id"] = sample_id
 
-    ds = create(output, force=force)
-    ds.set_entity("cells", bc_df)
-    ds.flush()
-    return ds
+    from cytome.io._atomic import building
+    with building(output, force) as partial:
+        ds = create(partial, force=True)
+        try:
+            ds.set_entity("cells", bc_df)
+            ds.flush()
+        except BaseException:
+            try:
+                ds.close()
+            except Exception:
+                pass
+            raise
+        ds.close()
+    return open(output)

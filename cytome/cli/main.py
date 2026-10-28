@@ -34,8 +34,9 @@ def main() -> None:
     p_merge = sub.add_parser("merge", help="Merge .cytome files")
     p_merge.add_argument("inputs", nargs="+")
     p_merge.add_argument("-o", "--output", required=True)
-    p_merge.add_argument("--batch-key", default="sample_id")
-    p_merge.add_argument("--genes", default="intersection", choices=["intersection", "union"])
+    p_merge.add_argument("--batch-key", default="batch")
+    # the API's default (it was "intersection" here, "union" there)
+    p_merge.add_argument("--genes", default="union", choices=["intersection", "union"])
     p_merge.add_argument("--no-fragments", action="store_true")
 
     p_subset = sub.add_parser("subset", help="Subset cells")
@@ -55,6 +56,9 @@ def main() -> None:
 
     p_val = sub.add_parser("validate", help="Validate dataset")
     p_val.add_argument("path")
+    p_val.add_argument("--quick", action="store_true",
+                       help="skip the checks that read the whole file (SQLite's integrity "
+                            "check, every metadata value): hours on a large store")
 
     p_prov = sub.add_parser("provenance", help="Show provenance")
     p_prov.add_argument("path")
@@ -88,6 +92,7 @@ def main() -> None:
     p_init.add_argument("--barcodes", required=True, help="Barcodes file (one per line or TSV)")
     p_init.add_argument("-o", "--output", required=True, help="Output .cytome path")
     p_init.add_argument("--sample-id", default=None, help="Sample identifier")
+    p_init.add_argument("--force", action="store_true", help="overwrite an existing output")
 
     # Note: bulk fragment import lives in PIASO now (piaso.pp.importFragments /
     # the cytome-import-fragments binary built from PIASO's Rust crate). cytome
@@ -158,7 +163,7 @@ def _cmd_convert(args: argparse.Namespace) -> None:
         ds = cytome.from_anndata(adata, modality=args.modality, output=str(out))
         ds.close()
     elif inp.suffix == ".cytome" and out.suffix == ".h5ad":
-        ds = cytome.open(inp)
+        ds = cytome.open(inp, mode="r")
         adata = ds.to_anndata(modality=args.modality)
         adata.write_h5ad(str(out))
         ds.close()
@@ -169,7 +174,7 @@ def _cmd_convert(args: argparse.Namespace) -> None:
         ds = cytome.from_mudata(mdata, output=str(out))
         ds.close()
     elif inp.suffix == ".cytome" and out.suffix == ".h5mu":
-        ds = cytome.open(inp)
+        ds = cytome.open(inp, mode="r")
         mdata = ds.to_mudata()
         mdata.write_h5mu(str(out))
         ds.close()
@@ -179,7 +184,9 @@ def _cmd_convert(args: argparse.Namespace) -> None:
 
 
 def _cmd_info(args: argparse.Namespace) -> None:
-    ds = cytome.open(args.path)
+    # read only: a command that reads must not change the file (an r+ open
+    # adds this version's tables to an older store, and its checksum changes)
+    ds = cytome.open(args.path, mode="r")
     if args.json:
         print(json.dumps(ds.to_info_dict(), indent=2, default=str))
     elif args.provenance:
@@ -202,10 +209,10 @@ def _cmd_merge(args: argparse.Namespace) -> None:
 
 
 def _cmd_subset(args: argparse.Namespace) -> None:
-    ds = cytome.open(args.input)
+    ds = cytome.open(args.input, mode="r")
     if args.query:
-        selected = ds.cells.query(args.query)
-        keep = selected["cell_idx"].to_numpy(dtype=np.int64)
+        # rows, not cell_idx values: subset takes positions
+        keep = np.flatnonzero(ds.cells.query_mask(args.query))
     elif args.barcodes:
         with open(args.barcodes, "rt") as f:
             wanted = {line.strip() for line in f if line.strip()}
@@ -214,9 +221,17 @@ def _cmd_subset(args: argparse.Namespace) -> None:
     elif args.sample:
         wanted = set(args.sample.split(","))
         sample_id = ds.cells["sample_id"]
-        keep = np.where(np.isin(sample_id, list(wanted)))[0]
+        if all(v is None or v == "" for v in sample_id):
+            ds.close()
+            raise ValueError(
+                f"{args.input} has no sample_id for any cell, so --sample selects nothing; "
+                f"select by --query on the column that holds the samples")
+        keep = np.where(np.isin(sample_id.astype(str), list(wanted)))[0]
     else:
         raise ValueError("Specify one of --query, --barcodes, or --sample")
+    if keep.size == 0:
+        ds.close()
+        raise ValueError("the selection holds no cell; nothing is written")
     out = ds.subset(keep, output=args.output)
     out.close()
     ds.close()
@@ -224,7 +239,7 @@ def _cmd_subset(args: argparse.Namespace) -> None:
 
 
 def _cmd_downsample(args: argparse.Namespace) -> None:
-    ds = cytome.open(args.input)
+    ds = cytome.open(args.input, mode="r")
     out = ds.downsample(
         n_cells=args.n_cells,
         fraction=args.fraction,
@@ -239,8 +254,8 @@ def _cmd_downsample(args: argparse.Namespace) -> None:
 
 
 def _cmd_validate(args: argparse.Namespace) -> None:
-    ds = cytome.open(args.path)
-    rep = ds.validate()
+    ds = cytome.open(args.path, mode="r")
+    rep = ds.validate(integrity=not args.quick)
     print("PASSED" if rep.passed else "FAILED")
     if rep.checks_failed:
         print("Failures:")
@@ -250,7 +265,7 @@ def _cmd_validate(args: argparse.Namespace) -> None:
 
 
 def _cmd_provenance(args: argparse.Namespace) -> None:
-    ds = cytome.open(args.path)
+    ds = cytome.open(args.path, mode="r")
     if args.methods_text:
         print(ds.provenance.export_methods_text())
     else:
@@ -259,7 +274,7 @@ def _cmd_provenance(args: argparse.Namespace) -> None:
 
 
 def _cmd_export_fragments(args: argparse.Namespace) -> None:
-    ds = cytome.open(args.input)
+    ds = cytome.open(args.input, mode="r")
     if args.groupby:
         ds.ATAC.fragments.export_by_group(args.groupby, args.output)
     else:
@@ -270,7 +285,7 @@ def _cmd_export_fragments(args: argparse.Namespace) -> None:
 
 
 def _cmd_export_coverage(args: argparse.Namespace) -> None:
-    ds = cytome.open(args.input)
+    ds = cytome.open(args.input, mode="r")
     region = parse_region(args.region) if args.region else None
     export_coverage(
         dataset=ds,
@@ -303,7 +318,7 @@ def _cmd_build_csc(args: argparse.Namespace) -> None:
 
 
 def _cmd_copy(args: argparse.Namespace) -> None:
-    ds = cytome.open(args.input)
+    ds = cytome.open(args.input, mode="r")
     out = ds.copy(args.output)
     out.close()
     ds.close()
@@ -319,7 +334,7 @@ def _cmd_init(args: argparse.Namespace) -> None:
     if args.sample_id:
         bc_df["sample_id"] = args.sample_id
 
-    ds = cytome.create(args.output, force=True)  # CLI keeps overwrite semantics
+    ds = cytome.create(args.output, force=args.force)   # an existing output needs --force
     ds.set_entity("cells", bc_df)
     ds.flush()
     ds.close()

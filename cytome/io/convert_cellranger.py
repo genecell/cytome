@@ -148,8 +148,11 @@ def from_cellranger(
             ds_i = _from_one_cellranger(p, part, label, import_fragments, build_index, keep_chroms, modalities, force=True)
             ds_i.close()
             parts.append(str(part)); labels.append(label)
-        # batch_labels → cells.sample_id carries each library's name (not the temp path stem)
-        cytome.merge(parts, str(out), batch_labels=labels, include_fragments=import_fragments, force=force)
+        # batch_labels → cells.sample_id carries each library's name (not the temp path stem).
+        # The dataset merge returns is closed here: left open, it kept the store
+        # locked for the caller's next write (see ProvenanceLog.log).
+        cytome.merge(parts, str(out), batch_labels=labels, include_fragments=import_fragments,
+                     force=force).close()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     return cytome.open(str(out))
@@ -157,32 +160,68 @@ def from_cellranger(
 
 def _from_one_cellranger(folder: Path, output, sample_name, import_fragments, build_index,
                          keep_chroms="standard", modalities="both", force=False):
-    """Build a Cytome dataset from one Cell Ranger folder (h5 or MTX; RNA ± ATAC)."""
-    from cytome.io.convert_anndata import make_unique_ids, warn_duplicate_symbols
+    """Build a Cytome dataset from one Cell Ranger folder (h5 or MTX; RNA ± ATAC).
+
+    The ``.h5`` matrix is read and written a batch of cells at a time (the
+    writer of :func:`from_10x_h5`): it was read whole, and its transpose copied,
+    for every modality. The store is built as ``<output>.partial`` and renamed
+    when whole.
+    """
+    from cytome.io._atomic import building
 
     folder = Path(folder)
     h5 = folder / "filtered_feature_bc_matrix.h5"
     mtx = folder / "filtered_feature_bc_matrix"
-    if h5.exists():
-        matrix, barcodes, ids, names, ftypes = _read_10x_h5(h5)
-    elif mtx.exists():
-        matrix, barcodes, features = _read_matrix_dir(mtx)
-        ids = np.array([f[0] for f in features])
-        names = np.array([f[1] if len(f) > 1 else f[0] for f in features])
-        ftypes = np.array([f[2] if len(f) >= 3 else "Gene Expression" for f in features])
-    else:
+    if not h5.exists() and not mtx.exists():
         raise FileNotFoundError(
             f"No 'filtered_feature_bc_matrix.h5' or 'filtered_feature_bc_matrix/' in {folder}")
-    matrix = matrix.tocsr() if not sp.isspmatrix_csr(matrix) else matrix   # features × cells
+    with building(output, force) as partial:
+        ds = cytome.create(partial, force=True)
+        try:
+            if h5.exists():
+                barcodes, atac_needed = _write_10x_h5(
+                    ds, h5, sample_name, build_index, modalities, None, keep_chroms,
+                    who="from_cellranger", folder=folder)
+            else:
+                barcodes, atac_needed = _write_matrix_dir(
+                    ds, mtx, sample_name, build_index, modalities, keep_chroms, folder)
+            ds.flush()
+            if import_fragments:
+                frag_path = folder / "atac_fragments.tsv.gz"
+                if frag_path.exists():
+                    mapping = {bc: i for i, bc in enumerate(barcodes)}
+                    from cytome.utils.genome import CHROM_ORDER
+                    # "all" applies no filter (None was the streaming importer's
+                    # default set, which dropped chrM and every non-UCSC name: "all"
+                    # kept fewer fragments than "standard")
+                    chr_filter = set(CHROM_ORDER) if keep_chroms == "standard" else "all"
+                    ds._conn.commit()   # streaming importer sets PRAGMAs → must not be mid-transaction
+                    _import_fragments_streaming(ds._conn, frag_path, mapping, chr_filter=chr_filter)
+                    atac_needed = True
 
-    ds = cytome.create(output, force=force)
-    cells_df = pd.DataFrame({"barcode": list(barcodes)})
-    if sample_name is not None:
-        cells_df["sample_id"] = sample_name
-    ds.set_entity("cells", cells_df)
+            if atac_needed:
+                mods = set(ds.modalities); mods.add("ATAC")
+                ds._write_manifest_key("modalities", sorted(mods))
+                ds._manifest = ds._read_manifest()
+            ds.flush()
+        except BaseException:
+            _close_quietly(ds)
+            raise
+        ds.close()
+    return cytome.open(str(output))
 
+
+def _close_quietly(ds) -> None:
+    try:
+        ds.close()
+    except Exception:
+        pass
+
+
+def _feature_masks(ids, names, ftypes, modalities, who, folder):
+    """``(gene_mask, peak_mask)``: Gene Expression features to RNA, Peaks (or ids
+    shaped ``chr:start-end``) to ATAC, as ``modalities`` asks."""
     ftypes = np.asarray([str(t) for t in ftypes])
-    ids = np.asarray(ids); names = np.asarray(names)
     gene_mask = ftypes == "Gene Expression"
     peak_mask = np.array(["Peak" in t for t in ftypes])
     if not peak_mask.any():   # fallback: peak feature ids look like 'chr:start-end'
@@ -195,59 +234,133 @@ def _from_one_cellranger(folder: Path, output, sample_name, import_fragments, bu
         peak_mask = np.zeros(len(ids), dtype=bool)   # RNA-only: drop ATAC peaks entirely
     elif modalities == "atac":
         gene_mask = np.zeros(len(ids), dtype=bool)   # ATAC-only: drop RNA genes
-    elif modalities == "both" and not peak_mask.any():
-        import warnings
+    elif modalities == "both" and not peak_mask.any() and folder is not None:
         warnings.warn(
-            f"from_cellranger(modalities='both'): no ATAC/Peak features found in {folder} "
-            f"— imported RNA only.", stacklevel=2)
+            f"{who}(modalities='both'): no ATAC/Peak features found in {folder} "
+            f"— imported RNA only.", stacklevel=4)
+    return gene_mask, peak_mask
 
+
+def _peak_table(ids, peak_mask, keep_chroms, who):
+    """``(peaks frame, peak_mask)``: the peaks' table, without the peaks on
+    non-standard chromosomes when ``keep_chroms='standard'``."""
+    from cytome.io.convert_anndata import make_unique_ids
+    peaks_df = _peaks_from_feature_ids(ids[peak_mask])
+    if peaks_df is None:
+        return pd.DataFrame({"peak_id": make_unique_ids(ids[peak_mask])}), peak_mask
+    if keep_chroms == "standard" and "chr" in peaks_df.columns:
+        from cytome.utils.genome import CHROM_ORDER
+        keep = peaks_df["chr"].isin(CHROM_ORDER).values
+        n_drop = int((~keep).sum())
+        if n_drop:
+            warnings.warn(
+                f"{who}: dropped {n_drop} peak(s) on non-standard chromosomes "
+                f"(keep_chroms='standard').", stacklevel=4)
+            peaks_df = peaks_df[keep].reset_index(drop=True)
+            peak_mask = peak_mask.copy()
+            peak_mask[np.flatnonzero(peak_mask)[~keep]] = False
+    return peaks_df, peak_mask
+
+
+def _write_matrix_dir(ds, mtx, sample_name, build_index, modalities, keep_chroms, folder):
+    """The MTX directory of one folder into ``ds`` (read whole: scipy reads MTX so)."""
+    from cytome.io.convert_anndata import make_unique_ids, warn_duplicate_symbols
+    matrix, barcodes, features = _read_matrix_dir(mtx)
+    ids = np.array([f[0] for f in features])
+    names = np.array([f[1] if len(f) > 1 else f[0] for f in features])
+    ftypes = np.array([f[2] if len(f) >= 3 else "Gene Expression" for f in features])
+    matrix = matrix.tocsr() if not sp.isspmatrix_csr(matrix) else matrix   # features × cells
+    cells_df = pd.DataFrame({"barcode": list(barcodes)})
+    if sample_name is not None:
+        cells_df["sample_id"] = sample_name
+    ds.set_entity("cells", cells_df)
+    gene_mask, peak_mask = _feature_masks(ids, names, ftypes, modalities, "from_cellranger",
+                                          folder)
     if gene_mask.any():
         warn_duplicate_symbols(names[gene_mask])
         ds.set_entity("genes", pd.DataFrame({
             "gene_id": make_unique_ids(ids[gene_mask]), "symbol": names[gene_mask]}))
         ds.add_matrix("RNA_counts", matrix[gene_mask, :].T.tocsr())
-
     atac_needed = False
     if peak_mask.any():
-        peaks_df = _peaks_from_feature_ids(ids[peak_mask])
-        atac = matrix[peak_mask, :]
-        if peaks_df is None:
-            peaks_df = pd.DataFrame({"peak_id": make_unique_ids(ids[peak_mask])})
-        elif keep_chroms == "standard" and "chr" in peaks_df.columns:
-            from cytome.utils.genome import CHROM_ORDER
-            keep = peaks_df["chr"].isin(CHROM_ORDER).values
-            n_drop = int((~keep).sum())
-            if n_drop:
-                import warnings
-                warnings.warn(
-                    f"from_cellranger: dropped {n_drop} peak(s) on non-standard chromosomes "
-                    f"(keep_chroms='standard').", stacklevel=2)
-                peaks_df = peaks_df[keep].reset_index(drop=True)
-                atac = atac[keep, :]
+        peaks_df, peak_mask = _peak_table(ids, peak_mask, keep_chroms, "from_cellranger")
         ds.set_entity("peaks", peaks_df)
-        ds.add_matrix("ATAC_counts", atac.T.tocsr())
+        ds.add_matrix("ATAC_counts", matrix[peak_mask, :].T.tocsr())
         ds.flush()
         if build_index:
             build_peak_index(ds._conn)
         atac_needed = True
+    return list(barcodes), atac_needed
 
-    ds.flush()
-    if import_fragments:
-        frag_path = folder / "atac_fragments.tsv.gz"
-        if frag_path.exists():
-            mapping = {bc: i for i, bc in enumerate(barcodes)}
-            from cytome.utils.genome import CHROM_ORDER
-            chr_filter = set(CHROM_ORDER) if keep_chroms == "standard" else None
-            ds._conn.commit()   # streaming importer sets PRAGMAs → must not be mid-transaction
-            _import_fragments_streaming(ds._conn, frag_path, mapping, chr_filter=chr_filter)
-            atac_needed = True
 
-    if atac_needed:
-        mods = set(ds.modalities); mods.add("ATAC")
-        ds._write_manifest_key("modalities", sorted(mods))
+def _write_10x_h5(ds, path, sample_name, build_index, modalities, batch_size, keep_chroms,
+                  who="from_10x_h5", folder=None):
+    """A CellRanger ``.h5`` into ``ds``, read a batch of cells at a time;
+    returns ``(barcodes, wrote ATAC)``."""
+    from cytome.io.convert_anndata import make_unique_ids, warn_duplicate_symbols
+
+    barcodes, ids, names, ftypes, shape, group = _read_10x_h5_meta(path)
+    n_features, n_cells = shape
+    # Counts stay int32; values that are not integers (an h5 written by
+    # CellBender or another tool) stay floats: int32 was forced, and 0.4 was
+    # stored as 0 in a matrix flagged as integer.
+    from ._optional import require_h5py
+    with require_h5py("cytome.from_10x_h5").File(str(path), "r") as _f:
+        _data_dtype = np.dtype(_f[group]["data"].dtype)
+    value_dtype = np.int32 if _data_dtype.kind in "iub" else _data_dtype
+
+    cells_df = pd.DataFrame({"barcode": barcodes})
+    if sample_name is not None:
+        cells_df["sample_id"] = sample_name
+    ds.set_entity("cells", cells_df)
+
+    gene_mask, peak_mask = _feature_masks(ids, names, ftypes, modalities, who, folder)
+    if gene_mask.any():
+        warn_duplicate_symbols(names[gene_mask])
+        ds.set_entity("genes", pd.DataFrame({
+            "gene_id": make_unique_ids(ids[gene_mask]),
+            "symbol": names[gene_mask],
+        }))
+
+    peaks_df = None
+    if peak_mask.any():
+        peaks_df, peak_mask = _peak_table(ids, peak_mask, keep_chroms, who)
+        ds.set_entity("peaks", peaks_df)
+
+    # One pass over the file, writing every requested modality as it goes: the
+    # counts are never held whole, so peak memory is set by `batch_size` rather
+    # than by the size of the matrix.
+    targets = []
+    for mask, layer in ((gene_mask, "RNA_counts"), (peak_mask, "ATAC_counts")):
+        if not mask.any():
+            continue
+        remap = np.full(n_features, -1, dtype=np.int64)
+        remap[np.flatnonzero(mask)] = np.arange(int(mask.sum()))
+        targets.append((
+            remap,
+            int(mask.sum()),
+            ds.create_layer_writer(layer, n_rows=n_cells, n_cols=int(mask.sum()),
+                                   dtype=value_dtype),
+        ))
+
+    if targets:
+        for offset, chunk in _iter_10x_h5_cell_chunks(
+                path, group, n_cells, n_features, batch_size):
+            for remap, n_out, writer in targets:
+                writer.write_chunk(_select_columns(chunk, remap, n_out), offset)
+        for _, _, writer in targets:
+            writer.finalize()
+
+    atac = peaks_df is not None
+    if atac:
+        ds.flush()
+        if build_index:
+            build_peak_index(ds._conn)
+        current_modalities = set(ds.modalities)
+        current_modalities.add("ATAC")
+        ds._write_manifest_key("modalities", sorted(current_modalities))
         ds._manifest = ds._read_manifest()
-    ds.flush()
-    return ds
+    return list(barcodes), atac
 
 
 def from_cellranger_arc(
@@ -280,100 +393,107 @@ def from_cellranger_arc(
     gene_mask = feature_types == "Gene Expression"
     peak_mask = np.array([("Peak" in t) or (":" in feat_id and "-" in feat_id) for t, feat_id in zip(feature_types, ids)])
 
-    ds = cytome.create(output, force=force)
-    cells_df = pd.DataFrame({"barcode": barcodes})
-    if sample_name is not None:
-        cells_df["sample_id"] = sample_name
+    from cytome.io._atomic import building
+    with building(output, force) as partial:
+        ds = cytome.create(partial, force=True)
+        try:
+            cells_df = pd.DataFrame({"barcode": barcodes})
+            if sample_name is not None:
+                cells_df["sample_id"] = sample_name
 
-    metrics_path = outs / "per_barcode_metrics.csv"
-    if metrics_path.exists():
-        metrics = pd.read_csv(metrics_path)
-        barcode_col = "barcode" if "barcode" in metrics.columns else metrics.columns[0]
-        metrics = metrics.rename(columns={barcode_col: "barcode"})
-        cells_df = cells_df.merge(metrics, on="barcode", how="left")
+            metrics_path = outs / "per_barcode_metrics.csv"
+            if metrics_path.exists():
+                metrics = pd.read_csv(metrics_path)
+                barcode_col = "barcode" if "barcode" in metrics.columns else metrics.columns[0]
+                metrics = metrics.rename(columns={barcode_col: "barcode"})
+                cells_df = cells_df.merge(metrics, on="barcode", how="left")
 
-    ds.set_entity("cells", cells_df)
+            ds.set_entity("cells", cells_df)
 
-    if gene_mask.any():
-        genes_df = pd.DataFrame({"gene_id": ids[gene_mask], "symbol": names[gene_mask]})
-        ds.set_entity("genes", genes_df)
-        ds.add_matrix("RNA_counts", matrix[gene_mask, :].T.tocsr())
+            if gene_mask.any():
+                genes_df = pd.DataFrame({"gene_id": ids[gene_mask], "symbol": names[gene_mask]})
+                ds.set_entity("genes", genes_df)
+                ds.add_matrix("RNA_counts", matrix[gene_mask, :].T.tocsr())
 
-    atac_needed = False
+            atac_needed = False
 
-    if peak_mask.any():
-        peaks_ids = ids[peak_mask]
-        peaks_df = _peaks_from_feature_ids(peaks_ids)
-        atac = matrix[peak_mask, :]
-        if peaks_df is None:
-            peaks_df = pd.DataFrame({"peak_id": peaks_ids})
-        elif keep_chroms == "standard" and "chr" in peaks_df.columns:
-            from cytome.utils.genome import CHROM_ORDER
-            keep = peaks_df["chr"].isin(CHROM_ORDER).values
-            n_drop = int((~keep).sum())
-            if n_drop:
-                import warnings
-                warnings.warn(
-                    f"from_cellranger_arc: dropped {n_drop} peak(s) on non-standard "
-                    f"chromosomes (keep_chroms='standard').", stacklevel=2)
-                peaks_df = peaks_df[keep].reset_index(drop=True)
-                atac = atac[keep, :]
-        ds.set_entity("peaks", peaks_df)
-        ds.add_matrix("ATAC_counts", atac.T.tocsr())
-        atac_needed = True
+            if peak_mask.any():
+                peaks_ids = ids[peak_mask]
+                peaks_df = _peaks_from_feature_ids(peaks_ids)
+                atac = matrix[peak_mask, :]
+                if peaks_df is None:
+                    peaks_df = pd.DataFrame({"peak_id": peaks_ids})
+                elif keep_chroms == "standard" and "chr" in peaks_df.columns:
+                    from cytome.utils.genome import CHROM_ORDER
+                    keep = peaks_df["chr"].isin(CHROM_ORDER).values
+                    n_drop = int((~keep).sum())
+                    if n_drop:
+                        import warnings
+                        warnings.warn(
+                            f"from_cellranger_arc: dropped {n_drop} peak(s) on non-standard "
+                            f"chromosomes (keep_chroms='standard').", stacklevel=2)
+                        peaks_df = peaks_df[keep].reset_index(drop=True)
+                        atac = atac[keep, :]
+                ds.set_entity("peaks", peaks_df)
+                ds.add_matrix("ATAC_counts", atac.T.tocsr())
+                atac_needed = True
 
-    bed_path = outs / "atac_peaks.bed"
-    if bed_path.exists():
-        bed_df = pd.read_csv(
-            bed_path,
-            sep="\t",
-            header=None,
-            names=["chr", "start", "end_"],
-            usecols=[0, 1, 2],
-        )
-        bed_df.insert(0, "peak_id", bed_df["chr"] + ":" + bed_df["start"].astype(str) + "-" + bed_df["end_"].astype(str))
+            bed_path = outs / "atac_peaks.bed"
+            if bed_path.exists():
+                bed_df = pd.read_csv(
+                    bed_path,
+                    sep="\t",
+                    header=None,
+                    names=["chr", "start", "end_"],
+                    usecols=[0, 1, 2],
+                )
+                bed_df.insert(0, "peak_id", bed_df["chr"] + ":" + bed_df["start"].astype(str) + "-" + bed_df["end_"].astype(str))
 
-        annot_path = outs / "peak_annotation.tsv"
-        if annot_path.exists():
-            annot = pd.read_csv(annot_path, sep="\t")
-            join_key = "peak" if "peak" in annot.columns else annot.columns[0]
-            annot = annot.rename(columns={join_key: "peak_id"})
-            bed_df = bed_df.merge(annot, on="peak_id", how="left")
+                annot_path = outs / "peak_annotation.tsv"
+                if annot_path.exists():
+                    annot = pd.read_csv(annot_path, sep="\t")
+                    join_key = "peak" if "peak" in annot.columns else annot.columns[0]
+                    annot = annot.rename(columns={join_key: "peak_id"})
+                    bed_df = bed_df.merge(annot, on="peak_id", how="left")
 
-        if keep_chroms == "standard":
-            from cytome.utils.genome import CHROM_ORDER
-            keep = bed_df["chr"].isin(CHROM_ORDER).values
-            n_drop = int((~keep).sum())
-            if n_drop:
-                import warnings
-                warnings.warn(
-                    f"from_cellranger_arc: dropped {n_drop} BED peak(s) on non-standard "
-                    f"chromosomes (keep_chroms='standard').", stacklevel=2)
-                bed_df = bed_df[keep].reset_index(drop=True)
+                if keep_chroms == "standard":
+                    from cytome.utils.genome import CHROM_ORDER
+                    keep = bed_df["chr"].isin(CHROM_ORDER).values
+                    n_drop = int((~keep).sum())
+                    if n_drop:
+                        import warnings
+                        warnings.warn(
+                            f"from_cellranger_arc: dropped {n_drop} BED peak(s) on non-standard "
+                            f"chromosomes (keep_chroms='standard').", stacklevel=2)
+                        bed_df = bed_df[keep].reset_index(drop=True)
 
-        ds.set_entity("peaks", bed_df)
-        ds.flush()
-        if build_index:
-            build_peak_index(ds._conn)
-        atac_needed = True
+                ds.set_entity("peaks", bed_df)
+                ds.flush()
+                if build_index:
+                    build_peak_index(ds._conn)
+                atac_needed = True
 
-    ds.flush()
+            ds.flush()
 
-    if import_fragments:
-        frag_path = outs / "atac_fragments.tsv.gz"
-        if frag_path.exists():
-            mapping = {bc: i for i, bc in enumerate(barcodes)}
-            _import_fragments(ds._conn, frag_path, mapping, build_index=build_index)
-            atac_needed = True
+            if import_fragments:
+                frag_path = outs / "atac_fragments.tsv.gz"
+                if frag_path.exists():
+                    mapping = {bc: i for i, bc in enumerate(barcodes)}
+                    _import_fragments(ds._conn, frag_path, mapping, build_index=build_index)
+                    atac_needed = True
 
-    if atac_needed:
-        current_modalities = set(ds.modalities)
-        current_modalities.add("ATAC")
-        ds._write_manifest_key("modalities", sorted(current_modalities))
-        ds._manifest = ds._read_manifest()
+            if atac_needed:
+                current_modalities = set(ds.modalities)
+                current_modalities.add("ATAC")
+                ds._write_manifest_key("modalities", sorted(current_modalities))
+                ds._manifest = ds._read_manifest()
 
-    ds.flush()
-    return ds
+            ds.flush()
+        except BaseException:
+            _close_quietly(ds)
+            raise
+        ds.close()
+    return cytome.open(str(output))
 
 
 def _read_10x_h5_meta(path: str | Path):
@@ -528,7 +648,8 @@ def _read_10x_h5(path: str | Path):
 
 def from_10x_h5(path: str | Path, output: str | Path, sample_name: Optional[str] = None,
                 build_index: bool = True, modalities: str = "both",
-                force: bool = False, batch_size: Optional[int] = None):
+                force: bool = False, batch_size: Optional[int] = None,
+                keep_chroms: str = "all"):
     """Create a Cytome dataset directly from a CellRanger ``.h5`` — no AnnData.
 
     Gene Expression features → RNA ``genes`` (``gene_id`` = Ensembl id, unique;
@@ -549,81 +670,27 @@ def from_10x_h5(path: str | Path, output: str | Path, sample_name: Optional[str]
         multiome gets small batches and a sparse RNA matrix gets large ones,
         without the caller having to know which they have. Pass an integer to
         override.
+    keep_chroms : {"all", "standard"}, default "all"
+        ``"standard"`` drops peaks on chromosomes not in
+        :data:`cytome.utils.genome.CHROM_ORDER`, as :func:`from_cellranger` does.
+
+    The store is built as ``<output>.partial`` and renamed when whole.
     """
     if modalities not in ("both", "rna", "atac"):
         raise ValueError(
             f"modalities must be 'both', 'rna' or 'atac', got {modalities!r}."
         )
-    from cytome.io.convert_anndata import make_unique_ids, warn_duplicate_symbols
-
-    barcodes, ids, names, ftypes, shape, group = _read_10x_h5_meta(path)
-    n_features, n_cells = shape
-
-    ds = cytome.create(output, force=force)
-    cells_df = pd.DataFrame({"barcode": barcodes})
-    if sample_name is not None:
-        cells_df["sample_id"] = sample_name
-    ds.set_entity("cells", cells_df)
-
-    gene_mask = ftypes == "Gene Expression"
-    peak_mask = np.array(["Peak" in str(t) for t in ftypes])
-    _warn_unhandled_feature_types(ftypes, gene_mask, peak_mask)
-    if not gene_mask.any() and not peak_mask.any():
-        gene_mask = np.ones(len(ids), dtype=bool)   # single-modality file → all RNA
-    if modalities == "rna":
-        peak_mask = np.zeros(len(ids), dtype=bool)   # RNA-only: drop ATAC peaks entirely
-    elif modalities == "atac":
-        gene_mask = np.zeros(len(ids), dtype=bool)   # ATAC-only: drop RNA genes
-
-    if gene_mask.any():
-        warn_duplicate_symbols(names[gene_mask])
-        ds.set_entity("genes", pd.DataFrame({
-            "gene_id": make_unique_ids(ids[gene_mask]),
-            "symbol": names[gene_mask],
-        }))
-
-    peaks_df = None
-    if peak_mask.any():
-        peaks_df = _peaks_from_feature_ids(ids[peak_mask])
-        if peaks_df is None:
-            peaks_df = pd.DataFrame({"peak_id": make_unique_ids(ids[peak_mask])})
-        ds.set_entity("peaks", peaks_df)
-
-    # One pass over the file, writing every requested modality as it goes: the
-    # counts are never held whole, so peak memory is set by `batch_size` rather
-    # than by the size of the matrix.
-    targets = []
-    for mask, layer in ((gene_mask, "RNA_counts"), (peak_mask, "ATAC_counts")):
-        if not mask.any():
-            continue
-        remap = np.full(n_features, -1, dtype=np.int64)
-        remap[np.flatnonzero(mask)] = np.arange(int(mask.sum()))
-        targets.append((
-            remap,
-            int(mask.sum()),
-            ds.create_layer_writer(layer, n_rows=n_cells, n_cols=int(mask.sum()),
-                                   dtype=np.int32),
-        ))
-
-    if targets:
-        for offset, chunk in _iter_10x_h5_cell_chunks(
-                path, group, n_cells, n_features, batch_size):
-            for remap, n_out, writer in targets:
-                writer.write_chunk(_select_columns(chunk, remap, n_out), offset)
-        for _, _, writer in targets:
-            writer.finalize()
-
-    if peaks_df is not None:
-        ds.flush()
-        if build_index:
-            build_peak_index(ds._conn)
-        current_modalities = set(ds.modalities)
-        current_modalities.add("ATAC")
-        ds._write_manifest_key("modalities", sorted(current_modalities))
-        ds._manifest = ds._read_manifest()
-
-    ds.flush()
-    return ds
+    from cytome.io._atomic import building
+    with building(output, force) as partial:
+        ds = cytome.create(partial, force=True)
+        try:
+            _write_10x_h5(ds, path, sample_name, build_index, modalities, batch_size, keep_chroms)
+            ds.flush()
+        except BaseException:
+            _close_quietly(ds)
+            raise
+        ds.close()
+    return cytome.open(str(output))
 
 
 def _read_matrix_dir(mtx_dir: Path):

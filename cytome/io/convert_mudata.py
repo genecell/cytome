@@ -27,50 +27,62 @@ def from_mudata(mdata, output: str | Path | None = None, force: bool = False):
         tmp.close()
         force = True  # the tempfile we just created is ours to overwrite
 
-    ds = cytome.create(output, force=force)
+    from cytome.io._atomic import building
+    with building(output, force) as partial:
+        ds = cytome.create(partial, force=True)
+        try:
 
-    obs = mdata.obs.copy()
-    if "barcode" not in obs.columns:
-        obs = obs.reset_index().rename(columns={obs.index.name or "index": "barcode"})
-    else:
-        obs = obs.reset_index(drop=True)
-    ds.set_entity("cells", obs)
-
-    for key, adata in mdata.mod.items():
-        modality = _MODALITY_MAP.get(str(key).lower(), str(key))
-        matrix = adata.X if sp.issparse(adata.X) else sp.csr_matrix(np.asarray(adata.X))
-        ds.add_matrix(f"{modality}_counts", matrix)
-
-        var = adata.var.copy()
-        if modality == "RNA":
-            if "gene_id" not in var.columns:
-                var = var.reset_index().rename(columns={var.index.name or "index": "gene_id"})
+            obs = mdata.obs.copy()
+            if "barcode" not in obs.columns:
+                obs = obs.reset_index().rename(columns={obs.index.name or "index": "barcode"})
             else:
-                var = var.reset_index(drop=True)
-            ds.set_entity("genes", var)
-        elif modality == "ATAC":
-            if "peak_id" not in var.columns:
-                var = var.reset_index().rename(columns={var.index.name or "index": "peak_id"})
-            else:
-                var = var.reset_index(drop=True)
-            ds.set_entity("peaks", var)
-        elif modality == "protein":
-            if "protein_id" not in var.columns:
-                var = var.reset_index().rename(columns={var.index.name or "index": "protein_id"})
-            else:
-                var = var.reset_index(drop=True)
-            ds.set_entity("proteins", var)
+                obs = obs.reset_index(drop=True)
+            ds.set_entity("cells", obs)
 
-        for layer_name, layer_mat in adata.layers.items():
-            lay = layer_mat if sp.issparse(layer_mat) else sp.csr_matrix(np.asarray(layer_mat))
-            ds.add_matrix(f"{modality}_{layer_name}", lay)
+            for key, adata in mdata.mod.items():
+                modality = _MODALITY_MAP.get(str(key).lower(), str(key))
+                matrix = adata.X if sp.issparse(adata.X) else sp.csr_matrix(np.asarray(adata.X))
+                ds.add_matrix(f"{modality}_counts", matrix)
 
-        for emb_name, emb in adata.obsm.items():
-            suffix = emb_name[2:] if emb_name.startswith("X_") else emb_name
-            ds.add_embedding(f"{modality}_{suffix}", np.asarray(emb))
+                var = adata.var.copy()
+                if modality == "RNA":
+                    if "gene_id" not in var.columns:
+                        var = var.reset_index().rename(columns={var.index.name or "index": "gene_id"})
+                    else:
+                        var = var.reset_index(drop=True)
+                    ds.set_entity("genes", var)
+                elif modality == "ATAC":
+                    if "peak_id" not in var.columns:
+                        var = var.reset_index().rename(columns={var.index.name or "index": "peak_id"})
+                    else:
+                        var = var.reset_index(drop=True)
+                    ds.set_entity("peaks", var)
+                elif modality == "protein":
+                    if "protein_id" not in var.columns:
+                        var = var.reset_index().rename(columns={var.index.name or "index": "protein_id"})
+                    else:
+                        var = var.reset_index(drop=True)
+                    ds.set_entity("proteins", var)
 
-    ds.flush()
-    return ds
+                for layer_name, layer_mat in adata.layers.items():
+                    if layer_name is None:          # anndata >= 0.13 lists X under a None key
+                        continue
+                    lay = layer_mat if sp.issparse(layer_mat) else sp.csr_matrix(np.asarray(layer_mat))
+                    ds.add_matrix(f"{modality}_{layer_name}", lay)
+
+                for emb_name, emb in adata.obsm.items():
+                    suffix = emb_name[2:] if emb_name.startswith("X_") else emb_name
+                    ds.add_embedding(f"{modality}_{suffix}", np.asarray(emb))
+
+            ds.flush()
+        except BaseException:
+            try:
+                ds.close()
+            except Exception:
+                pass
+            raise
+        ds.close()
+    return cytome.open(str(output))
 
 
 def to_mudata(ds):

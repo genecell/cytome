@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import warnings
 from pathlib import Path
-from typing import Any, Iterable, List, Sequence
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -15,7 +17,7 @@ from cytome.core.dataset import CytomeDataset
 def merge(
     inputs,
     output,
-    batch_key: str = "sample_id",
+    batch_key: str = "batch",
     batch_labels: Sequence[str] | None = None,
     gene_strategy: str = "union",
     peak_strategy: str = "union",
@@ -26,11 +28,17 @@ def merge(
     include_graphs: bool = False,
     chunk_memory_mb: int = 256,
     force: bool = False,
+    dtype=None,
 ):
     """Merge Cytome files into one output dataset.
 
     Parameters
     ----------
+    batch_key
+        The ``cells`` column that records each cell's input, filled with its
+        label (``batch_labels``, by default each input's file stem). Default
+        ``"batch"``. Pass ``"sample_id"`` to write the label there for every
+        cell, replacing the cells' own samples.
     gene_strategy
         How to reconcile gene sets across inputs. ``'union'`` (default) keeps
         every gene seen in any input — genes absent from a given input become
@@ -41,23 +49,61 @@ def merge(
     tile_strategy
         Same as ``gene_strategy`` but for the genome-tiles feature axis. Default
         ``'union'``. (``GA`` gene-activity features reuse ``gene_strategy``.)
+    obs_columns
+        ``"all"`` (every column of any input, missing where an input lacks it),
+        ``"shared"`` (the columns every input has) or a list. ``barcode``,
+        ``sample_id`` and ``batch_key`` are always kept.
+    include_embeddings
+        Concatenate each cell embedding over the inputs: an input without it
+        contributes rows of NaN, and an embedding whose width differs between
+        inputs is left out, with a warning.
+    dtype
+        The value dtype of every merged matrix. ``None`` (default) promotes the
+        inputs' dtypes (``np.result_type``: int32 and float32 give float64), so
+        no value changes. A float written as an integer dtype must be integral.
 
     Notes
     -----
-    Matrix merging takes a vectorized fast path when all inputs share an
-    identical feature order (``vstack`` with no remap); otherwise each input's
-    matrix is projected onto the merged feature axis with a single sparse
-    matmul (no per-column Python loop). Fragments are remapped by a vectorized
-    cell-index offset (inputs are concatenated in order, so each input's cells
-    occupy a contiguous block) and streamed into the compressed
-    ``fragment_chunks`` format.
+    **Cells and samples.** Barcodes are kept as given: a cell is named by its
+    sample and its barcode, the pair the ``samples`` table and ``sample_id``
+    record. A cell whose ``sample_id`` is empty gets its input's label there; a
+    cell that has one keeps it (the default ``batch_key`` was ``"sample_id"``
+    until 0.3.8, which replaced every cell's sample with the file stem). The
+    ``samples`` table holds one row per sample of the merged cells, with the
+    inputs' rows where they have them and each sample's cells counted. A
+    barcode that repeats across inputs is reported.
+
+    **Matrices** are written in one dtype per matrix, a row chunk of one input
+    at a time, each projected onto the merged feature axis of its own feature
+    table (the raw matrix onto the merged ``_raw_var``); fragments are merged
+    per chromosome by their start, a chunk of each input at a time. The output
+    is built as ``<output>.partial`` and renamed at the end, so a failure leaves
+    no store under the output's name.
     """
     del include_graphs, chunk_memory_mb
     datasets = [_as_dataset(x) for x in inputs]
     close_after = [not isinstance(x, CytomeDataset) for x in inputs]
+    try:
+        return _merge(datasets, inputs, output, batch_key, batch_labels, gene_strategy,
+                      peak_strategy, tile_strategy, obs_columns, include_embeddings,
+                      include_fragments, force, dtype)
+    finally:
+        for ds, should_close in zip(datasets, close_after):
+            if should_close:
+                ds.close()
 
+
+def _merge(datasets, inputs, output, batch_key, batch_labels, gene_strategy, peak_strategy,
+           tile_strategy, obs_columns, include_embeddings, include_fragments, force, dtype):
+    from cytome.io.subset import _remove_store_files, _sync_path
     if batch_labels is None:
         batch_labels = [Path(ds.path).stem for ds in datasets]
+    batch_labels = [str(b) for b in batch_labels]
+    if len(batch_labels) != len(datasets):
+        raise ValueError(f"{len(batch_labels)} batch_labels for {len(datasets)} inputs")
+    output = Path(output)
+    if output.exists() and not force:
+        raise FileExistsError(f"Cytome already exists: {output}. Pass force=True to overwrite.")
 
     # Genome guard: merging across assemblies is never valid (coordinates, peaks
     # and tiles are incomparable). The genome is stored in the manifest
@@ -78,124 +124,72 @@ def merge(
         )
     _merged_genome = _distinct_genomes[0] if _distinct_genomes else None
     if _merged_genome is None:
-        import warnings as _w
-        _w.warn(
+        warnings.warn(
             "cytome.merge: inputs have no recorded genome in their manifest; "
-            "skipping the genome-consistency check.", stacklevel=2,
+            "skipping the genome-consistency check.", stacklevel=3,
         )
 
-    # force=False (default) raises FileExistsError if `output` already exists,
-    # so an expensive merged atlas is never silently truncated.
-    out = CytomeDataset(output, mode="w", force=force)
-    if _merged_genome is not None:
-        out._write_manifest_key("genome", _merged_genome)
+    partial = Path(str(output) + ".partial")
+    _remove_store_files(partial)
+    out = CytomeDataset(partial, mode="w", force=True)
+    try:
+        if _merged_genome is not None:
+            out._write_manifest_key("genome", _merged_genome)
+        n_cells_per_ds = _merge_cells(datasets, out, batch_key, batch_labels, obs_columns)
+        merged_axis = _merge_feature_tables(datasets, out, gene_strategy, peak_strategy,
+                                            tile_strategy)
+        out.flush()
+        raw_axis = _merge_raw_var(datasets, out)
 
-    # Per-modality feature axis: every modality with a non-empty feature table
-    # (genes/GA_genes/peaks/tiles) is merged onto a unified axis and its var
-    # table is carried over — NOT just genes+peaks. Read the entity tables by
-    # raw SQL: ds.tiles / ds.GA hit __getattr__ → a Modality, not the table.
-    from cytome.utils.modality import MODALITY_VAR_ENTITY
-    _strategy = {
-        "RNA": gene_strategy, "GA": gene_strategy,
-        "ATAC": peak_strategy, "tiles": tile_strategy,
-    }
-    # modality -> (entity_table, id_col)
-    _mod_entity = dict(MODALITY_VAR_ENTITY)
+        for matrix_name in _collect_matrix_names(datasets):
+            _stream_write_matrix(out, datasets, matrix_name, n_cells_per_ds, merged_axis,
+                                 raw_axis, dtype)
 
-    cell_frames = []
-    feature_frames = {m: [] for m in _mod_entity}   # modality -> [DataFrame, ...]
-    n_cells_per_ds = []
-    for ds, label in zip(datasets, batch_labels):
-        cells = ds.cells.to_pandas()
-        cells[batch_key] = label
-        cell_frames.append(cells)
-        n_cells_per_ds.append(len(cells))
+        if include_embeddings:
+            _merge_embeddings(datasets, out, n_cells_per_ds)
+        _merge_var_embeddings(datasets, out, merged_axis)
+        _merge_spatial(datasets, out, batch_labels)
 
-        for mod, (entity, id_col) in _mod_entity.items():
-            fdf = _read_entity_frame(ds, entity)
-            if fdf is not None and len(fdf) and id_col in fdf.columns:
-                feature_frames[mod].append(fdf)
+        if include_fragments:
+            _merge_fragments(datasets, out)
 
-    out_cells = pd.concat(cell_frames, ignore_index=True)
-    if "cell_idx" in out_cells.columns:
-        out_cells = out_cells.drop(columns=["cell_idx"])
-    if obs_columns == "shared":
-        shared = set(cell_frames[0].columns)
-        for df in cell_frames[1:]:
-            shared &= set(df.columns)
-        out_cells = out_cells[list(shared)]
-    elif isinstance(obs_columns, list):
-        keep = [c for c in obs_columns if c in out_cells.columns]
-        out_cells = out_cells[keep]
-    out.set_entity("cells", out_cells)
+        _merge_metadata(datasets, out, batch_labels)
+        out.provenance.log(
+            operation="merge",
+            function_name="cytome.merge",
+            parameters={"batch_key": batch_key, "gene_strategy": gene_strategy,
+                        "peak_strategy": peak_strategy, "tile_strategy": tile_strategy,
+                        "obs_columns": obs_columns if isinstance(obs_columns, str)
+                        else list(obs_columns),
+                        "dtype": None if dtype is None else str(np.dtype(dtype))},
+            package_name="cytome",
+            package_version=_version(),
+            input_objects=[str(getattr(x, "path", x)) for x in inputs],
+            output_objects=[str(output)],
+        )
+        out.flush()
+        out.close()
+    except BaseException:
+        try:
+            out.close()
+        except Exception:
+            pass
+        _remove_store_files(partial)
+        raise
+    _sync_path(partial)
+    for sfx in ("-wal", "-shm", "-journal"):
+        Path(str(output) + sfx).unlink(missing_ok=True)
+    os.replace(partial, output)
+    _sync_path(output.parent)
+    return CytomeDataset(output, mode="r+")
 
-    # dataset d's cells occupy rows [offset_d, offset_d + n_cells_per_ds[d]).
-    cell_offsets = np.concatenate([[0], np.cumsum(n_cells_per_ds)])[:-1].astype(np.int64)
 
-    # Merge + write each modality's feature table; remember the merged axis so
-    # every matrix of that modality is projected onto it (not just *_counts).
-    merged_axis = {}   # modality -> (entity, id_col, output_ids)
-    for mod, (entity, id_col) in _mod_entity.items():
-        frames = feature_frames[mod]
-        # Preserve-identical-axis fast path: when every input that has this
-        # feature table already shares the SAME ids in the SAME order (a fixed
-        # genome tiling, or same-reference genes/peaks), keep that native order —
-        # avoids a needless lexical re-sort + 5.4M-wide sparse reprojection, and
-        # preserves genomic tile order. Otherwise fall back to the sorted
-        # union/intersection merge.
-        shared_order = _identical_feature_axis(frames, id_col)
-        if shared_order is not None:
-            output_ids = shared_order
-            feat_df = _clean_feature_frame(frames[0], id_col)
-        else:
-            output_ids, feat_df = _merge_feature_frames(frames, id_col, _strategy[mod])
-        if not output_ids:
-            continue
-        if entity in ("genes", "GA_genes") and "symbol" not in feat_df.columns:
-            feat_df["symbol"] = feat_df[id_col]
-        out.set_entity(entity, feat_df)
-        merged_axis[mod] = (entity, id_col, output_ids)
-
-    out.flush()  # ensure entity tables are on disk before streaming matrix chunks
-
-    matrix_names = _collect_matrix_names(datasets)
-    for matrix_name in matrix_names:
-        mod = matrix_name.split("_", 1)[0]
-        axis = merged_axis.get(mod)
-        if axis is not None:
-            entity, id_col, output_ids = axis
-            _stream_write_matrix(out, datasets, matrix_name, output_ids,
-                                 n_cells_per_ds, entity, id_col)
-        else:
-            # No merged feature axis for this modality (no feature table on any
-            # input) — keep the native axis (identity vstack).
-            _stream_write_matrix(out, datasets, matrix_name, None,
-                                 n_cells_per_ds, None, None)
-
-    if include_embeddings:
-        for ds in datasets:
-            for name in ds.embeddings.keys():
-                out.add_embedding(name, ds.embeddings[name])
-
-    if include_fragments:
-        _merge_fragments(datasets, out, cell_offsets)
-
-    _merge_metadata(datasets, out, batch_labels)
-    out.provenance.log(
-        operation="merge",
-        function_name="cytome.merge",
-        parameters={"batch_key": batch_key, "gene_strategy": gene_strategy, "peak_strategy": peak_strategy},
-        package_name="cytome",
-        package_version="0.1.0",
-        input_objects=[str(getattr(x, "path", x)) for x in inputs],
-        output_objects=[str(output)],
-    )
-    out.flush()
-
-    for ds, should_close in zip(datasets, close_after):
-        if should_close:
-            ds.close()
-    return out
+def _version() -> str:
+    try:
+        from cytome import __version__
+        return str(__version__)
+    except Exception:
+        return "unknown"
 
 
 def _as_dataset(x) -> CytomeDataset:
@@ -204,20 +198,195 @@ def _as_dataset(x) -> CytomeDataset:
     return CytomeDataset(x, mode="r")
 
 
+# ---------------------------------------------------------------------------
+# cells and samples
+# ---------------------------------------------------------------------------
+
+def _merge_cells(datasets, out, batch_key, batch_labels, obs_columns) -> list[int]:
+    """Write the merged cells and samples tables; return each input's cell count."""
+    from cytome.core.column_meta import restore_column_dtypes, store_column_meta
+
+    frames = []
+    for ds, label in zip(datasets, batch_labels):
+        cells = restore_column_dtypes(ds._conn, "cells", ds.cells.to_pandas())
+        cells = cells.drop(columns=[c for c in cells.columns if str(c).lower() == "cell_idx"])
+        if batch_key == "sample_id":
+            cells["sample_id"] = label                 # asked for: every cell's sample is its input
+        else:
+            cells[batch_key] = label
+            sid = cells["sample_id"] if "sample_id" in cells.columns else pd.Series(
+                [None] * len(cells), index=cells.index, dtype=object)
+            empty = sid.isna() | (sid.astype(str) == "")
+            cells["sample_id"] = sid.astype(object).where(~empty, label)
+        frames.append(cells)
+
+    keep_always = ["barcode", "sample_id", batch_key]
+    if obs_columns == "shared":
+        shared = set(frames[0].columns)
+        for df in frames[1:]:
+            shared &= set(df.columns)
+        cols = [c for c in frames[0].columns if c in shared or c in keep_always]
+    elif obs_columns == "all":
+        cols = None
+    else:
+        cols = [c for c in obs_columns if any(c in f.columns for f in frames)]
+        cols = [c for c in keep_always if c not in cols] + cols
+    if cols is not None:
+        frames = [f[[c for c in cols if c in f.columns]] for f in frames]
+
+    merged = _concat_keeping_categories(frames)
+    if "_obs_name" in merged.columns:
+        # inputs without kept obs_names are named by their barcode
+        merged["_obs_name"] = merged["_obs_name"].astype(object).where(
+            merged["_obs_name"].notna(), merged["barcode"])
+
+    # Barcodes are kept as given (a user's barcodes join to their own metadata);
+    # a cell is its sample and its barcode.
+    pairs = merged[["sample_id", "barcode"]].astype(str)
+    dup = pairs.duplicated(keep=False)
+    if dup.any():
+        warnings.warn(
+            f"cytome.merge: {int(dup.sum())} cells share a sample_id and a barcode with "
+            f"another cell; give each input its own sample_id (its cells are named by the "
+            f"pair).", UserWarning, stacklevel=4)
+    origin = pd.Series(np.repeat(np.arange(len(frames)), [len(f) for f in frames]))
+    n_across = int((origin.groupby(merged["barcode"].astype(str).to_numpy()).nunique() > 1).sum())
+    if n_across:
+        warnings.warn(
+            f"cytome.merge: {n_across} barcodes occur in more than one input; they stay as "
+            f"they are, and a cell is named by its sample_id and its barcode.",
+            UserWarning, stacklevel=4)
+
+    out.set_entity("cells", merged.reset_index(drop=True))
+    out.flush()
+    store_column_meta(out._conn, "cells", merged)
+
+    # samples: one row per sample of the merged cells
+    rows = {}
+    for ds, label in zip(datasets, batch_labels):
+        try:
+            sdf = pd.read_sql_query("SELECT * FROM samples", ds._conn)
+        except Exception:
+            sdf = pd.DataFrame()
+        for rec in sdf.to_dict("records"):
+            sid = rec.get("sample_id")
+            if sid is not None and sid not in rows:
+                rec = {k: v for k, v in rec.items() if k not in ("sample_idx", "rowid")}
+                if not rec.get("batch"):
+                    rec["batch"] = label
+                rows[sid] = rec
+    counts = merged.groupby("sample_id", sort=False).size()
+    batch_of = merged.groupby("sample_id", sort=False)[batch_key].first() \
+        if batch_key in merged.columns and batch_key != "sample_id" else None
+    for sid, n in counts.items():
+        rec = rows.setdefault(sid, {"sample_id": sid})
+        if not rec.get("batch"):
+            rec["batch"] = batch_of.get(sid) if batch_of is not None else sid
+        rec["n_cells"] = int(n)
+    for sid, rec in rows.items():
+        if sid not in counts.index:
+            rec["n_cells"] = 0
+    if rows:
+        out.set_entity("samples", pd.DataFrame(list(rows.values())))
+        out.flush()
+    return [len(f) for f in frames]
+
+
+def _concat_keeping_categories(frames):
+    """``pd.concat`` that keeps a column categorical when every input that has it
+    holds it as a categorical (the categories united, in order of appearance)."""
+    merged = pd.concat(frames, ignore_index=True)
+    for col in merged.columns:
+        parts = [f[col] for f in frames if col in f.columns]
+        if parts and all(isinstance(p.dtype, pd.CategoricalDtype) for p in parts):
+            cats = []
+            for p in parts:
+                cats.extend(c for c in p.cat.categories if c not in cats)
+            ordered = all(p.cat.ordered for p in parts) and all(
+                list(p.cat.categories) == list(parts[0].cat.categories) for p in parts)
+            merged[col] = pd.Categorical(merged[col].astype(object), categories=cats,
+                                         ordered=ordered)
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# feature axes
+# ---------------------------------------------------------------------------
+
+def _merge_feature_tables(datasets, out, gene_strategy, peak_strategy, tile_strategy) -> dict:
+    """Merge and write each modality's feature table;
+    ``{modality: (entity, id_col, ids, axis unchanged)}``."""
+    from cytome.core.column_meta import restore_column_dtypes, store_column_meta
+    from cytome.utils.modality import MODALITY_VAR_ENTITY
+    strategy = {"RNA": gene_strategy, "GA": gene_strategy,
+                "ATAC": peak_strategy, "tiles": tile_strategy}
+    merged_axis = {}
+    for mod, (entity, id_col) in dict(MODALITY_VAR_ENTITY).items():
+        frames = []
+        for ds in datasets:
+            fdf = _read_entity_frame(ds, entity)
+            if fdf is not None and len(fdf) and id_col in fdf.columns:
+                frames.append(restore_column_dtypes(ds._conn, entity, fdf))
+        # Preserve-identical-axis fast path: when every input that has this
+        # feature table shares the SAME ids in the SAME order (a fixed genome
+        # tiling, or same-reference genes/peaks), keep that native order.
+        shared_order = _identical_feature_axis(frames, id_col)
+        if shared_order is not None:
+            output_ids = shared_order
+            feat_df = _clean_feature_frame(frames[0], id_col)
+        else:
+            output_ids, feat_df = _merge_feature_frames(frames, id_col, strategy[mod])
+        if not output_ids:
+            continue
+        if entity in ("genes", "GA_genes") and "symbol" not in feat_df.columns:
+            feat_df["symbol"] = feat_df[id_col]
+        out.set_entity(entity, feat_df)
+        out.flush()
+        store_column_meta(out._conn, entity, feat_df)
+        merged_axis[mod] = (entity, id_col, output_ids, shared_order is not None)
+    return merged_axis
+
+
+def _merge_raw_var(datasets, out):
+    """The union of the inputs' raw var tables (``adata.raw.var``), by
+    ``var_name``; None when no input has one."""
+    frames = [f for f in (_read_entity_frame(ds, "_raw_var") for ds in datasets)
+              if f is not None and len(f) and "var_name" in f.columns]
+    if not frames:
+        return None
+    shared = _identical_feature_axis(frames, "var_name")
+    if shared is not None:
+        ids, df = shared, _clean_feature_frame(frames[0], "var_name")
+    else:
+        ids, df = _merge_feature_frames(frames, "var_name", "union")
+    df = df.drop(columns=[c for c in df.columns if c == "var_idx"], errors="ignore")
+    from cytome.io.convert_anndata import _write_raw_var_table
+    _write_raw_var_table(out._conn, df.set_index("var_name", drop=False))
+    out._conn.commit()
+    return ids
+
+
 def _read_entity_frame(ds: CytomeDataset, entity: str):
     """Return entity table ``entity`` as a DataFrame, or None if it doesn't
     exist. Reads by raw SQL — ``getattr(ds, 'tiles')`` / ``ds.GA`` resolve to a
     Modality via __getattr__, not the entity table, so the attribute path can't
     be used uniformly across genes/peaks/tiles/GA_genes."""
     exists = ds._conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (entity,)
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name=?", (entity,)
     ).fetchone()
+    if exists is None:
+        exists = ds._conn.execute(
+            "SELECT 1 FROM sqlite_temp_master WHERE type IN ('table', 'view') AND name=?",
+            (entity,)).fetchone()
     if exists is None:
         return None
     try:
-        return pd.read_sql_query(f"SELECT * FROM {entity}", ds._conn)
+        df = pd.read_sql_query(f'SELECT * FROM "{entity}"', ds._conn)
     except Exception:
         return None
+    if entity in getattr(ds._conn, "shim_views", ()) and "rowid" in df.columns:
+        df = df.drop(columns=["rowid"])
+    return df
 
 
 def _collect_matrix_names(datasets: list[CytomeDataset]) -> list[str]:
@@ -301,16 +470,9 @@ def _merge_feature_frames(frames: list[pd.DataFrame], id_col: str, strategy: str
     return output_ids, df.reset_index(drop=True)
 
 
-def _layer_for(ds: CytomeDataset, matrix_name: str):
-    """Resolve the MeasurementLayer for ``{modality}_{layer}`` if present."""
-    row = ds._conn.execute(
-        "SELECT 1 FROM matrix_meta WHERE matrix_name = ?", (matrix_name,)
-    ).fetchone()
-    if row is None:
-        return None
-    modality, layer = matrix_name.split("_", 1)
-    return getattr(ds, modality).layer(layer)
-
+# ---------------------------------------------------------------------------
+# matrices
+# ---------------------------------------------------------------------------
 
 def _projection_matrix(in_features, out_idx, n_out, dtype):
     """0/1 sparse projection P (n_in × n_out): mat @ P reindexes columns."""
@@ -324,217 +486,434 @@ def _projection_matrix(in_features, out_idx, n_out, dtype):
     )
 
 
-def _append_csr_chunks(conn, matrix_name, csr, chunk_size, row_offset, chunk_idx,
-                       total_nnz, compression):
-    """Append one CSR block to ``matrix_chunks`` as compressed row-chunks.
-
-    Rows are written at global positions ``row_offset + local``. Returns the
-    advanced ``(chunk_idx, total_nnz)``. Holds only this block in memory.
-    """
-    from cytome.io.chunked_io import _INSERT_CHUNK_SQL
-    from cytome.io.compression import compress_blob
-
-    csr = csr.tocsr()
-    dtype_str = str(csr.data.dtype)
-    n_rows = csr.shape[0]
-    batch = []
-    for rs in range(0, n_rows, chunk_size):
-        re = min(rs + chunk_size, n_rows)
-        chunk = csr[rs:re]
-        batch.append((
-            matrix_name, chunk_idx, row_offset + rs, row_offset + re, int(chunk.nnz),
-            compress_blob(chunk.data.tobytes(), method=compression),
-            compress_blob(chunk.indices.tobytes(), method=compression),
-            compress_blob(chunk.indptr.tobytes(), method=compression),
-            dtype_str, compression,
-        ))
-        chunk_idx += 1
-        total_nnz += int(chunk.nnz)
-    if batch:
-        conn.executemany(_INSERT_CHUNK_SQL, batch)
-    return chunk_idx, total_nnz
+def _column_entities(ds) -> dict:
+    from cytome.utils.validation import matrix_column_entities
+    return matrix_column_entities(ds._conn)
 
 
-def _stream_write_matrix(out, datasets, matrix_name, output_features, n_cells_per_ds,
-                         entity, feat_col):
-    """Merge a matrix onto a unified feature axis and stream it to disk.
+def _out_dtype(dtypes, requested):
+    """The dtype of a merged matrix: the promotion of the inputs' (no value
+    changes), or the one asked for."""
+    if requested is not None:
+        return np.dtype(requested)
+    return np.result_type(*[np.dtype(d) for d in dtypes])
 
-    Processes ONE input at a time — load → (identity fast path | sparse
-    projection ``mat @ P``) → append compressed row-chunks → free — so peak
-    memory is a single input's matrix, never the full vstacked atlas (which
-    OOMs at 10s-of-millions-cell scale). Datasets missing the matrix contribute
-    an aligned all-zero block so rows stay aligned with the merged cells table.
-    ``output_features=None`` ⇒ no remap (identical/native feature axis);
-    otherwise ``entity``/``feat_col`` name the per-input feature table + id
-    column used to project onto ``output_features``.
+
+def _stream_write_matrix(out, datasets, matrix_name, n_cells_per_ds, merged_axis, raw_axis,
+                         requested_dtype):
+    """Merge a matrix onto the feature axis of its own feature table and stream it.
+
+    One row chunk of one input at a time — (identity | sparse projection
+    ``chunk @ P``) → the output's layer writer — so memory holds a chunk, not an
+    input's whole matrix (an input stored column-major is read whole). An input
+    without the matrix contributes empty rows. Every chunk is written in the
+    one dtype of the merged matrix: chunks used to keep their input's dtype under
+    the first input's, and an int32 count of 2 read back as 1,073,741,824 from a
+    float32 merge.
     """
     from cytome.core.dataset import _infer_col_entity
-    from cytome.io.chunk_tuning import compute_chunk_size
-    from cytome.io.chunked_io import _now_iso
+    from cytome.io.chunked_io import read_sparse_rows_iter
 
-    conn = out._conn
     metas = {}
     for i, ds in enumerate(datasets):
         metas[i] = ds._conn.execute(
-            "SELECT n_cols, n_nonzero, dtype FROM matrix_meta WHERE matrix_name = ?",
-            (matrix_name,),
-        ).fetchone()
-    if all(m is None for m in metas.values()):
+            "SELECT n_cols, n_nonzero, dtype, COALESCE(n_chunks, 0), COALESCE(has_csc, 0) "
+            "FROM matrix_meta WHERE matrix_name = ?", (matrix_name,)).fetchone()
+    present = [i for i, m in metas.items() if m is not None]
+    if not present:
         return
 
-    if output_features is not None:
-        n_cols = len(output_features)
-        out_idx = {g: i for i, g in enumerate(output_features)}
+    entities = {i: _column_entities(datasets[i]).get(matrix_name) for i in present}
+    mod = matrix_name.split("_", 1)[0]
+    axis = merged_axis.get(mod)
+    ent_set = {entities[i] for i in present}
+    if ent_set == {"_raw_var"} and raw_axis is not None:
+        out_ids, entity, feat_col, table = raw_axis, "_raw_var", "var_name", "_raw_var"
+    elif axis is not None and ent_set == {axis[0]}:
+        out_ids, entity, feat_col, table = axis[2], axis[0], axis[1], axis[0]
     else:
-        n_cols = next(int(m[0]) for m in metas.values() if m is not None)
-        out_idx = None
-        entity = _infer_col_entity(matrix_name)
+        # no feature table to project by (a sparse obsm stored as a matrix, or
+        # a matrix of no modality): kept only when every input has one width
+        widths = {int(metas[i][0]) for i in present}
+        if len(widths) != 1:
+            warnings.warn(
+                f"cytome.merge: {matrix_name} has no feature table to align its columns by "
+                f"and its inputs differ in width ({sorted(widths)}); it is not merged.",
+                UserWarning, stacklevel=4)
+            return
+        out_ids, table, feat_col = None, None, None
+        entity = next(iter(ent_set)) if len(ent_set) == 1 else None
+        if entity is None:
+            entity = "_obsm" if any(e is None for e in ent_set) else _infer_col_entity(matrix_name)
 
-    dtype = np.dtype(next((m[2] for m in metas.values() if m is not None), "float32"))
+    n_cols = len(out_ids) if out_ids is not None else int(metas[present[0]][0])
+    out_idx = {g: k for k, g in enumerate(out_ids)} if out_ids is not None else None
+    dtype = _out_dtype([metas[i][2] for i in present], requested_dtype)
     total_rows = int(sum(n_cells_per_ds))
-    total_nnz_est = sum(int(m[1]) for m in metas.values() if m is not None)
-    chunk_size = compute_chunk_size(total_rows, n_cols, max(1, total_nnz_est))
-
-    conn.execute("DELETE FROM matrix_chunks WHERE matrix_name = ?", (matrix_name,))
-    conn.execute("DELETE FROM matrix_meta WHERE matrix_name = ?", (matrix_name,))
-
-    chunk_idx = 0
+    writer = out.create_layer_writer(matrix_name, n_rows=total_rows, n_cols=n_cols,
+                                     dtype=dtype, col_entity=entity)
     row_offset = 0
-    total_nnz = 0
     for i, (ds, n_cells) in enumerate(zip(datasets, n_cells_per_ds)):
         if metas[i] is None:
-            block = sp.csr_matrix((n_cells, n_cols), dtype=dtype)
+            writer.write_chunk(sp.csr_matrix((n_cells, n_cols), dtype=dtype), row_offset)
+            row_offset += n_cells
+            continue
+        P = None
+        if out_idx is not None:
+            fdf = _read_entity_frame(ds, table)
+            in_features = (list(fdf[feat_col].astype(str))
+                           if fdf is not None and feat_col in fdf.columns else None)
+            if in_features is None or len(in_features) != int(metas[i][0]):
+                raise ValueError(
+                    f"cytome.merge: {matrix_name} of input {i} has {int(metas[i][0])} columns "
+                    f"and its feature table {table} "
+                    f"{0 if in_features is None else len(in_features)} rows; its columns "
+                    f"cannot be aligned")
+            if in_features != out_ids:
+                P = _projection_matrix(in_features, out_idx, n_cols, dtype)
+        column_major = int(metas[i][3]) == 0 and bool(metas[i][4])
+        if column_major:
+            from cytome.core.measurement import MeasurementLayer
+            blocks = [(0, MeasurementLayer(ds._conn, matrix_name).to_memory())]
         else:
-            mat = _layer_for(ds, matrix_name).to_memory().tocsr()
-            if output_features is None:
-                block = mat
+            blocks = ((rs, chunk) for rs, _re, chunk in read_sparse_rows_iter(ds._conn, matrix_name))
+        written = 0
+        for rs, chunk in blocks:
+            rs = min(int(rs), n_cells)
+            if rs > written:                 # rows the input's chunks skip: zero rows
+                writer.write_chunk(sp.csr_matrix((rs - written, n_cols), dtype=dtype),
+                                   row_offset + written)
+            rows = min(chunk.shape[0], n_cells - rs)
+            if rows <= 0:
+                continue
+            block = chunk[:rows] if rows < chunk.shape[0] else chunk
+            if P is not None:
+                block = (block @ P).tocsr()
+            writer.write_chunk(block, row_offset + rs)
+            written = rs + rows
+        if written < n_cells:
+            writer.write_chunk(sp.csr_matrix((n_cells - written, n_cols), dtype=dtype),
+                               row_offset + written)
+        row_offset += n_cells
+    writer.finalize()
+
+
+# ---------------------------------------------------------------------------
+# embeddings, spatial
+# ---------------------------------------------------------------------------
+
+def _merge_embeddings(datasets, out, n_cells_per_ds) -> None:
+    """Each cell embedding, its rows concatenated over the inputs. (Only the
+    last input's survived before: 2 rows for 5 cells.)"""
+    names = []
+    for ds in datasets:
+        for name in ds.embeddings.keys():
+            if name not in names:
+                names.append(name)
+    for name in names:
+        widths = {int(ds._conn.execute("SELECT n_cols FROM embedding_meta WHERE array_name = ?",
+                                       (name,)).fetchone()[0])
+                  for ds in datasets if name in ds.embeddings}
+        if len(widths) != 1:
+            warnings.warn(f"cytome.merge: embedding {name!r} has widths {sorted(widths)} in the "
+                          f"inputs; it is not merged.", UserWarning, stacklevel=4)
+            continue
+        width = widths.pop()
+        parts, missing = [], []
+        for k, (ds, n) in enumerate(zip(datasets, n_cells_per_ds)):
+            if name in ds.embeddings:
+                parts.append(ds.embeddings[name])
             else:
-                fdf = _read_entity_frame(ds, entity)
-                in_features = (
-                    list(fdf[feat_col].astype(str))
-                    if fdf is not None and feat_col in fdf.columns else None
-                )
-                if in_features is None:
-                    block = sp.csr_matrix((mat.shape[0], n_cols), dtype=mat.dtype)
-                elif in_features == output_features:
-                    block = mat  # identity fast path — no remap
-                else:
-                    block = (mat @ _projection_matrix(in_features, out_idx, n_cols, mat.dtype)).tocsr()
-            mat = None
-        chunk_idx, total_nnz = _append_csr_chunks(
-            conn, matrix_name, block, chunk_size, row_offset, chunk_idx, total_nnz, "zstd"
-        )
-        row_offset += block.shape[0]
-        block = None
-
-    conn.execute(
-        """INSERT INTO matrix_meta(
-            matrix_name, n_rows, n_cols, n_nonzero, dtype,
-            row_entity, col_entity, chunk_size, n_chunks, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (matrix_name, int(row_offset), int(n_cols), int(total_nnz), str(dtype),
-         "cells", entity, int(chunk_size), int(chunk_idx), _now_iso()),
-    )
-    conn.commit()
+                parts.append(np.full((n, width), np.nan))
+                missing.append(k)
+        if missing:
+            warnings.warn(f"cytome.merge: embedding {name!r} is missing from input(s) {missing}; "
+                          f"their cells get NaN rows.", UserWarning, stacklevel=4)
+        out.add_embedding(name, np.vstack(parts), flush=False)
+    out.flush()
 
 
-def _merge_fragments(datasets, out, cell_offsets) -> None:
+def _merge_var_embeddings(datasets, out, merged_axis) -> None:
+    """Var embeddings follow features: carried from the first input that has
+    each, when its modality's feature axis came out unchanged."""
+    entity_of_axis = {v[0]: v for v in merged_axis.values()}
+    done = set()
+    for ds in datasets:
+        for name, entity in ds._conn.execute(
+                "SELECT array_name, entity FROM embedding_meta WHERE entity != 'cells'").fetchall():
+            if name in done:
+                continue
+            axis = entity_of_axis.get(entity)
+            if axis is None or not axis[3]:
+                continue                       # the feature axis changed: rows would not align
+            out.add_var_embedding(name, ds.var_embeddings[name], entity=entity, flush=False)
+            done.add(name)
+    out.flush()
+
+
+def _merge_spatial(datasets, out, batch_labels) -> None:
+    """Gene models (from the first input that has them: one assembly), spatial
+    images and scale factors (all inputs'; a library id taken twice is renamed
+    ``<label>:<library>``) and spatial coordinates (offset to the merged cells)."""
+    from cytome.io.subset import _copy_feature_table, _table_has_rows
+    for tbl in ("_gene_annotation", "_exon_annotation"):
+        for ds in datasets:
+            if _table_has_rows(ds._conn, tbl):
+                _copy_feature_table(ds._conn, out._conn, tbl)
+                break
+    taken = set()
+    images_seen = False
+    for ds, label in zip(datasets, batch_labels):
+        if not (_table_has_rows(ds._conn, "spatial_images")
+                or _table_has_rows(ds._conn, "spatial_scalefactors")):
+            continue
+        from cytome.core.spatial import _ensure_tables
+        if not images_seen:
+            _ensure_tables(out._conn)
+            images_seen = True
+        libs = set()
+        for tbl in ("spatial_images", "spatial_scalefactors"):
+            if _table_has_rows(ds._conn, tbl):
+                libs.update(r[0] for r in ds._conn.execute(f"SELECT library_id FROM {tbl}"))
+        rename = {lib: (f"{label}:{lib}" if lib in taken else lib) for lib in libs}
+        taken.update(rename.values())
+        with out._conn:
+            if _table_has_rows(ds._conn, "spatial_images"):
+                for row in ds._conn.execute(
+                        "SELECT library_id, img_key, image, format, height, width, channels, "
+                        "dtype FROM spatial_images"):
+                    out._conn.execute("INSERT INTO spatial_images VALUES (?,?,?,?,?,?,?,?)",
+                                      (rename[row[0]], *row[1:]))
+            if _table_has_rows(ds._conn, "spatial_scalefactors"):
+                for lib, key, value in ds._conn.execute(
+                        "SELECT library_id, key, value FROM spatial_scalefactors"):
+                    out._conn.execute("INSERT OR REPLACE INTO spatial_scalefactors "
+                                      "VALUES (?,?,?)", (rename[lib], key, value))
+    # coordinates: each input's cells by position, offset
+    rows, offset = [], 0
+    for ds in datasets:
+        pos = _cell_positions(ds)
+        if _table_has_rows(ds._conn, "spatial_coords"):
+            for ci, x, y, z in ds._conn.execute("SELECT cell_idx, x, y, z FROM spatial_coords"):
+                p = pos.get(int(ci))
+                if p is not None:
+                    rows.append((offset + p, x, y, z))
+        offset += len(pos)
+    if rows:
+        with out._conn:
+            out._conn.executemany("INSERT INTO spatial_coords (cell_idx, x, y, z) VALUES (?,?,?,?)",
+                                  rows)
+            out._conn.executemany("INSERT INTO spatial_rtree (id, min_x, max_x, min_y, max_y) "
+                                  "VALUES (?,?,?,?,?)", [(c, x, x, y, y) for c, x, y, _z in rows])
+
+
+def _cell_positions(ds) -> dict:
+    """``{cell_idx: row}`` of an input (its cell_idx need not be its rows)."""
+    ci = np.asarray(ds.cells["cell_idx"], dtype=np.int64)
+    return {int(c): i for i, c in enumerate(ci)}
+
+
+# ---------------------------------------------------------------------------
+# fragments
+# ---------------------------------------------------------------------------
+
+def _merge_fragments(datasets, out) -> None:
     """Merge ATAC fragments into the output's compressed ``fragment_chunks``.
 
-    Cells are concatenated in order, so dataset ``d``'s cells occupy the
-    contiguous global block starting at ``cell_offsets[d]`` — the cell-index
-    remap is a vectorized ``+offset`` (no barcode round-trip). For each
-    chromosome we gather every input's (start, end, cell+offset), stable-sort by
-    start, and write delta+LZ4 chunks via the shared converter, matching the
-    importer/subset layout. Inputs without ATAC fragments are skipped.
+    Each input's cells occupy a contiguous block of the merged cells; a
+    fragment's ``cell_idx`` goes to its cell's row in that block (by position,
+    so an input whose cell_idx is not its rows is still right). Per chromosome
+    the inputs' start-sorted chunk streams are merged by start, a chunk of each
+    input at a time (a k-way merge): memory holds about one chunk per input, not
+    the chromosome of every input. An input whose chunks are not start-sorted
+    has that chromosome loaded and sorted.
     """
-    from cytome.io.convert_fragments import _write_block_chunks, _update_fragment_meta
+    from cytome.io.convert_fragments import _update_fragment_meta, _write_block_chunks
+    from cytome.io.subset import _has_fragments
 
     CHUNK_SIZE = 500_000
-
-    has_any = False
+    sources = []                                   # (FragmentStore, remap array)
+    offset = 0
     chroms = []
-    seen = set()
-    frag_sources = []  # (frags_store, offset)
-    for ds, offset in zip(datasets, cell_offsets):
-        if "ATAC" not in ds.modalities:
-            continue
-        frags = ds.ATAC.fragments
-        if not frags.has_compressed_chunks:
-            # legacy per-row store still works via iter_chromosome_chunks
-            pass
-        frag_sources.append((frags, int(offset)))
-        for chrom in frags.chromosomes:
-            if chrom not in seen:
-                seen.add(chrom)
-                chroms.append(chrom)
-        has_any = True
-    if not has_any:
+    for ds in datasets:
+        n = ds.n_cells
+        if _has_fragments(ds):
+            ci = np.asarray(ds.cells["cell_idx"], dtype=np.int64)
+            remap = np.full(int(ci.max()) + 1 if ci.size else 0, -1, dtype=np.int64)
+            remap[ci] = offset + np.arange(ci.size, dtype=np.int64)
+            frags = ds.fragments
+            sources.append((frags, remap))
+            for chrom in frags.chromosomes:
+                if chrom not in chroms:
+                    chroms.append(chrom)
+        offset += n
+    if not sources:
         return
-
-    out._conn.execute(
-        """CREATE TABLE IF NOT EXISTS fragment_chunks (
-            id INTEGER PRIMARY KEY,
-            chrom TEXT NOT NULL,
-            chunk_idx INTEGER NOT NULL,
-            row_start INTEGER NOT NULL,
-            row_end INTEGER NOT NULL,
-            n_fragments INTEGER NOT NULL,
-            min_start INTEGER,
-            starts_blob BLOB NOT NULL,
-            ends_blob BLOB NOT NULL,
-            cell_idx_blob BLOB NOT NULL,
-            compression TEXT DEFAULT 'lz4',
-            encoding INTEGER DEFAULT 1,
-            UNIQUE(chrom, chunk_idx)
-        )"""
-    )
-    out._conn.execute(
-        """CREATE TABLE IF NOT EXISTS fragment_meta (
-            chrom TEXT PRIMARY KEY,
-            n_fragments INTEGER NOT NULL,
-            table_name TEXT NOT NULL,
-            rtree_name TEXT NOT NULL,
-            min_start INTEGER,
-            max_end INTEGER
-        )"""
-    )
 
     with out._conn:
         for chrom in chroms:
-            parts_s, parts_e, parts_c = [], [], []
-            for frags, offset in frag_sources:
-                if chrom not in frags.chromosomes:
-                    continue
-                for src_s, src_e, src_c in frags.iter_chromosome_chunks(chrom):
-                    if src_s.size == 0:
+            writer = _ChunkWriter(out._conn, chrom, CHUNK_SIZE, _write_block_chunks)
+            streams = [_SortedStream(frags.iter_chromosome_chunks(chrom), remap)
+                       for frags, remap in sources if chrom in frags.chromosomes]
+            if not _kway(streams, writer):
+                # an input not start-sorted: this chromosome loaded whole and sorted
+                out._conn.execute("DELETE FROM fragment_chunks WHERE chrom = ?", (chrom,))
+                writer = _ChunkWriter(out._conn, chrom, CHUNK_SIZE, _write_block_chunks)
+                parts = []
+                for frags, remap in sources:
+                    if chrom not in frags.chromosomes:
                         continue
-                    parts_s.append(src_s.astype(np.int32, copy=False))
-                    parts_e.append(src_e.astype(np.int32, copy=False))
-                    parts_c.append((src_c.astype(np.int64) + offset).astype(np.int32))
-            if not parts_s:
-                continue
-            starts = np.concatenate(parts_s)
-            ends = np.concatenate(parts_e)
-            cells = np.concatenate(parts_c)
-            # global sort-by-start so chunks keep the importer/subset invariant
-            order = np.argsort(starts, kind="mergesort")
-            starts = starts[order]
-            ends = ends[order]
-            cells = cells[order]
-            _write_block_chunks(
-                out._conn, chrom, starts, ends, cells,
-                chunk_size=CHUNK_SIZE, compression="lz4", compression_level=1,
-                chunk_idx_start=0, encoding=1,
-            )
-            _update_fragment_meta(out._conn, chrom, len(starts), max_end=int(ends.max()))
+                    for s, e, c in frags.iter_chromosome_chunks(chrom):
+                        parts.append(_remapped(s, e, c, remap))
+                s = np.concatenate([p[0] for p in parts])
+                e = np.concatenate([p[1] for p in parts])
+                c = np.concatenate([p[2] for p in parts])
+                order = np.argsort(s, kind="mergesort")
+                writer.add(s[order], e[order], c[order])
+            writer.close()
+            if writer.n:
+                _update_fragment_meta(out._conn, chrom, writer.n, max_end=writer.max_end)
 
     from cytome.index.builder import build_fragment_indices
-
     build_fragment_indices(out._conn)
 
 
+def _remapped(s, e, c, remap):
+    c = np.asarray(c, dtype=np.int64)
+    ok = (c >= 0) & (c < remap.size)
+    mapped = np.full(c.shape, -1, dtype=np.int64)
+    mapped[ok] = remap[c[ok]]
+    keep = mapped >= 0
+    if not keep.all():
+        s, e, mapped = s[keep], e[keep], mapped[keep]
+    return (np.asarray(s, dtype=np.int32), np.asarray(e, dtype=np.int32),
+            mapped.astype(np.int32))
+
+
+class _SortedStream:
+    """One input's chunks of a chromosome, remapped, checked to be start-sorted."""
+
+    def __init__(self, it, remap):
+        self._it, self._remap = it, remap
+        self.buf = None                     # (starts, ends, cells), what is not yet emitted
+        self.done = False
+        self.unsorted = False
+        self._last = None
+
+    def fill(self) -> None:
+        while not self.done and (self.buf is None or self.buf[0].size == 0):
+            try:
+                s, e, c = next(self._it)
+            except StopIteration:
+                self.done = True
+                return
+            if s.size == 0:
+                continue
+            if np.any(s[1:] < s[:-1]) or (self._last is not None and s[0] < self._last):
+                self.unsorted = True
+                self.done = True
+                return
+            self._last = int(s[-1])
+            self.buf = _remapped(s, e, c, self._remap)
+
+
+def _kway(streams, writer) -> bool:
+    """Merge start-sorted streams into ``writer``; False if one turns out unsorted."""
+    while True:
+        for st in streams:
+            st.fill()
+        if any(st.unsorted for st in streams):
+            return False
+        live = [st for st in streams if st.buf is not None and st.buf[0].size]
+        if not live:
+            return True
+        waiting = [st for st in live if not st.done]
+        # every fragment still to come from a stream starts at or after the last
+        # start it has buffered: up to the smallest of those, the order is final
+        bound = min(int(st.buf[0][-1]) for st in waiting) if waiting else None
+        parts = []
+        for st in live:
+            s, e, c = st.buf
+            k = s.size if bound is None else int(np.searchsorted(s, bound, side="right"))
+            if k:
+                parts.append((s[:k], e[:k], c[:k]))
+                st.buf = (s[k:], e[k:], c[k:])
+        s = np.concatenate([p[0] for p in parts])
+        e = np.concatenate([p[1] for p in parts])
+        c = np.concatenate([p[2] for p in parts])
+        order = np.argsort(s, kind="mergesort")
+        writer.add(s[order], e[order], c[order])
+
+
+class _ChunkWriter:
+    """Fragments added in start order, written as full chunks as they fill."""
+
+    def __init__(self, conn, chrom, chunk_size, write):
+        self.conn, self.chrom, self.size, self._write = conn, chrom, chunk_size, write
+        self.buf = ([], [], [])
+        self.held = 0
+        self.next_idx = 0
+        self.n = 0
+        self.max_end = None
+
+    def add(self, s, e, c) -> None:
+        if not s.size:
+            return
+        self.buf[0].append(s)
+        self.buf[1].append(e)
+        self.buf[2].append(c)
+        self.held += s.size
+        m = int(e.max())
+        self.max_end = m if self.max_end is None else max(self.max_end, m)
+        if self.held >= self.size:
+            self._flush(full_only=True)
+
+    def _flush(self, full_only: bool) -> None:
+        if not self.held:
+            return
+        s = np.concatenate(self.buf[0])
+        e = np.concatenate(self.buf[1])
+        c = np.concatenate(self.buf[2])
+        n = (s.size // self.size) * self.size if full_only else s.size
+        if n:
+            self._write(self.conn, self.chrom, s[:n], e[:n], c[:n], chunk_size=self.size,
+                        compression="lz4", compression_level=1, chunk_idx_start=self.next_idx,
+                        encoding=1)
+            self.next_idx += -(-n // self.size)
+            self.n += n
+        self.buf = ([s[n:]], [e[n:]], [c[n:]])
+        self.held = s.size - n
+
+    def close(self) -> None:
+        self._flush(full_only=False)
+
+
+# ---------------------------------------------------------------------------
+# metadata
+# ---------------------------------------------------------------------------
+
 def _merge_metadata(datasets: list[CytomeDataset], out: CytomeDataset, labels: Sequence[str]) -> None:
+    """Each input's metadata under ``<label>:<key>``; the AnnData conversion
+    records (``_anndata_*``) are united unprefixed, so ``to_anndata`` of the
+    merge still finds its layers, obsm and raw (they were prefixed and lost)."""
+    united: dict = {}
     for ds, label in zip(datasets, labels):
         for key, value in ds.metadata.items():
+            if key.startswith("_anndata_"):
+                if isinstance(value, dict):
+                    merged = dict(united.get(key) or {})
+                    for k, v in value.items():
+                        merged.setdefault(k, v)
+                    united[key] = merged
+                else:
+                    united.setdefault(key, value)
+                continue
             out.metadata[f"{label}:{key}"] = value
+    raw = united.get("_anndata_raw")
+    if isinstance(raw, dict) and raw.get("matrix_name") and \
+            out.matrix_meta(raw["matrix_name"]) is None:
+        united.pop("_anndata_raw")
+    if "_anndata_obs_index" in united and united["_anndata_obs_index"] not in out.cells.columns:
+        united.pop("_anndata_obs_index")
+    for key, value in united.items():
+        out.metadata[key] = value

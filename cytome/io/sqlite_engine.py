@@ -123,9 +123,32 @@ def create_database(path: PathLike, force: bool = False) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     _configure_connection(conn)
     _create_schema(conn)
+    ensure_chunk_span_indexes(conn)
     _init_manifest(conn, db_path.stem)
     conn.commit()
     return conn
+
+
+def ensure_chunk_span_indexes(conn: sqlite3.Connection) -> None:
+    """Covering indexes for the chunk-range queries every masked or partial
+    read starts with (which chunks hold which rows, and how many entries).
+
+    Without them SQLite answers from the table, whose rows also hold the blobs:
+    100 ms and 6.1 MB read per 10,000 chunks, against 13 ms and 0.4 MB (audit
+    2026-10-27). Made by a new store and by the matrix writers, which hold the
+    write lock anyway, never by an open: building one on a large older store
+    takes a write lock and seconds. Readers never need them.
+    """
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_matrix_chunks_span ON "
+            "matrix_chunks(matrix_name, chunk_idx, row_start, row_end, n_nonzero)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_csc_chunks_span ON "
+            "matrix_csc_chunks(matrix_name, chunk_idx, col_start, col_end, n_nonzero)")
+    except sqlite3.OperationalError as exc:
+        if "readonly" not in str(exc).lower() and "read-only" not in str(exc).lower():
+            raise
 
 
 class ReadOnlyError(sqlite3.OperationalError):

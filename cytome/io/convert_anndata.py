@@ -248,6 +248,155 @@ def _resolve_main_matrix_name(modality, x_is_integer, counts_layer,
     return f"{modality}_{_MAIN_LAYER_FALLBACK}"
 
 
+#: the cells column that keeps obs_names when they are not the barcode column
+_OBS_NAME_COL = "_obs_name"
+#: the feature-table column that keeps var_names when no other column holds them
+_VAR_NAME_COL = "_var_name"
+#: col_entity of matrices with no feature table of the modality (see FORMAT_SPEC)
+_RAW_ENTITY = "_raw_var"
+_OBSM_ENTITY = "_obsm"
+
+
+def _drop_incoming_key(df: pd.DataFrame, key: str, what: str) -> pd.DataFrame:
+    """``df`` without cytome's own row key ``key`` (``cell_idx``, ``gene_idx``).
+
+    The key is assigned by position. ``to_anndata`` of earlier versions exported
+    it, and kept as the key it is wrong after any subset: genes 2, 3 and 4 of a
+    three-column matrix, so a lookup of gene 2 read gene 4's column. SQLite
+    names compare without case, so ``Cell_idx`` is the key too.
+    """
+    cols = [c for c in df.columns if str(c).lower() == key.lower()]
+    if not cols:
+        return df
+    for c in cols:
+        vals = pd.to_numeric(df[c], errors="coerce").to_numpy()
+        if not np.array_equal(vals, np.arange(len(df))):
+            warnings.warn(
+                f"{what}: the column {c!r} is cytome's row key, assigned by position; "
+                f"its values ({vals[:3].tolist()} ...) are not positions and are dropped",
+                UserWarning, stacklevel=4)
+    return df.drop(columns=cols)
+
+
+def _prepare_obs(obs: pd.DataFrame):
+    """``(cells frame, column holding obs_names or None)`` for an AnnData's obs.
+
+    ``barcode`` is the obs_names unless obs has its own ``barcode`` column; then
+    obs_names that differ from it (unique names over merged libraries, say) are
+    kept in ``_obs_name``, which :func:`to_anndata` makes the index again.
+    """
+    obs = _drop_incoming_key(obs.copy(), "cell_idx", "obs")
+    names = np.asarray(pd.Index(obs.index).astype(str), dtype=object)
+    index_col = None
+    if "barcode" not in obs.columns:
+        obs.insert(0, "barcode", names)
+    elif not np.array_equal(obs["barcode"].astype(str).to_numpy(dtype=object), names):
+        obs = obs.drop(columns=[_OBS_NAME_COL], errors="ignore")
+        obs.insert(0, _OBS_NAME_COL, names)
+        index_col = _OBS_NAME_COL
+    return obs.reset_index(drop=True), index_col
+
+
+def _prepare_var(var: pd.DataFrame, var_names, modality: str, id_col: str, key_col: str):
+    """``(feature frame, column holding var_names or None)`` for an AnnData's var.
+
+    One routine for the in-memory and the streaming conversion, which keyed
+    genes differently and failed on duplicate names in the streaming one. The
+    id column is unique (``gene_ids`` when the var has them, var_names
+    otherwise, duplicates suffixed); var_names that end up in another column
+    (``symbol`` for a 10x var) are recorded, so ``to_anndata`` restores them
+    (it returned the Ensembl IDs as var_names).
+    """
+    var = _drop_incoming_key(var.copy(), key_col, "var")
+    names = np.asarray(pd.Index(var_names).astype(str), dtype=object)
+    if modality.upper() == "ATAC":
+        var = _parse_peak_coords_from_varnames(var, var_names)
+        _check_atac_var_has_peak_coords(var)
+        if id_col not in var.columns:
+            var.insert(0, id_col, names)
+    else:
+        # The cytome id column is UNIQUE. When it isn't already present, prefer an
+        # existing unique id (10x 'gene_ids' = Ensembl) and keep the (possibly
+        # duplicated) symbol — var_names — in a 'symbol' column for name-based
+        # lookup. Otherwise fall back to var_names as the id.
+        if id_col not in var.columns:
+            if "gene_ids" in var.columns:
+                if "symbol" not in var.columns:
+                    var.insert(0, "symbol", names)
+                    warn_duplicate_symbols(var["symbol"].values)
+                var.insert(0, id_col, var["gene_ids"].astype(str).values)
+            else:
+                var.insert(0, id_col, names)
+        # Populate a 'symbol' display column from a recognised alias when the source
+        # carries gene symbols under a non-standard name (CELLxGENE 'feature_name',
+        # etc.) so downstream name resolution (COSG/dotplot/inferGRN) shows symbols,
+        # not Ensembl ids. Only when 'symbol' isn't already a real column.
+        if "symbol" not in var.columns:
+            for _alias in ("gene_symbols", "gene_symbol", "gene_name",
+                           "feature_name", "Symbol", "symbols"):
+                if _alias in var.columns:
+                    var.insert(0, "symbol", var[_alias].astype(str).values)
+                    warn_duplicate_symbols(var["symbol"].values)
+                    break
+    # Enforce uniqueness of the id column only when it is actually violated.
+    ids = var[id_col].astype(str).values
+    uids = make_unique_ids(ids)
+    if list(uids) != list(ids):
+        warnings.warn(
+            f"Duplicate {id_col} values were de-duplicated with -1/-2 suffixes "
+            f"(the cytome {id_col} column is UNIQUE).", UserWarning, stacklevel=3)
+        var[id_col] = uids
+    index_col = None
+    if not np.array_equal(var[id_col].astype(str).to_numpy(dtype=object), names):
+        for c in ("symbol",):
+            if c in var.columns and np.array_equal(
+                    var[c].astype(str).to_numpy(dtype=object), names):
+                index_col = c
+                break
+        else:
+            var = var.drop(columns=[_VAR_NAME_COL], errors="ignore")
+            var.insert(0, _VAR_NAME_COL, names)
+            index_col = _VAR_NAME_COL
+    return var.reset_index(drop=True), index_col
+
+
+def _same_matrix(a, b) -> bool:
+    """Whether two sparse matrices hold the same values (canonical forms compared)."""
+    if a.shape != b.shape:
+        return False
+    a, b = sp.csr_matrix(a), sp.csr_matrix(b)
+    return (a != b).nnz == 0
+
+
+class _MatrixNames:
+    """The matrix names one conversion writes, refusing a name given twice.
+
+    A non-integer X is stored as ``RNA_data``, and a layer named ``data`` was
+    written under the same name and replaced it (a Seurat-derived h5ad: X =
+    scale.data, layers data and counts); ``counts_layer=`` with
+    ``main_layer_name='counts'`` replaced the verified counts with X. Two
+    sources of one name are refused, unless they hold the same matrix, which
+    is then stored once and the second name recorded as an alias.
+    """
+
+    def __init__(self, compare):
+        self._compare = compare
+        self.sources: dict[str, tuple[str, Any]] = {}
+
+    def claim(self, name: str, source: str, matrix) -> bool:
+        """True: write ``matrix`` as ``name``; False: it is already there."""
+        if name in self.sources:
+            prev_source, prev = self.sources[name]
+            if self._compare(prev, matrix):
+                return False
+            raise ValueError(
+                f"{source} and {prev_source} would both be stored as {name!r}, and they "
+                f"differ. Pass main_layer_name= to name X (main_layer_name='scale_data', say), "
+                f"or rename the layer.")
+        self.sources[name] = (source, matrix)
+        return True
+
+
 def from_anndata(
     adata,
     modality: str = "RNA",
@@ -277,74 +426,36 @@ def from_anndata(
     asking for a counts-only conversion means the same thing either way:
     before this, ``from_h5ad(..., backed=False, skip_layers=[...])`` accepted
     the argument and wrote every layer anyway.
+
+    ``compression`` names the codec of the matrices (``zstd``, ``lz4`` or
+    ``zlib``). Two sources that would be stored under one name (a layer called
+    ``data`` beside a non-integer X) are refused unless they hold the same
+    matrix; ``main_layer_name=`` names X.
     """
-    del compression
+    from cytome.io.compression import _resolve_method
+    _resolve_method(compression)
     if output is None:
         handle = tempfile.NamedTemporaryFile(suffix=".cytome", delete=False)
         output = handle.name
         handle.close()
         force = True  # the tempfile we just created is ours to overwrite
 
-    ds = CytomeDataset(output, mode="w", force=force)
     # Route the var entity table + id column via the modality registry
     # (single source of truth in cytome.utils.modality). Supports RNA →
-    # genes, GA → GA_genes, ATAC → peaks, tiles → tiles. Pre-Round-11
-    # this used a hardcoded ATAC-vs-other dichotomy, which silently
-    # mis-routed GA / tiles inputs into the `genes` table.
+    # genes, GA → GA_genes, ATAC → peaks, tiles → tiles.
     var_entity, id_col = _modality_var_entity(modality)
+    from cytome.core.dataset import _primary_key_for_table
+    obs, obs_index = _prepare_obs(adata.obs)
+    var, var_index = _prepare_var(adata.var, adata.var_names, modality, id_col,
+                                  _primary_key_for_table(var_entity))
 
-    obs = adata.obs.copy()
-    if "barcode" not in obs.columns:
-        obs.insert(0, "barcode", obs.index.astype(str))
-    obs = obs.reset_index(drop=True)
-    ds.set_entity("cells", obs)
-    _store_column_meta(ds._conn, "cells", obs)
+    def _csr(m):
+        return m if sp.issparse(m) else sp.csr_matrix(np.asarray(m))
 
-    var = adata.var.copy()
-    if modality.upper() == "ATAC":
-        var = _parse_peak_coords_from_varnames(var, adata.var_names)
-        _check_atac_var_has_peak_coords(var)
-        if id_col not in var.columns:
-            var.insert(0, id_col, var.index.astype(str))
-    else:
-        # The cytome id column is UNIQUE. When it isn't already present, prefer an
-        # existing unique id (10x 'gene_ids' = Ensembl) and keep the (possibly
-        # duplicated) symbol — var_names — in a 'symbol' column for name-based
-        # lookup. Otherwise fall back to var_names as the id. (Conditional, so the
-        # common var_names-as-id case is unchanged / lossless.)
-        if id_col not in var.columns:
-            if "gene_ids" in var.columns:
-                if "symbol" not in var.columns:
-                    var.insert(0, "symbol", np.asarray(adata.var_names, dtype=str))
-                    warn_duplicate_symbols(var["symbol"].values)
-                var.insert(0, id_col, var["gene_ids"].astype(str).values)
-            else:
-                var.insert(0, id_col, np.asarray(adata.var_names, dtype=str))
-        # Populate a 'symbol' display column from a recognised alias when the source
-        # carries gene symbols under a non-standard name (CELLxGENE 'feature_name',
-        # etc.) so downstream name resolution (COSG/dotplot/inferGRN) shows symbols,
-        # not Ensembl ids. Only when 'symbol' isn't already a real column.
-        if "symbol" not in var.columns:
-            for _alias in ("gene_symbols", "gene_symbol", "gene_name",
-                           "feature_name", "Symbol", "symbols"):
-                if _alias in var.columns:
-                    var.insert(0, "symbol", var[_alias].astype(str).values)
-                    warn_duplicate_symbols(var["symbol"].values)
-                    break
-    # Enforce uniqueness of the id column only when it is actually violated.
-    if id_col in var.columns:
-        ids = var[id_col].astype(str).values
-        uids = make_unique_ids(ids)
-        if list(uids) != list(ids):
-            warnings.warn(
-                f"Duplicate {id_col} values were de-duplicated with -1/-2 suffixes "
-                f"(the cytome {id_col} column is UNIQUE).", UserWarning, stacklevel=2)
-            var[id_col] = uids
-    var = var.reset_index(drop=True)
-    ds.set_entity(var_entity, var)
-    _store_column_meta(ds._conn, var_entity, var)
-
-    matrix = adata.X if sp.issparse(adata.X) else sp.csr_matrix(np.asarray(adata.X))
+    matrix = _csr(adata.X)
+    names = _MatrixNames(_same_matrix)
+    plan: list[tuple[str, Any, str | None]] = []       # (cytome name, matrix, col_entity)
+    layer_aliases: dict[str, str] = {}
 
     # `counts_layer` asserts where the raw counts are. Verify the assertion --
     # storing a normalized matrix under `{modality}_counts` is the whole bug
@@ -358,8 +469,7 @@ def from_anndata(
                 # >= 0.13, which lists X under a None key -- so the error
                 # explaining a bad counts_layer= died before it could print.
                 f"available: {sorted(k for k in adata.layers if k is not None)}")
-        _cl = adata.layers[counts_layer]
-        _cl = _cl if sp.issparse(_cl) else sp.csr_matrix(np.asarray(_cl))
+        _cl = _csr(adata.layers[counts_layer])
         if not _values_are_integer(_cl):
             raise ValueError(
                 f"counts_layer={counts_layer!r} does not hold integer values, "
@@ -367,23 +477,18 @@ def from_anndata(
                 f"'{modality}_counts' and every downstream default reads that "
                 f"name as counts. Pass the layer that holds UMIs, or omit "
                 f"counts_layer and name the matrix with main_layer_name=.")
-        ds.add_matrix(f"{modality}_counts", _cl)
+        names.claim(f"{modality}_counts", f"counts_layer={counts_layer!r}", _cl)
+        plan.append((f"{modality}_counts", _cl, None))
 
     x_matrix_name = _resolve_main_matrix_name(
         modality, _values_are_integer(matrix), counts_layer, main_layer_name)
-    ds.add_matrix(x_matrix_name, matrix)
+    if names.claim(x_matrix_name, "adata.X", matrix):
+        plan.append((x_matrix_name, matrix, None))
 
-    # A layer promoted to `{modality}_counts` must not also be written under
-    # its own name: it is the same matrix, and storing it twice doubles the
-    # file for nothing. The promoted name is the canonical one.
+    # A layer promoted to `{modality}_counts` is not written again under its own
+    # name: it is the same matrix (RNA_count beside RNA_counts, one letter apart).
     skip_layers_set = set(skip_layers or [])
     if counts_layer is not None:
-        skip_layers_set.add(counts_layer)
-    if counts_layer is not None:
-        # already written as `{modality}_counts`; writing it again under its
-        # AnnData name would store one matrix twice and recreate exactly the
-        # near-identical pair this release exists to remove (RNA_count beside
-        # RNA_counts, one letter apart).
         skip_layers_set.add(counts_layer)
     skip_obsm_set = set(skip_obsm or [])
     skip_obsp_set = set(skip_obsp or [])
@@ -394,119 +499,187 @@ def from_anndata(
     if write_layers:
         for layer_name, layer_mat in adata.layers.items():
             # anndata >= 0.13 lists X under a `None` key in `.layers`; 0.10 did
-            # not. Formatted into a name it becomes `{modality}_None`, so every
-            # conversion under a current anndata wrote a third matrix holding a
-            # duplicate of X under a nonsense name -- and `main_layer_name=`
-            # looked ignored, because the matrix it asked for was there beside
-            # one nobody asked for.
-            if layer_name is None:
+            # not. Formatted into a name it becomes `{modality}_None`.
+            if layer_name is None or layer_name in skip_layers_set:
                 continue
-            if layer_name in skip_layers_set:
-                continue
-            cyt_name = f"{modality}_{layer_name}"
-            layer = layer_mat if sp.issparse(layer_mat) else sp.csr_matrix(np.asarray(layer_mat))
-            ds.add_matrix(cyt_name, layer)
-            layer_map[cyt_name] = str(layer_name)
+            key = _metadata_name(str(layer_name))
+            cyt_name = f"{modality}_{key}"
+            layer = _csr(layer_mat)
+            if names.claim(cyt_name, f"layers[{key!r}]", layer):
+                plan.append((cyt_name, layer, None))
+                layer_map[cyt_name] = key
+            else:
+                layer_aliases[key] = cyt_name
 
     obsm_map: dict[str, str] = {}
     obsm_as_matrix: dict[str, str] = {}
+    obsm_dense: list[tuple[str, np.ndarray]] = []
     for key, emb in (adata.obsm.items() if write_obsm else ()):
         if key in skip_obsm_set:
             continue
+        key = _metadata_name(str(key))
         cyt_key = _embedding_name(modality, key,
                                    existing=set(obsm_map) | set(obsm_as_matrix))
         if sp.issparse(emb):
             if emb.shape[1] > 500:
                 # Large sparse obsm (e.g. gene activity) — store as matrix
-                mat = emb.tocsr() if not sp.isspmatrix_csr(emb) else emb
-                ds.add_matrix(cyt_key, mat)
-                obsm_as_matrix[cyt_key] = str(key)
+                mat = emb.tocsr()
+                if names.claim(cyt_key, f"obsm[{key!r}]", mat):
+                    plan.append((cyt_key, mat, _OBSM_ENTITY))
+                obsm_as_matrix[cyt_key] = key
                 continue
             emb = emb.toarray()
+        elif isinstance(emb, pd.DataFrame):
+            if not all(pd.api.types.is_numeric_dtype(t) or pd.api.types.is_bool_dtype(t)
+                       for t in emb.dtypes):
+                warnings.warn(
+                    f"obsm[{key!r}] is a DataFrame with non-numeric columns "
+                    f"({sorted({str(t) for t in emb.dtypes})}); an embedding holds numbers, "
+                    f"so it is not stored (its columns belong in obs).", UserWarning, stacklevel=2)
+                continue
+            emb = emb.to_numpy(dtype=np.float64)
         else:
             emb = np.asarray(emb)
-        ds.add_embedding(cyt_key, emb)
-        obsm_map[cyt_key] = str(key)
+        obsm_dense.append((cyt_key, emb))
+        obsm_map[cyt_key] = key
 
-    varm_map: dict[str, str] = {}
-    for key, emb in (adata.varm.items() if write_varm else ()):
-        if key in skip_varm_set:
-            continue
-        cyt_key = f"{modality}_varm_{key}"
-        if sp.issparse(emb):
-            emb = emb.toarray()
-        else:
-            emb = np.asarray(emb)
-        ds.add_var_embedding(cyt_key, emb, entity=var_entity)
-        varm_map[cyt_key] = str(key)
-
-    obsp_map: dict[str, str] = {}
-    for key, graph in (adata.obsp.items() if write_obsp else ()):
-        if key in skip_obsp_set:
-            continue
-        cyt_key = f"{modality}_obsp_{key}"
-        ds.add_graph(cyt_key, graph, axis="obs", entity_table="cells")
-        obsp_map[cyt_key] = str(key)
-
-    varp_map: dict[str, str] = {}
-    for key, graph in (adata.varp.items() if write_varp else ()):
-        if key in skip_varp_set:
-            continue
-        cyt_key = f"{modality}_varp_{key}"
-        ds.add_var_graph(cyt_key, graph, entity_table=var_entity)
-        varp_map[cyt_key] = str(key)
-
+    raw_name = None
     if write_raw and adata.raw is not None:
         raw_name = f"{modality}_raw_X"
-        raw_matrix = adata.raw.X if sp.issparse(adata.raw.X) else sp.csr_matrix(np.asarray(adata.raw.X))
-        ds.add_matrix(raw_name, raw_matrix)
-        _write_raw_var_table(ds._conn, adata.raw.var.copy())
-        ds.metadata["_anndata_raw"] = {
-            "matrix_name": raw_name,
-            "var_table": "_raw_var",
-        }
+        raw_matrix = _csr(adata.raw.X)
+        if names.claim(raw_name, "adata.raw.X", raw_matrix):
+            plan.append((raw_name, raw_matrix, _RAW_ENTITY))
 
-    ds.metadata["_anndata_X_layer"] = x_matrix_name
-    ds.metadata["_anndata_layer_map"] = layer_map
-    ds.metadata["_anndata_obsm_map"] = obsm_map
-    ds.metadata["_anndata_obsm_as_matrix"] = obsm_as_matrix
-    ds.metadata["_anndata_varm_map"] = varm_map
-    ds.metadata["_anndata_obsp_map"] = obsp_map
-    ds.metadata["_anndata_varp_map"] = varp_map
-
-    if "spatial" in getattr(adata, "obsm", {}):
-        # keep the queryable index in sync with the embedding it mirrors
+    # Everything is decided: only now is the store created, so a refused
+    # conversion leaves no file behind. It is built as <output>.partial and
+    # renamed when whole: a conversion killed half way left a store that opened
+    # and passed validate().
+    from cytome.io._atomic import building
+    with building(output, force) as partial:
+        ds = CytomeDataset(partial, mode="w", force=True)
         try:
-            ds.set_spatial_coords(np.asarray(adata.obsm["spatial"]))
-        except Exception as _e:      # pragma: no cover - index is best-effort
-            import warnings as _w
-            _w.warn(f"spatial coordinate index not built: {_e}")
+            ds.set_entity("cells", obs)
+            _store_column_meta(ds._conn, "cells", obs)
+            ds.set_entity(var_entity, var)
+            _store_column_meta(ds._conn, var_entity, var)
+            for cyt_name, mat, col_entity in plan:
+                ds.add_matrix(cyt_name, mat, compression=compression, col_entity=col_entity)
+            for cyt_key, emb in obsm_dense:
+                ds.add_embedding(cyt_key, emb, flush=False)
 
-    for key, value in (adata.uns.items() if write_uns else ()):
-        if key == "spatial" and isinstance(value, dict):
-            # Visium-convention images + scalefactors go to the spatial tables
-            # (image arrays are not JSON and previously vanished in the
-            # TypeError fallback below). Non-convention entries under a
-            # library are named, never silently dropped.
-            _write_uns_spatial(ds, value)
-            continue
-        try:
-            ds.metadata[_metadata_name(key)] = _metadata_value(value)
-        except TypeError:
-            continue
+            varm_map: dict[str, str] = {}
+            for key, emb in (adata.varm.items() if write_varm else ()):
+                if key in skip_varm_set:
+                    continue
+                key = _metadata_name(str(key))
+                cyt_key = f"{modality}_varm_{key}"
+                if sp.issparse(emb):
+                    emb = emb.toarray()
+                elif isinstance(emb, pd.DataFrame):
+                    emb = emb.to_numpy(dtype=np.float64)
+                else:
+                    emb = np.asarray(emb)
+                ds.add_var_embedding(cyt_key, emb, entity=var_entity, flush=False)
+                varm_map[cyt_key] = key
 
-    ds.flush()
-    ds.provenance.log(
-        operation="conversion",
-        function_name="cytome.from_anndata",
-        parameters={"modality": modality, "chunk_size": chunk_size},
-        package_name="cytome",
-        package_version="0.1.0",
-        input_objects=["anndata"],
-        output_objects=[x_matrix_name],
-    )
-    ds.flush()
-    return ds
+            obsp_map: dict[str, str] = {}
+            for key, graph in (adata.obsp.items() if write_obsp else ()):
+                if key in skip_obsp_set:
+                    continue
+                key = _metadata_name(str(key))
+                cyt_key = f"{modality}_obsp_{key}"
+                ds.add_graph(cyt_key, graph, axis="obs", entity_table="cells")
+                obsp_map[cyt_key] = key
+
+            varp_map: dict[str, str] = {}
+            for key, graph in (adata.varp.items() if write_varp else ()):
+                if key in skip_varp_set:
+                    continue
+                key = _metadata_name(str(key))
+                cyt_key = f"{modality}_varp_{key}"
+                ds.add_var_graph(cyt_key, graph, entity_table=var_entity)
+                varp_map[cyt_key] = key
+
+            if raw_name is not None:
+                _write_raw_var_table(ds._conn, adata.raw.var.copy())
+                ds.metadata["_anndata_raw"] = {
+                    "matrix_name": raw_name,
+                    "var_table": "_raw_var",
+                }
+
+            ds.metadata["_anndata_X_layer"] = x_matrix_name
+            ds.metadata["_anndata_layer_map"] = layer_map
+            ds.metadata["_anndata_obsm_map"] = obsm_map
+            ds.metadata["_anndata_obsm_as_matrix"] = obsm_as_matrix
+            ds.metadata["_anndata_varm_map"] = varm_map
+            ds.metadata["_anndata_obsp_map"] = obsp_map
+            ds.metadata["_anndata_varp_map"] = varp_map
+            _record_names(ds, modality, obs_index, var_index, layer_aliases)
+
+            if "spatial" in getattr(adata, "obsm", {}):
+                # keep the queryable index in sync with the embedding it mirrors
+                try:
+                    ds.set_spatial_coords(np.asarray(adata.obsm["spatial"]))
+                except Exception as _e:      # pragma: no cover - index is best-effort
+                    import warnings as _w
+                    _w.warn(f"spatial coordinate index not built: {_e}")
+
+            for key, value in (adata.uns.items() if write_uns else ()):
+                if key == "spatial" and isinstance(value, dict):
+                    # Visium-convention images + scalefactors go to the spatial tables
+                    # (image arrays are not JSON and previously vanished in the
+                    # TypeError fallback below). Non-convention entries under a
+                    # library are named, never silently dropped.
+                    _write_uns_spatial(ds, value)
+                    continue
+                try:
+                    ds.metadata[_metadata_name(key)] = _metadata_value(value)
+                except TypeError:
+                    continue
+
+            ds.flush()
+            ds.provenance.log(
+                operation="conversion",
+                function_name="cytome.from_anndata",
+                parameters={"modality": modality, "chunk_size": chunk_size,
+                            "compression": compression},
+                package_name="cytome",
+                package_version=_cytome_version(),
+                input_objects=["anndata"],
+                output_objects=[x_matrix_name],
+            )
+            ds.flush()
+        except BaseException:
+            try:
+                ds.close()
+            except Exception:
+                pass
+            raise
+        ds.close()
+    return CytomeDataset(output, mode="r+")
+
+
+def _cytome_version() -> str:
+    try:
+        from cytome import __version__
+        return str(__version__)
+    except Exception:
+        return "unknown"
+
+
+def _record_names(ds, modality, obs_index, var_index, layer_aliases) -> None:
+    """Record where obs_names and var_names are kept, and the layers stored as
+    another name (one per modality where it is a modality's), for to_anndata."""
+    if obs_index is not None:
+        ds.metadata["_anndata_obs_index"] = obs_index
+    if var_index is not None:
+        recorded = dict(_metadata_get(ds, "_anndata_var_index", default={}) or {})
+        recorded[modality] = var_index
+        ds.metadata["_anndata_var_index"] = recorded
+    if layer_aliases:
+        recorded = dict(_metadata_get(ds, "_anndata_layer_aliases", default={}) or {})
+        recorded.update({f"{modality}:{k}": v for k, v in layer_aliases.items()})
+        ds.metadata["_anndata_layer_aliases"] = recorded
 
 
 def _h5_values_are_integer(grp, n_probe: int = 20000) -> bool:
@@ -514,17 +687,45 @@ def _h5_values_are_integer(grp, n_probe: int = 20000) -> bool:
 
     Reads at most ``n_probe`` stored values with an h5py slice, so the streaming
     path can hold the same naming invariant as the in-memory one without giving
-    up streaming to do it.
+    up streaming to do it. For a dense 2-D dataset that is ``n_probe`` values,
+    not rows: 20,000 full rows of a dense X were read before.
     """
     try:
         data = grp["data"] if hasattr(grp, "keys") and "data" in grp else grp
-        a = np.asarray(data[:n_probe], dtype="float64")
+        if getattr(data, "ndim", 1) == 2:
+            n_cols = max(1, int(data.shape[1]))
+            a = np.asarray(data[:max(1, n_probe // n_cols)], dtype="float64").ravel()
+        else:
+            a = np.asarray(data[:n_probe], dtype="float64")
         if a.size == 0:
             return True
         a = a[np.isfinite(a)]
         return bool(a.size == 0 or np.allclose(a, np.round(a)))
     except Exception:
         return True          # cannot tell -> keep the historical name
+
+
+def _h5_same_csr(a, b, chunk: int = 1 << 22) -> bool:
+    """Whether two CSR groups of an h5ad file hold the same matrix, read a bounded
+    slice at a time (only when two sources would be stored under one name)."""
+    try:
+        if tuple(a.attrs["shape"]) != tuple(b.attrs["shape"]):
+            return False
+        if a.name == b.name:
+            return True
+        if not np.array_equal(a["indptr"][:], b["indptr"][:]):
+            return False
+        n = int(a["data"].shape[0])
+        if n != int(b["data"].shape[0]):
+            return False
+        for lo in range(0, n, chunk):
+            hi = min(lo + chunk, n)
+            if not (np.array_equal(a["indices"][lo:hi], b["indices"][lo:hi])
+                    and np.array_equal(a["data"][lo:hi], b["data"][lo:hi])):
+                return False
+        return True
+    except Exception:
+        return False
 
 
 def from_h5ad(
@@ -563,6 +764,10 @@ def from_h5ad(
         Path for the output ``.cytome`` file.
     modality
         Modality name (e.g. ``"RNA"``).
+    counts_layer, main_layer_name
+        As in :func:`from_anndata`, on both paths: ``counts_layer`` is checked to
+        hold integers and stored as ``{modality}_counts`` (both paths stored it
+        under its own name, unchecked), ``main_layer_name`` names X.
     backed
         If ``True``, stream the h5ad via h5py + cytome's
         ``create_layer_writer`` API. Peak RAM is bounded by
@@ -587,6 +792,10 @@ def from_h5ad(
         Round 10: per-category opt-outs. Defaults preserve everything.
     skip_layers / skip_obsm / skip_obsp / skip_varm / skip_varp
         Round 10: per-key skip lists within each category.
+
+    Both paths write the same store: the cells and feature tables are prepared
+    by one routine, and names are checked the same way (two sources of one
+    matrix name are refused unless they hold the same matrix).
 
     Backed-mode peak-RAM fix (Round 10, 2026-05-24)
     -----------------------------------------------
@@ -628,6 +837,8 @@ def from_h5ad(
         adata = anndata.read_h5ad(str(h5ad_path))
         return from_anndata(
             adata, modality=modality, output=output, force=force,
+            counts_layer=counts_layer, main_layer_name=main_layer_name,
+            compression=compression,
             write_raw=write_raw, write_layers=write_layers,
             write_obsm=write_obsm, write_obsp=write_obsp,
             write_varm=write_varm, write_varp=write_varp,
@@ -640,6 +851,9 @@ def from_h5ad(
     import gc
     import time
     from ._optional import require_h5py
+    from cytome.core.dataset import _primary_key_for_table
+    from cytome.io.compression import _resolve_method
+    _resolve_method(compression)
     h5py = require_h5py("from_h5ad(backed=True)")
     # `anndata.io` is the public home for read_elem only in anndata >= 0.11.
     # On anndata 0.10.x it lives in `anndata.experimental`. Fall back so the
@@ -653,257 +867,299 @@ def from_h5ad(
     t_open = time.time()
 
     skip_layers_set = set(skip_layers or [])
+    if counts_layer is not None:
+        skip_layers_set.add(counts_layer)
     skip_obsm_set = set(skip_obsm or [])
     skip_obsp_set = set(skip_obsp or [])
     skip_varm_set = set(skip_varm or [])
     skip_varp_set = set(skip_varp or [])
 
-    ds = CytomeDataset(output, mode="w", force=force)
     # Round 11 (2026-05-26): route via the modality registry. Same
     # change as the in-memory `from_anndata` path above — supports
     # GA → GA_genes and tiles → tiles, not just ATAC vs other.
     var_entity, id_col = _modality_var_entity(modality)
 
-    with h5py.File(str(h5ad_path), "r") as f:
+    from cytome.io._atomic import building
+    opened: list = []
+    with building(output, force) as partial:
+        try:
+            with h5py.File(str(h5ad_path), "r") as f:
 
-        if verbose:
-            _emit_backed_inventory(
-                f, modality, write_raw=write_raw, write_layers=write_layers,
-                write_obsm=write_obsm, write_obsp=write_obsp,
-                write_varm=write_varm, write_varp=write_varp,
-                write_uns=write_uns,
-                skip_layers=skip_layers_set, skip_obsm=skip_obsm_set,
-                skip_obsp=skip_obsp_set, skip_varm=skip_varm_set,
-                skip_varp=skip_varp_set,
-                h5ad_path=h5ad_path, output=output,
-            )
+                if verbose:
+                    _emit_backed_inventory(
+                        f, modality, write_raw=write_raw, write_layers=write_layers,
+                        write_obsm=write_obsm, write_obsp=write_obsp,
+                        write_varm=write_varm, write_varp=write_varp,
+                        write_uns=write_uns,
+                        skip_layers=skip_layers_set, skip_obsm=skip_obsm_set,
+                        skip_obsp=skip_obsp_set, skip_varm=skip_varm_set,
+                        skip_varp=skip_varp_set,
+                        counts_layer=counts_layer, main_layer_name=main_layer_name,
+                        h5ad_path=h5ad_path, output=output,
+                    )
 
-        # --- 1. obs / var via read_elem (no pyarrow; pure pandas) ---
-        obs = read_elem(f["obs"])
-        if "barcode" not in obs.columns:
-            obs.insert(0, "barcode", obs.index.astype(str))
-        obs = obs.reset_index(drop=True)
-        ds.set_entity("cells", obs)
-        _store_column_meta(ds._conn, "cells", obs)
-        n_obs = len(obs)
-        del obs
+                # --- 0. the matrices and their names, decided before anything is written ---
+                if counts_layer is not None:
+                    if "layers" not in f or counts_layer not in f["layers"]:
+                        avail = sorted(f["layers"].keys()) if "layers" in f else []
+                        raise KeyError(f"counts_layer={counts_layer!r} is not in the file's layers; "
+                                       f"available: {avail}")
+                    if not _h5_values_are_integer(f["layers"][counts_layer]):
+                        raise ValueError(
+                            f"counts_layer={counts_layer!r} does not hold integer values, "
+                            f"so it is not raw counts. cytome stores raw counts as "
+                            f"'{modality}_counts' and every downstream default reads that "
+                            f"name as counts. Pass the layer that holds UMIs, or omit "
+                            f"counts_layer and name the matrix with main_layer_name=.")
+                x_matrix_name = _resolve_main_matrix_name(
+                    modality, _h5_values_are_integer(f["X"]),
+                    counts_layer, main_layer_name, stacklevel=4)
+                names = _MatrixNames(_h5_same_csr)
+                streams: list[tuple[str, Any, str]] = []          # (name, h5 group, col_entity)
+                layer_map: dict[str, str] = {}
+                layer_aliases: dict[str, str] = {}
+                if counts_layer is not None:
+                    names.claim(f"{modality}_counts", f"counts_layer={counts_layer!r}",
+                                f["layers"][counts_layer])
+                    streams.append((f"{modality}_counts", f["layers"][counts_layer], var_entity))
+                if names.claim(x_matrix_name, "X", f["X"]):
+                    streams.append((x_matrix_name, f["X"], var_entity))
+                if write_layers and "layers" in f:
+                    for layer_name in f["layers"].keys():
+                        if layer_name in skip_layers_set:
+                            if verbose:
+                                print(f"  [skip] layers/{layer_name}")
+                            continue
+                        key = _metadata_name(str(layer_name))
+                        cyt_name = f"{modality}_{key}"
+                        grp = f[f"layers/{layer_name}"]
+                        if names.claim(cyt_name, f"layers[{key!r}]", grp):
+                            streams.append((cyt_name, grp, var_entity))
+                            layer_map[cyt_name] = key
+                        else:
+                            layer_aliases[key] = cyt_name
+                raw_name = None
+                if write_raw and "raw" in f and "X" in f["raw"]:
+                    raw_name = f"{modality}_raw_X"
+                    if names.claim(raw_name, "raw.X", f["raw/X"]):
+                        streams.append((raw_name, f["raw/X"], _RAW_ENTITY))
 
-        var = read_elem(f["var"])
-        if modality.upper() == "ATAC":
-            var = _parse_peak_coords_from_varnames(var, var.index)
-            _check_atac_var_has_peak_coords(var)
-        if id_col not in var.columns:
-            var.insert(0, id_col, var.index.astype(str))
-        var = var.reset_index(drop=True)
-        ds.set_entity(var_entity, var)
-        _store_column_meta(ds._conn, var_entity, var)
-        n_vars = len(var)
-        del var
-        gc.collect()
-        ds.flush()
+                # --- 1. obs / var via read_elem (no pyarrow; pure pandas) ---
+                obs, obs_index = _prepare_obs(read_elem(f["obs"]))
+                var_raw = read_elem(f["var"])
+                var, var_index = _prepare_var(var_raw, var_raw.index, modality, id_col,
+                                              _primary_key_for_table(var_entity))
+                del var_raw
 
-        if verbose:
-            print(f"[from_h5ad backed] obs/var written ({n_obs:,} cells × "
-                  f"{n_vars:,} {var_entity}). Streaming matrices...")
-
-        # --- 2. X — stream via cytome's create_layer_writer ---
-        # Same invariant as from_anndata: {modality}_counts holds raw integer
-        # counts or does not exist. Probed with an h5py slice so streaming is
-        # preserved.
-        x_matrix_name = _resolve_main_matrix_name(
-            modality, _h5_values_are_integer(f["X"]),
-            counts_layer, main_layer_name, stacklevel=4)
-        _stream_h5_csr_to_writer(
-            ds, f["X"], matrix_name=x_matrix_name,
-            chunk_size=chunk_size, storage_chunk_size=storage_chunk_size,
-            compression=compression, row_entity="cells",
-            col_entity=var_entity, verbose=verbose,
-        )
-        ds.metadata["_anndata_X_layer"] = x_matrix_name
-
-        # --- 3. layers ---
-        layer_map: dict[str, str] = {}
-        if write_layers and "layers" in f:
-            for layer_name in f["layers"].keys():
-                if layer_name in skip_layers_set:
-                    if verbose:
-                        print(f"  [skip] layers/{layer_name}")
-                    continue
-                cyt_name = f"{modality}_{layer_name}"
-                _stream_h5_csr_to_writer(
-                    ds, f[f"layers/{layer_name}"], matrix_name=cyt_name,
-                    chunk_size=chunk_size, storage_chunk_size=storage_chunk_size,
-                    compression=compression, row_entity="cells",
-                    col_entity=var_entity, verbose=verbose,
-                )
-                layer_map[cyt_name] = str(layer_name)
-        ds.metadata["_anndata_layer_map"] = layer_map
-
-        # --- 4. raw.X (cytome convention: {modality}_raw_X + _raw_var) ---
-        if write_raw and "raw" in f and "X" in f["raw"]:
-            raw_name = f"{modality}_raw_X"
-            _stream_h5_csr_to_writer(
-                ds, f["raw/X"], matrix_name=raw_name,
-                chunk_size=chunk_size, storage_chunk_size=storage_chunk_size,
-                compression=compression, row_entity="cells",
-                col_entity=var_entity, verbose=verbose,
-            )
-            if "var" in f["raw"]:
-                raw_var = read_elem(f["raw/var"])
-                _write_raw_var_table(ds._conn, raw_var)
-                del raw_var
+                ds = CytomeDataset(partial, mode="w", force=True)
+                opened.append(ds)
+                ds.set_entity("cells", obs)
+                _store_column_meta(ds._conn, "cells", obs)
+                n_obs = len(obs)
+                del obs
+                ds.set_entity(var_entity, var)
+                _store_column_meta(ds._conn, var_entity, var)
+                n_vars = len(var)
+                del var
                 gc.collect()
-            ds.metadata["_anndata_raw"] = {
-                "matrix_name": raw_name,
-                "var_table": "_raw_var",
-            }
+                ds.flush()
 
-        # --- 5. obsm — read each key, write, free ---
-        obsm_map: dict[str, str] = {}
-        obsm_as_matrix: dict[str, str] = {}
-        if write_obsm and "obsm" in f:
-            for k in f["obsm"].keys():
-                if k in skip_obsm_set:
-                    if verbose:
-                        print(f"  [skip] obsm/{k}")
-                    continue
-                arr = read_elem(f["obsm"][k])
-                cyt_key = _embedding_name(
-                    modality, k, existing=set(obsm_map) | set(obsm_as_matrix))
-                if sp.issparse(arr):
-                    if arr.shape[1] > 500:
-                        mat = arr.tocsr() if not sp.isspmatrix_csr(arr) else arr
-                        ds.add_matrix(cyt_key, mat)
-                        obsm_as_matrix[cyt_key] = str(k)
-                        del arr, mat
+                if verbose:
+                    print(f"[from_h5ad backed] obs/var written ({n_obs:,} cells × "
+                          f"{n_vars:,} {var_entity}). Streaming matrices...")
+
+                # --- 2. X, the counts layer, layers, raw.X: streamed ---
+                for cyt_name, grp, col_entity in streams:
+                    _stream_h5_csr_to_writer(
+                        ds, grp, matrix_name=cyt_name,
+                        chunk_size=chunk_size, storage_chunk_size=storage_chunk_size,
+                        compression=compression, row_entity="cells",
+                        col_entity=col_entity, verbose=verbose,
+                    )
+                ds.metadata["_anndata_X_layer"] = x_matrix_name
+                ds.metadata["_anndata_layer_map"] = layer_map
+
+                if raw_name is not None:
+                    if "var" in f["raw"]:
+                        raw_var = read_elem(f["raw/var"])
+                        _write_raw_var_table(ds._conn, raw_var)
+                        del raw_var
                         gc.collect()
-                        continue
-                    arr = arr.toarray()
-                ds.add_embedding(cyt_key, np.asarray(arr))
-                obsm_map[cyt_key] = str(k)
-                del arr
-                gc.collect()
-        ds.metadata["_anndata_obsm_map"] = obsm_map
-        ds.metadata["_anndata_obsm_as_matrix"] = obsm_as_matrix
+                    ds.metadata["_anndata_raw"] = {
+                        "matrix_name": raw_name,
+                        "var_table": "_raw_var",
+                    }
 
-        # --- 6. varm — same pattern but via add_var_embedding ---
-        varm_map: dict[str, str] = {}
-        if write_varm and "varm" in f:
-            for k in f["varm"].keys():
-                if k in skip_varm_set:
-                    if verbose:
-                        print(f"  [skip] varm/{k}")
-                    continue
-                arr = read_elem(f["varm"][k])
-                cyt_key = f"{modality}_varm_{k}"
-                if sp.issparse(arr):
-                    arr = arr.toarray()
-                ds.add_var_embedding(cyt_key, np.asarray(arr), entity=var_entity)
-                varm_map[cyt_key] = str(k)
-                del arr
-                gc.collect()
-        ds.metadata["_anndata_varm_map"] = varm_map
+                # --- 5. obsm — read each key, write, free ---
+                obsm_map: dict[str, str] = {}
+                obsm_as_matrix: dict[str, str] = {}
+                if write_obsm and "obsm" in f:
+                    for k in f["obsm"].keys():
+                        if k in skip_obsm_set:
+                            if verbose:
+                                print(f"  [skip] obsm/{k}")
+                            continue
+                        arr = read_elem(f["obsm"][k])
+                        key = _metadata_name(str(k))
+                        cyt_key = _embedding_name(
+                            modality, key, existing=set(obsm_map) | set(obsm_as_matrix))
+                        if sp.issparse(arr):
+                            if arr.shape[1] > 500:
+                                mat = arr.tocsr()
+                                if names.claim(cyt_key, f"obsm[{key!r}]", mat):
+                                    ds.add_matrix(cyt_key, mat, compression=compression,
+                                                  col_entity=_OBSM_ENTITY)
+                                obsm_as_matrix[cyt_key] = key
+                                del arr, mat
+                                gc.collect()
+                                continue
+                            arr = arr.toarray()
+                        elif isinstance(arr, pd.DataFrame):
+                            if not all(pd.api.types.is_numeric_dtype(t) or pd.api.types.is_bool_dtype(t)
+                                       for t in arr.dtypes):
+                                warnings.warn(
+                                    f"obsm[{key!r}] is a DataFrame with non-numeric columns; an "
+                                    f"embedding holds numbers, so it is not stored (its columns "
+                                    f"belong in obs).", UserWarning, stacklevel=2)
+                                continue
+                            arr = arr.to_numpy(dtype=np.float64)
+                        ds.add_embedding(cyt_key, np.asarray(arr))
+                        obsm_map[cyt_key] = key
+                        del arr
+                        gc.collect()
+                ds.metadata["_anndata_obsm_map"] = obsm_map
+                ds.metadata["_anndata_obsm_as_matrix"] = obsm_as_matrix
 
-        # --- 7. obsp — read each, add_graph ---
-        obsp_map: dict[str, str] = {}
-        if write_obsp and "obsp" in f:
-            for k in f["obsp"].keys():
-                if k in skip_obsp_set:
-                    if verbose:
-                        print(f"  [skip] obsp/{k}")
-                    continue
-                graph = read_elem(f["obsp"][k])
-                cyt_key = f"{modality}_obsp_{k}"
-                ds.add_graph(cyt_key, graph, axis="obs", entity_table="cells")
-                obsp_map[cyt_key] = str(k)
-                del graph
-                gc.collect()
-        ds.metadata["_anndata_obsp_map"] = obsp_map
+                # --- 6. varm — same pattern but via add_var_embedding ---
+                varm_map: dict[str, str] = {}
+                if write_varm and "varm" in f:
+                    for k in f["varm"].keys():
+                        if k in skip_varm_set:
+                            if verbose:
+                                print(f"  [skip] varm/{k}")
+                            continue
+                        arr = read_elem(f["varm"][k])
+                        key = _metadata_name(str(k))
+                        cyt_key = f"{modality}_varm_{key}"
+                        if sp.issparse(arr):
+                            arr = arr.toarray()
+                        elif isinstance(arr, pd.DataFrame):
+                            arr = arr.to_numpy(dtype=np.float64)
+                        ds.add_var_embedding(cyt_key, np.asarray(arr), entity=var_entity)
+                        varm_map[cyt_key] = key
+                        del arr
+                        gc.collect()
+                ds.metadata["_anndata_varm_map"] = varm_map
 
-        # --- 8. varp — add_var_graph ---
-        varp_map: dict[str, str] = {}
-        if write_varp and "varp" in f:
-            for k in f["varp"].keys():
-                if k in skip_varp_set:
-                    if verbose:
-                        print(f"  [skip] varp/{k}")
-                    continue
-                graph = read_elem(f["varp"][k])
-                cyt_key = f"{modality}_varp_{k}"
-                ds.add_var_graph(cyt_key, graph, entity_table=var_entity)
-                varp_map[cyt_key] = str(k)
-                del graph
-                gc.collect()
-        ds.metadata["_anndata_varp_map"] = varp_map
+                # --- 7. obsp — read each, add_graph ---
+                obsp_map: dict[str, str] = {}
+                if write_obsp and "obsp" in f:
+                    for k in f["obsp"].keys():
+                        if k in skip_obsp_set:
+                            if verbose:
+                                print(f"  [skip] obsp/{k}")
+                            continue
+                        graph = read_elem(f["obsp"][k])
+                        key = _metadata_name(str(k))
+                        cyt_key = f"{modality}_obsp_{key}"
+                        ds.add_graph(cyt_key, graph, axis="obs", entity_table="cells")
+                        obsp_map[cyt_key] = key
+                        del graph
+                        gc.collect()
+                ds.metadata["_anndata_obsp_map"] = obsp_map
 
-        # --- 9. uns — per-key, skip unpickleable ---
-        if write_uns and "uns" in f:
-            # Read one key at a time. `read_elem(f["uns"])` materialises every
-            # key at once, which for a Visium object means a full-resolution
-            # tissue image in memory before anything decides where it goes.
-            uns_grp = f["uns"]
-            for key in list(uns_grp.keys()):
-                try:
-                    value = read_elem(uns_grp[key])
-                except Exception as exc:      # pragma: no cover - exotic uns
-                    if verbose:
-                        print(f"  [skip] uns/{key} (unreadable: {exc})")
-                    continue
-                if key == "spatial" and isinstance(value, dict):
-                    # Same route as the in-memory path: images become
-                    # compressed blobs in the spatial tables. Without this the
-                    # backed path serialised the image as JSON text, which is
-                    # ~20 bytes per float32 element and overflows sqlite3's
-                    # 2 GB bind limit on any full-resolution image.
-                    _write_uns_spatial(ds, value)
-                    del value
+                # --- 8. varp — add_var_graph ---
+                varp_map: dict[str, str] = {}
+                if write_varp and "varp" in f:
+                    for k in f["varp"].keys():
+                        if k in skip_varp_set:
+                            if verbose:
+                                print(f"  [skip] varp/{k}")
+                            continue
+                        graph = read_elem(f["varp"][k])
+                        key = _metadata_name(str(k))
+                        cyt_key = f"{modality}_varp_{key}"
+                        ds.add_var_graph(cyt_key, graph, entity_table=var_entity)
+                        varp_map[cyt_key] = key
+                        del graph
+                        gc.collect()
+                ds.metadata["_anndata_varp_map"] = varp_map
+                _record_names(ds, modality, obs_index, var_index, layer_aliases)
+
+                # --- 9. uns — per-key, skip unpickleable ---
+                if write_uns and "uns" in f:
+                    # Read one key at a time. `read_elem(f["uns"])` materialises every
+                    # key at once, which for a Visium object means a full-resolution
+                    # tissue image in memory before anything decides where it goes.
+                    uns_grp = f["uns"]
+                    for key in list(uns_grp.keys()):
+                        try:
+                            value = read_elem(uns_grp[key])
+                        except Exception as exc:      # pragma: no cover - exotic uns
+                            if verbose:
+                                print(f"  [skip] uns/{key} (unreadable: {exc})")
+                            continue
+                        if key == "spatial" and isinstance(value, dict):
+                            # Same route as the in-memory path: images become
+                            # compressed blobs in the spatial tables. Without this the
+                            # backed path serialised the image as JSON text, which is
+                            # ~20 bytes per float32 element and overflows sqlite3's
+                            # 2 GB bind limit on any full-resolution image.
+                            _write_uns_spatial(ds, value)
+                            del value
+                            gc.collect()
+                            continue
+                        try:
+                            ds.metadata[_metadata_name(key)] = _metadata_value(value)
+                        except (TypeError, ValueError, OverflowError) as exc:
+                            if verbose:
+                                print(f"  [skip] uns/{key} ({exc})")
+                        del value
                     gc.collect()
-                    continue
-                try:
-                    ds.metadata[_metadata_name(key)] = _metadata_value(value)
-                except (TypeError, ValueError, OverflowError) as exc:
-                    if verbose:
-                        print(f"  [skip] uns/{key} ({exc})")
-                del value
-            gc.collect()
 
-    ds.flush()
-    try:
-        from cytome import __version__ as _cytome_version
-    except Exception:
-        _cytome_version = "0.0.0"
-    ds.provenance.log(
-        operation="conversion",
-        function_name="cytome.from_h5ad",
-        parameters={
-            "modality": modality,
-            "backed": True,
-            "chunk_size": chunk_size,
-            "storage_chunk_size": storage_chunk_size,
-            "compression": compression,
-            "write_raw": write_raw,
-            "write_layers": write_layers,
-            "write_obsm": write_obsm,
-            "write_obsp": write_obsp,
-            "write_varm": write_varm,
-            "write_varp": write_varp,
-            "write_uns": write_uns,
-            "skip_layers": sorted(skip_layers_set),
-            "skip_obsm": sorted(skip_obsm_set),
-            "skip_obsp": sorted(skip_obsp_set),
-            "skip_varm": sorted(skip_varm_set),
-            "skip_varp": sorted(skip_varp_set),
-        },
-        package_name="cytome",
-        package_version=_cytome_version,
-        input_objects=[str(h5ad_path)],
-        output_objects=[x_matrix_name],
-    )
-    ds.flush()
+            ds.flush()
+            ds.provenance.log(
+                operation="conversion",
+                function_name="cytome.from_h5ad",
+                parameters={
+                    "modality": modality,
+                    "backed": True,
+                    "chunk_size": chunk_size,
+                    "storage_chunk_size": storage_chunk_size,
+                    "compression": compression,
+                    "counts_layer": counts_layer,
+                    "main_layer_name": main_layer_name,
+                    "write_raw": write_raw,
+                    "write_layers": write_layers,
+                    "write_obsm": write_obsm,
+                    "write_obsp": write_obsp,
+                    "write_varm": write_varm,
+                    "write_varp": write_varp,
+                    "write_uns": write_uns,
+                    "skip_layers": sorted(skip_layers_set),
+                    "skip_obsm": sorted(skip_obsm_set),
+                    "skip_obsp": sorted(skip_obsp_set),
+                    "skip_varm": sorted(skip_varm_set),
+                    "skip_varp": sorted(skip_varp_set),
+                },
+                package_name="cytome",
+                package_version=_cytome_version(),
+                input_objects=[str(h5ad_path)],
+                output_objects=[x_matrix_name],
+            )
+            ds.flush()
+        except BaseException:
+            for _ds in opened:
+                try:
+                    _ds.close()
+                except Exception:
+                    pass
+            raise
+        ds.close()
     if verbose:
         print(f"[from_h5ad backed] Done in {time.time()-t_open:.1f}s. "
               f"Output: {output}")
-    return ds
+    return CytomeDataset(output, mode="r+")
 
 
 def _stream_h5_csr_to_writer(
@@ -1059,6 +1315,45 @@ def _metadata_name(name):
     return name.replace("%2F", "/") if isinstance(name, str) and "%2F" in name else name
 
 
+#: The colour :func:`to_anndata` gives a category kept from outside a column's
+#: recorded categories, in ``uns['<column>_colors']``: a neutral grey, darker
+#: than the light grey that scanpy and PIASO draw missing labels in.
+KEPT_CATEGORY_COLOR = "#808080"
+
+
+def _colour_kept_categories(conn, adata) -> None:
+    """Extend each stored colour list of ``obs`` by the categories kept outside it.
+
+    A value outside a column's recorded categories is kept, as a category after
+    the recorded ones (:func:`cytome.core.column_meta.restore_categorical`). A
+    colour list stored for the column -- scanpy's ``uns['<column>_colors']``,
+    one colour per category, in order -- then has fewer colours than the column
+    has categories, and scanpy and PIASO replace every colour with their default
+    palette. Each kept category gets :data:`KEPT_CATEGORY_COLOR` instead, so the
+    recorded categories keep theirs. A list of any other length is left as it
+    is.
+    """
+    from cytome.core.column_meta import read_records
+
+    for col, dtype, cats_json in read_records(conn, "cells"):
+        if dtype not in ("categorical", "ordered_categorical") or col not in adata.obs.columns:
+            continue
+        key = _h5ad_name(f"{col}_colors")
+        stored = adata.uns.get(key)
+        values = adata.obs[col]
+        if stored is None or not isinstance(values.dtype, pd.CategoricalDtype):
+            continue
+        try:
+            n_recorded = len(json.loads(cats_json)) if cats_json else 0
+        except ValueError:
+            continue
+        n_now = len(values.cat.categories)
+        if isinstance(stored, (list, tuple, np.ndarray)) and len(stored) == n_recorded < n_now:
+            extended = list(stored) + [KEPT_CATEGORY_COLOR] * (n_now - n_recorded)
+            adata.uns[key] = (np.asarray(extended, dtype=object) if isinstance(stored, np.ndarray)
+                              else extended)
+
+
 def _uns_value(value):
     """A metadata value as it goes into ``uns``: no "/" in a mapping's keys or a table's columns.
 
@@ -1131,6 +1426,7 @@ def to_anndata(
     include_embeddings: bool = True,
     include_cross_modality_embeddings: bool = True,
     cell_mask=None,
+    layers=None,
 ):
     """Convert Cytome dataset modality to AnnData.
 
@@ -1147,7 +1443,28 @@ def to_anndata(
     cell_mask
         Optional boolean mask (length ``n_cells``) or sorted integer indices.
         When provided, only reads chunks containing selected cells,
-        yielding significant RAM and time savings for partial exports.
+        yielding significant RAM and time savings for partial exports. The
+        graphs (obsp) and ``raw`` are cut to the same cells.
+    layers
+        Which other matrices of the modality to load as layers: ``None``
+        (default) all of them, a list of names (the AnnData layer name or the
+        store's, ``"infog"`` or ``"RNA_infog"``), or ``[]`` for none. A PIASO
+        store holds four or five full RNA matrices; reading only X saves
+        reading the others.
+
+    obs_names and var_names are the ones the AnnData had when it was
+    converted (recorded by :func:`from_anndata`); otherwise the ``barcode``
+    and the feature id. The store's own row keys (``cell_idx``,
+    ``gene_idx``) are not exported: they are positions, wrong after any
+    subset of the AnnData.
+
+    A categorical column comes back with its recorded categories, in their
+    order. A value outside them (the column was written since) is kept, as a
+    category after the recorded ones, with a warning. A colour list stored for
+    the column (``uns['<column>_colors']``, one colour per recorded category)
+    is extended with :data:`KEPT_CATEGORY_COLOR`, a neutral grey, for each
+    such category: the recorded categories keep their colours, where scanpy
+    and PIASO would otherwise replace them all with their default palette.
     """
     try:
         import anndata
@@ -1155,6 +1472,7 @@ def to_anndata(
         raise ImportError("anndata is required for to_anndata") from exc
 
     from cytome.io.chunked_io import read_dense_rows
+    from cytome.core.dataset import _primary_key_for_table
 
     # Validate modality up front (before any I/O) so an unknown modality
     # produces a clean ValueError rather than a deeper KeyError on the
@@ -1166,6 +1484,9 @@ def to_anndata(
     if cell_mask is not None:
         arr = np.asarray(cell_mask)
         if arr.dtype == bool:
+            if arr.shape[0] != ds.n_cells:
+                raise ValueError(f"to_anndata: a boolean cell_mask of {arr.shape[0]} entries "
+                                 f"for {ds.n_cells} cells")
             keep_idx = np.where(arr)[0]
         else:
             keep_idx = np.sort(np.asarray(arr, dtype=np.int64))
@@ -1200,10 +1521,16 @@ def to_anndata(
     X = ml.rows(keep_idx) if keep_idx is not None else ml.to_memory()
 
     obs = _restore_column_dtypes(ds._conn, "cells", ds.cells.to_pandas())
+    obs = obs.drop(columns=[c for c in obs.columns if str(c).lower() == "cell_idx"])
     if keep_idx is not None:
         obs = obs.iloc[keep_idx].copy().reset_index(drop=True)
-    if "barcode" in obs.columns:
+    obs_index = _metadata_get(ds, "_anndata_obs_index", default=None)
+    if obs_index and obs_index in obs.columns:
+        obs = obs.set_index(obs_index, drop=True)
+        obs.index.name = None
+    elif "barcode" in obs.columns:
         obs = obs.set_index("barcode", drop=False)
+    obs.index = obs.index.astype(str)
 
     # Build an EntityTable directly off the connection so we don't depend on
     # per-table @property accessors existing for every modality (e.g. tiles
@@ -1213,8 +1540,15 @@ def to_anndata(
     from cytome.core.entity import EntityTable
     var_tbl = EntityTable(ds._conn, var_entity)
     var = _restore_column_dtypes(ds._conn, var_entity, var_tbl.to_pandas())
-    if id_col in var.columns:
+    key = _primary_key_for_table(var_entity)
+    var = var.drop(columns=[c for c in var.columns if str(c).lower() == key.lower()])
+    var_index = (_metadata_get(ds, "_anndata_var_index", default={}) or {}).get(modality)
+    if var_index and var_index in var.columns:
+        var = var.set_index(var_index, drop=(var_index == _VAR_NAME_COL))
+        var.index.name = None
+    elif id_col in var.columns:
         var = var.set_index(id_col, drop=False)
+    var.index = var.index.astype(str)
 
     obs = _writable_frame(obs)
     var = _writable_frame(var)
@@ -1226,29 +1560,50 @@ def to_anndata(
     obsm_as_matrix_meta = _metadata_get(ds, "_anndata_obsm_as_matrix", default={})
     if isinstance(obsm_as_matrix_meta, dict):
         _obsm_matrix_names = set(obsm_as_matrix_meta.keys())
+    raw_info = _metadata_get(ds, "_anndata_raw", default=None)
+    raw_matrix_name = raw_info.get("matrix_name") if isinstance(raw_info, dict) else None
 
     # Layers are feature-dimensioned, so they MUST match the requested modality.
     # Restrict discovery to `{modality}_%` matrices (the global `_anndata_layer_map`
     # is written for whichever modality was imported first and would otherwise
     # attach e.g. RNA_infog to a GA AnnData → column-count mismatch). Honor the
     # recorded adata-layer name when the map has one for this modality, and always
-    # guard on the feature count.
+    # guard on the feature count. The raw matrix is adata.raw, not a layer.
     prefix = f"{modality}_"
     layer_map = _metadata_get(ds, "_anndata_layer_map", default={})
     layer_map = layer_map if isinstance(layer_map, dict) else {}
+    wanted = None if layers is None else {str(x) for x in layers}
+
+    def _wanted(cytome_name, adata_name):
+        return wanted is None or cytome_name in wanted or adata_name in wanted
+
     rows = ds._conn.execute(
         "SELECT matrix_name FROM matrix_meta WHERE matrix_name LIKE ? ORDER BY matrix_name",
         (f"{prefix}%",),
     ).fetchall()
     for (name,) in rows:
-        if name == x_matrix_name or name in _obsm_matrix_names:
+        if name == x_matrix_name or name in _obsm_matrix_names or name == raw_matrix_name:
+            continue
+        adata_name = layer_map.get(name, name[len(prefix):])
+        if not _wanted(name, adata_name):
             continue
         lyr = MeasurementLayer(ds._conn, name)
         # Skip layers with mismatched column count (compact HVG layers, etc.)
         if lyr.shape[1] != adata.shape[1]:
             continue
-        adata_name = layer_map.get(name, name[len(prefix):])
-        adata.layers[adata_name] = lyr.rows(keep_idx) if keep_idx is not None else lyr.to_memory()
+        adata.layers[_h5ad_name(adata_name)] = (lyr.rows(keep_idx) if keep_idx is not None
+                                                else lyr.to_memory())
+    # layers that were the same matrix as another, stored once
+    aliases = _metadata_get(ds, "_anndata_layer_aliases", default={}) or {}
+    for alias_key, cytome_name in aliases.items():
+        mod, _, alias = str(alias_key).partition(":")
+        if mod != modality or not _wanted(cytome_name, alias) or alias in adata.layers:
+            continue
+        if cytome_name == x_matrix_name:
+            adata.layers[_h5ad_name(alias)] = adata.X.copy()
+        elif _h5ad_name(layer_map.get(cytome_name, cytome_name[len(prefix):])) in adata.layers:
+            adata.layers[_h5ad_name(alias)] = adata.layers[
+                _h5ad_name(layer_map.get(cytome_name, cytome_name[len(prefix):]))].copy()
 
     if include_embeddings:
         prefix = f"{modality}_"
@@ -1267,13 +1622,13 @@ def to_anndata(
         #     RNA's obsm names.
         for cytome_key, adata_key in obsm_map.items():
             if str(cytome_key).startswith(prefix) and cytome_key in ds.embeddings.keys():
-                adata.obsm[adata_key] = _read_emb(cytome_key)
+                adata.obsm[_h5ad_name(adata_key)] = _read_emb(cytome_key)
                 added_keys.add(cytome_key)
         for name in ds.embeddings.keys():
             if name in added_keys or "_TMP_" in name:
                 continue
             if name.startswith(prefix):
-                adata.obsm[f"X_{name[len(prefix):]}"] = _read_emb(name)
+                adata.obsm[_h5ad_name(f"X_{name[len(prefix):]}")] = _read_emb(name)
                 added_keys.add(name)
 
         # (2) OWN-modality sparse obsm stored as matrices (feature-ish; gated).
@@ -1282,7 +1637,8 @@ def to_anndata(
             for cytome_key, adata_key in obsm_as_matrix.items():
                 if str(cytome_key).startswith(prefix) and _matrix_exists(ds._conn, cytome_key):
                     ml = MeasurementLayer(ds._conn, cytome_key)
-                    adata.obsm[adata_key] = ml.rows(keep_idx) if keep_idx is not None else ml.to_memory()
+                    adata.obsm[_h5ad_name(adata_key)] = (ml.rows(keep_idx) if keep_idx is not None
+                                                         else ml.to_memory())
                     added_keys.add(cytome_key)
 
         # (3) CROSS-modality cell embeddings (other modalities). These are
@@ -1293,7 +1649,7 @@ def to_anndata(
             for name in ds.embeddings.keys():
                 if name in added_keys or "_TMP_" in name:
                     continue
-                disp = str(name).replace("_obsm_", "_")
+                disp = _h5ad_name(str(name).replace("_obsm_", "_"))
                 if disp in adata.obsm:
                     continue
                 adata.obsm[disp] = _read_emb(name)
@@ -1308,18 +1664,24 @@ def to_anndata(
                 if _embedding_exists(ds._conn, cytome_key):
                     ve = ds.var_embeddings[cytome_key]
                     if getattr(ve, "shape", (0,))[0] == adata.shape[1]:
-                        adata.varm[adata_key] = ve
+                        adata.varm[_h5ad_name(adata_key)] = ve
+
+    def _cut(graph):
+        """A cells × cells graph cut to the kept cells (rows and columns)."""
+        if keep_idx is None:
+            return graph
+        return graph.tocsr()[keep_idx][:, keep_idx]
 
     obsp_map = _metadata_get(ds, "_anndata_obsp_map", default={})
     if isinstance(obsp_map, dict) and obsp_map:
         for cytome_key, adata_key in obsp_map.items():
             try:
-                adata.obsp[adata_key] = ds.graphs[cytome_key].to_sparse()
+                adata.obsp[_h5ad_name(adata_key)] = _cut(ds.graphs[cytome_key].to_sparse())
             except KeyError:
                 continue
     else:
         try:
-            adata.obsp["connectivities"] = ds.graphs["knn"].to_sparse()
+            adata.obsp["connectivities"] = _cut(ds.graphs["knn"].to_sparse())
         except Exception:
             pass
 
@@ -1327,7 +1689,7 @@ def to_anndata(
     if isinstance(varp_map, dict):
         for cytome_key, adata_key in varp_map.items():
             try:
-                adata.varp[adata_key] = ds.var_graphs[cytome_key].to_sparse()
+                adata.varp[_h5ad_name(adata_key)] = ds.var_graphs[cytome_key].to_sparse()
             except KeyError:
                 continue
 
@@ -1335,6 +1697,7 @@ def to_anndata(
         if key.startswith("_anndata_"):
             continue
         adata.uns[_h5ad_name(key)] = _uns_value(value)   # no "/" in h5ad names (_uns_value)
+    _colour_kept_categories(ds._conn, adata)
 
     # Materialised, not lazy: `to_anndata` hands back a *detached* object that
     # people write to disk, and anndata's h5ad writer type-checks the values in
@@ -1347,110 +1710,64 @@ def to_anndata(
     if _spatial_uns:
         adata.uns["spatial"] = _spatial_uns
 
-    raw_info = _metadata_get(ds, "_anndata_raw", default=None)
-    if isinstance(raw_info, dict):
-        matrix_name = raw_info.get("matrix_name")
-        if matrix_name and _matrix_exists(ds._conn, matrix_name):
-            raw_X = MeasurementLayer(ds._conn, matrix_name).to_memory()
-            raw_var = _read_raw_var_table(ds._conn)
-            adata.raw = anndata.AnnData(X=raw_X, var=raw_var)
+    if raw_matrix_name and _matrix_exists(ds._conn, raw_matrix_name):
+        raw_ml = MeasurementLayer(ds._conn, raw_matrix_name)
+        raw_X = raw_ml.rows(keep_idx) if keep_idx is not None else raw_ml.to_memory()
+        raw_var = _read_raw_var_table(ds._conn)
+        adata.raw = anndata.AnnData(X=raw_X, obs=pd.DataFrame(index=adata.obs_names),
+                                    var=raw_var)
 
     return adata
 
 
 def update_from_anndata(ds: CytomeDataset, adata, modality: str = "RNA") -> None:
-    """Sync selected AnnData changes back into a Cytome dataset."""
-    obs = adata.obs.copy()
-    if "barcode" not in obs.columns:
-        obs.insert(0, "barcode", obs.index.astype(str))
-    ds.set_entity("cells", obs.reset_index(drop=True))
-    _store_column_meta(ds._conn, "cells", obs.reset_index(drop=True))
+    """Sync selected AnnData changes back into a Cytome dataset.
+
+    The AnnData must have the store's cells, in its order (``to_anndata``
+    of the store, with columns, embeddings or layers added): the cells table
+    is replaced by its obs, so a different number of cells, or other cells,
+    is refused.
+    """
+    if adata.n_obs != ds.n_cells:
+        raise ValueError(f"update_from_anndata: the AnnData has {adata.n_obs} cells and the "
+                         f"store {ds.n_cells}; it must hold the store's cells, in its order")
+    obs, obs_index = _prepare_obs(adata.obs)
+    stored = np.asarray(ds.cells["barcode"]).astype(str)
+    if not np.array_equal(obs["barcode"].astype(str).to_numpy(), stored):
+        raise ValueError("update_from_anndata: the AnnData's barcodes are not the store's, "
+                         "in the store's order")
+    ds.set_entity("cells", obs)
+    _store_column_meta(ds._conn, "cells", obs)
+    if obs_index is not None:
+        ds.metadata["_anndata_obs_index"] = obs_index
 
     _taken: set = set()
     for key, emb in adata.obsm.items():
+        key = _metadata_name(str(key))
         cyt_key = _embedding_name(modality, key, existing=_taken)
         _taken.add(cyt_key)
-        ds.add_embedding(cyt_key, np.asarray(emb))
+        if sp.issparse(emb):
+            emb = emb.toarray()
+        ds.add_embedding(cyt_key, emb, flush=False)
     for key, layer in adata.layers.items():
         if key is None:                     # anndata >= 0.13 lists X here
             continue
         mat = layer if sp.issparse(layer) else sp.csr_matrix(np.asarray(layer))
-        ds.add_matrix(f"{modality}_{key}", mat)
+        ds.add_matrix(f"{modality}_{_metadata_name(str(key))}", mat)
 
     ds.flush()
 
 
 def _store_column_meta(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame) -> None:
-    """Record dtype metadata for DataFrame columns."""
-    conn.execute("DELETE FROM _column_meta WHERE table_name = ?", (table_name,))
-    for col in df.columns:
-        series = df[col]
-        dtype_tag = None
-        categories = None
-        if isinstance(series.dtype, pd.CategoricalDtype):
-            cats = series.cat.categories.tolist()
-            categories = json.dumps(cats)
-            dtype_tag = "ordered_categorical" if bool(series.cat.ordered) else "categorical"
-        elif pd.api.types.is_bool_dtype(series.dtype) or str(series.dtype) == "boolean":
-            dtype_tag = "bool"
-        elif pd.api.types.is_integer_dtype(series.dtype):
-            dtype_tag = str(series.dtype)
-        elif pd.api.types.is_float_dtype(series.dtype):
-            dtype_tag = str(series.dtype)
-        elif pd.api.types.is_string_dtype(series.dtype):
-            dtype_tag = "string"
-        if dtype_tag is None:
-            continue
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO _column_meta(table_name, column_name, dtype, categories)
-            VALUES (?, ?, ?, ?)
-            """,
-            (table_name, str(col), dtype_tag, categories),
-        )
+    """Record dtype metadata for DataFrame columns (see :mod:`cytome.core.column_meta`)."""
+    from cytome.core.column_meta import store_column_meta
+    store_column_meta(conn, table_name, df)
 
 
 def _restore_column_dtypes(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame) -> pd.DataFrame:
-    """Restore pandas dtype metadata for a DataFrame."""
-    try:
-        rows = conn.execute(
-            "SELECT column_name, dtype, categories FROM _column_meta WHERE table_name = ?",
-            (table_name,),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return df
-    for col, dtype, categories_json in rows:
-        if col not in df.columns:
-            continue
-        if dtype in {"categorical", "ordered_categorical"}:
-            cats = json.loads(categories_json) if categories_json else []
-            ordered = dtype == "ordered_categorical"
-            df[col] = pd.Categorical(df[col], categories=cats, ordered=ordered)
-        elif dtype == "bool":
-            try:
-                df[col] = df[col].astype(bool)
-            except Exception:
-                pass
-        elif dtype.startswith("Int") or dtype.startswith("UInt"):
-            try:
-                df[col] = df[col].astype(dtype)
-            except Exception:
-                pass
-        elif dtype in {"int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"}:
-            try:
-                if df[col].isna().any():
-                    up = dtype.upper().replace("INT", "Int")
-                    df[col] = df[col].astype(up)
-                else:
-                    df[col] = df[col].astype(dtype)
-            except Exception:
-                pass
-        elif dtype in {"float32", "float64"}:
-            try:
-                df[col] = df[col].astype(dtype)
-            except Exception:
-                pass
-    return df
+    """Restore pandas dtype metadata for a DataFrame (see :mod:`cytome.core.column_meta`)."""
+    from cytome.core.column_meta import restore_column_dtypes
+    return restore_column_dtypes(conn, table_name, df)
 
 
 def _write_raw_var_table(conn: sqlite3.Connection, var_df: pd.DataFrame) -> None:
@@ -1491,13 +1808,8 @@ def _read_raw_var_table(conn: sqlite3.Connection) -> pd.DataFrame:
 
 
 def _sqlite_type_for_series(series: pd.Series) -> str:
-    if pd.api.types.is_bool_dtype(series.dtype):
-        return "INTEGER"
-    if pd.api.types.is_integer_dtype(series.dtype):
-        return "INTEGER"
-    if pd.api.types.is_float_dtype(series.dtype):
-        return "REAL"
-    return "TEXT"
+    from cytome.core.column_meta import sql_type_of
+    return sql_type_of(series)
 
 
 def _metadata_get(ds: CytomeDataset, key: str, default: Any = None) -> Any:
@@ -1524,7 +1836,9 @@ def _embedding_exists(conn: sqlite3.Connection, array_name: str) -> bool:
 
 
 def _py_scalar(value: Any) -> Any:
-    return value.item() if hasattr(value, "item") else value
+    # the dataset's: a missing value (NaN, pd.NA, NaT) binds as NULL
+    from cytome.core.dataset import _py_scalar as _scalar
+    return _scalar(value)
 
 
 def _quote_ident(name: str) -> str:
