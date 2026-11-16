@@ -116,7 +116,7 @@ def test_a_region_query_reads_only_the_chunks_that_can_overlap(tmp_path, monkeyp
     monkeypatch.setattr(comp, "decode_starts", counting)
     hits = _query_region_from_chunks(ds._conn, "chr1", 15_050, 15_060)
     assert [h[0] for h in hits] == [15_000]
-    assert len(decoded) == 2                     # the chunks starting before 15,060
+    assert len(decoded) == 1                     # the single chunk overlapping [15_050, 15_060)
     ds.close()
 
 

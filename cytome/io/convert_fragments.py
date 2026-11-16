@@ -805,14 +805,15 @@ def _write_block_chunks(
         c_blob = compress_blob(chunk_c.tobytes(), compression,
                                level=compression_level)
         min_start = int(chunk_s[0]) if len(chunk_s) > 0 else 0
+        max_end = int(chunk_e.max()) if len(chunk_e) > 0 else 0
         conn.execute(
             """INSERT INTO fragment_chunks
                (chrom, chunk_idx, row_start, row_end, n_fragments,
-                min_start, starts_blob, ends_blob, cell_idx_blob,
+                min_start, max_end, starts_blob, ends_blob, cell_idx_blob,
                 compression, encoding)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (chrom, chunk_idx, row_offset + i, row_offset + end_i,
-             end_i - i, min_start, s_blob, e_blob, c_blob,
+             end_i - i, min_start, max_end, s_blob, e_blob, c_blob,
              compression, encoding),
         )
         chunk_idx += 1

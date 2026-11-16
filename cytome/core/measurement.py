@@ -6,6 +6,8 @@ from cytome.core import _handles
 
 from typing import Iterator, Tuple
 
+import warnings
+
 import numpy as np
 import scipy.sparse as sp
 import sqlite3
@@ -15,13 +17,49 @@ from cytome.io.chunked_io import (
     _chunk_payload,
     _decode_block,
     _np_dtype,
+    read_sparse_axis,
     read_sparse_chunked,
-    read_sparse_rows,
+    read_sparse_chunked_csc,
     read_sparse_rows_iter,
     read_sparse_slice,
     storage_dtype,
+    touched_nonzeros,
 )
 from cytome.io.compression import compress_blob, decompress_blob  # noqa: F401
+
+
+class FullPassWarning(UserWarning):
+    """A read along the axis a matrix is not stored by: every chunk is read once.
+
+    Rows of a column-major matrix (a peak matrix as the quantifier writes it), or
+    columns of a row-major one without a column index. Memory stays at the
+    result plus one chunk, but the time is a pass over the whole matrix, so a
+    loop of such reads (one per batch of cells) repeats that pass per batch.
+    """
+
+
+#: (store file, matrix, axis) already warned about, one warning each per process
+_FULL_PASS_REPORTED: set = set()
+#: a pass over fewer chunks than this is quick, and not worth a warning
+_FULL_PASS_MIN_CHUNKS = 64
+
+
+def _warn_full_pass(conn, matrix_name: str, read_by: str, stored_by: str, n_chunks: int) -> None:
+    if n_chunks < _FULL_PASS_MIN_CHUNKS:
+        return
+    try:
+        path = next((r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"), "")
+    except sqlite3.Error:
+        path = ""
+    key = (path, matrix_name, read_by)
+    if key in _FULL_PASS_REPORTED:
+        return
+    _FULL_PASS_REPORTED.add(key)
+    warnings.warn(
+        f"{matrix_name} is stored by {stored_by}: reading it by {read_by} reads each of its "
+        f"{n_chunks:,} chunks once (memory: the result plus one chunk). For repeated reads by "
+        f"{read_by}, keep a copy of the matrix stored by {read_by}.",
+        FullPassWarning, stacklevel=4)
 
 
 class MeasurementLayer:
@@ -52,72 +90,112 @@ class MeasurementLayer:
         return np.dtype(self._meta["dtype"])
 
     def __getitem__(self, key: object) -> sp.csr_matrix:
+        """``X[rows]`` or ``X[rows, cols]``, as CSR.
+
+        Each selector is an integer, a slice (any step), a sequence of integers
+        (any order, repeats allowed) or a boolean mask of the axis's length;
+        negative positions count from the end. Reads go through one reader
+        (:meth:`_select`): along the axis the matrix is stored by, only the
+        chunks that hold a wanted position are read; along the other, every
+        chunk is read once and only the wanted positions are kept.
+        """
         if not isinstance(key, tuple):
             key = (key, slice(None))
+        if len(key) != 2:
+            raise IndexError(f"{self._matrix_name}: a matrix takes one or two indices, not {len(key)}")
         row_sel, col_sel = key
         n_rows, n_cols = self.shape
-
-        if isinstance(row_sel, slice):
+        # a step-1 range of rows from row chunks keeps its range read
+        if isinstance(row_sel, slice) and self._has_row_chunks:
             start, stop, step = row_sel.indices(n_rows)
-            lo, hi = (start, stop) if step > 0 else (stop + 1, start + 1)
-            lo, hi = max(lo, 0), max(hi, max(lo, 0))
-            if self.is_column_major:
-                matrix = self.to_memory()[lo:hi]
-            else:
-                matrix = read_sparse_slice(self._conn, self._matrix_name, lo, hi)
-            if step != 1:
-                # rows lo..hi-1 read once; the step (and direction) applied here
-                matrix = matrix[np.arange(start - lo, stop - lo, step)]
-        elif _is_int(row_sel):
-            i = int(row_sel)
-            if i < 0:
-                i += n_rows
-            if i < 0 or i >= n_rows:
-                raise IndexError("index out of range")
-            matrix = self.rows(np.array([i]))
-        elif isinstance(row_sel, (list, np.ndarray)):
-            matrix = self.rows(np.asarray(row_sel))
-        else:
-            raise TypeError(f"Unsupported row selector: {type(row_sel)}")
+            if step == 1 and not (start == 0 and stop >= n_rows):
+                cols = _positions(col_sel, n_cols, "column", self._matrix_name)
+                matrix = read_sparse_slice(self._conn, self._matrix_name, start, max(start, stop))
+                return matrix if cols is None else matrix[:, cols].tocsr()
+        return self._select(_positions(row_sel, n_rows, "row", self._matrix_name),
+                            _positions(col_sel, n_cols, "column", self._matrix_name))
 
-        if isinstance(col_sel, slice):
-            return matrix[:, col_sel].tocsr()
-        if isinstance(col_sel, (list, np.ndarray)):
-            return matrix[:, col_sel].tocsr()
-        if _is_int(col_sel):
-            return matrix[:, [int(col_sel)]].tocsr()
-        raise TypeError(f"Unsupported column selector: {type(col_sel)}")
+    @property
+    def _has_row_chunks(self) -> bool:
+        return bool(self._meta.get("n_chunks"))
+
+    @property
+    def _has_col_chunks(self) -> bool:
+        return bool(self._meta.get("has_csc"))
+
+    def _select(self, rows, cols) -> sp.csr_matrix:
+        """The one reader behind ``rows()``, ``columns()``, ``X[...]`` and
+        ``to_memory()``. ``rows`` and ``cols`` are int64 positions (any order,
+        repeats allowed, already in range) or ``None`` for all.
+
+        - Along the axis the matrix is stored by, only the chunks that hold a
+          wanted position are read, and the other axis is masked inside each
+          chunk. A matrix stored both ways is read by the layout whose chunks
+          holding the selection hold fewer entries.
+        - With a selection only along the other axis, every chunk is read once
+          and the wanted positions kept (a :class:`FullPassWarning`, once, for a
+          matrix of 64 chunks or more).
+        """
+        conn, name = self._conn, self._matrix_name
+        n_rows, n_cols = self.shape
+        if rows is None and cols is None:
+            return self.to_memory()
+        shape = (n_rows if rows is None else rows.size, n_cols if cols is None else cols.size)
+        if 0 in shape:
+            return sp.csr_matrix(shape, dtype=self.dtype)
+        by_rows, by_cols = self._has_row_chunks, self._has_col_chunks
+        if not (by_rows or by_cols):                     # no chunks: an all-zero matrix
+            return sp.csr_matrix(shape, dtype=self.dtype)
+        if rows is not None and cols is not None and by_rows and by_cols:
+            use = "rows" if touched_nonzeros(conn, name, "rows", rows) <= \
+                touched_nonzeros(conn, name, "cols", cols) else "cols"
+        elif rows is not None and by_rows:
+            use = "rows"
+        elif cols is not None and by_cols:
+            use = "cols"
+        else:
+            # the selection is only along the axis the matrix is not stored by
+            stored = "cols" if by_cols else "rows"
+            n_chunks = int(self._meta.get("csc_n_chunks") or 0) if stored == "cols" else \
+                int(self._meta.get("n_chunks") or 0)
+            _warn_full_pass(conn, name, "rows" if rows is not None else "columns",
+                            "columns" if stored == "cols" else "rows", n_chunks)
+            out = read_sparse_axis(conn, name, stored, major=None,
+                                   minor=rows if stored == "cols" else cols)
+            return out.tocsr()
+        if use == "rows":
+            return read_sparse_axis(conn, name, "rows", major=rows, minor=cols).tocsr()
+        return read_sparse_axis(conn, name, "cols", major=cols, minor=rows).tocsr()
 
     def to_memory(self) -> sp.csr_matrix:
-        """Load entire matrix into memory.
+        """Load entire matrix into memory, as CSR.
 
-        A column-major matrix is assembled from its CSC chunks; row-major
-        from its row chunks. Either way the result is CSR.
+        A column-major matrix is read from its column chunks
+        (:func:`~cytome.io.chunked_io.read_sparse_chunked_csc`: each placed by
+        its span, the destination sized once), then converted; a row-major one
+        from its row chunks.
         """
         if self.is_column_major:
-            blocks = [chunk for _, _, chunk in self.iter_columns()]
-            if not blocks:
-                return sp.csr_matrix(self.shape, dtype=self.dtype)
-            return sp.hstack(blocks, format="csc").tocsr()
+            return read_sparse_chunked_csc(self._conn, self._matrix_name).tocsr()
         return read_sparse_chunked(self._conn, self._matrix_name)
 
     def rows(self, indices: np.ndarray) -> sp.csr_matrix:
-        """Read specific rows, in the order given, using chunk-selective I/O.
+        """Read specific rows, in the order given, as CSR.
 
-        Only decompresses chunks containing at least one requested row. The
-        indices need not be sorted or unique; an index outside the matrix
-        raises ``IndexError``.
+        ``indices``: integers (any order, repeats allowed; negative ones count
+        from the end) or a boolean mask over every row. An index outside the
+        matrix raises ``IndexError``.
+
+        From row chunks, only the chunks holding a requested row are read. A
+        column-major matrix (CSC chunks only) has no row chunks: every column
+        chunk is read once and the requested rows kept, so memory stays at the
+        result plus one chunk, but the time is a pass over the whole matrix
+        (a :class:`FullPassWarning`, once per matrix and process).
         """
-        idx = np.asarray(indices)
-        if idx.dtype == bool:
-            idx = np.flatnonzero(idx)
-        if self.is_column_major:
-            idx = np.asarray(idx, dtype=np.int64)
-            n = self.shape[0]
-            if idx.size and (idx.min() < 0 or idx.max() >= n):
-                raise IndexError(f"{self._matrix_name}: row index outside its {n} rows")
-            return self.to_memory()[idx]
-        return read_sparse_rows(self._conn, self._matrix_name, idx)
+        n_rows = self.shape[0]
+        idx = _positions(indices if not _is_int(indices) else [indices], n_rows, "row",
+                         self._matrix_name, everything_is_none=False)
+        return self._select(idx, None)
 
     def iter_rows(self, row_filter=None) -> Iterator[Tuple[int, int, sp.csr_matrix]]:
         """Iterate row chunks as CSR matrices.
@@ -141,42 +219,22 @@ class MeasurementLayer:
         return self.columns([idx])
 
     def columns(self, indices: list[int] | np.ndarray) -> sp.csr_matrix:
-        """Read selected feature columns across all rows, in the order given.
+        """Read selected feature columns across all rows, in the order given, as CSR.
 
-        With a feature index this touches only the chunks that actually hold
-        the requested columns, each one once. The previous form called
-        ``column()`` per index and each of those re-iterated every chunk in
-        the matrix, so asking for k features read the whole store k times --
-        fine for one marker, quadratic for a marker panel. The columns are
-        joined in one ``hstack`` (a LIL matrix filled column by column took
-        2.4 s for 50 genes over 160,000 cells, against 0.4 s).
+        ``indices``: integers (any order, repeats allowed; negative ones count
+        from the end) or a boolean mask over every column. An index outside
+        the matrix raises ``IndexError``.
+
+        From column chunks (a column-major matrix, or a feature index), only
+        the chunks that hold a requested column are fetched and decoded, each
+        once; they are found from the chunks' recorded spans, before any blob
+        is read. A matrix without column chunks is read once, row chunk by row
+        chunk, keeping the requested columns (a :class:`FullPassWarning`).
         """
-        idx_list = [int(i) for i in indices]
-        n_rows, n_cols = self.shape
-        if not idx_list:
-            return sp.csr_matrix((n_rows, 0), dtype=self.dtype)
-        wanted = np.asarray(idx_list, dtype=np.int64)
-        if wanted.min() < -n_cols or wanted.max() >= n_cols:
-            raise IndexError(f"{self._matrix_name}: column index outside its {n_cols} columns")
-        wanted = np.where(wanted < 0, wanted + n_cols, wanted)
-        if not self.has_feature_index:
-            return self[:, wanted.tolist()]
-
-        picked: dict[int, sp.csc_matrix] = {}
-        remaining = set(wanted.tolist())
-        for col_start, col_end, chunk in self.iter_columns():
-            hits = [j for j in remaining if col_start <= j < col_end]
-            if not hits:
-                continue
-            local = chunk[:, [j - col_start for j in hits]].tocsc()
-            for slot, j in enumerate(hits):
-                picked[j] = local[:, [slot]]
-            remaining.difference_update(hits)
-            if not remaining:
-                break
-        dtype = next(iter(picked.values())).dtype if picked else self.dtype
-        cols = [picked.get(int(j), sp.csc_matrix((n_rows, 1), dtype=dtype)) for j in wanted]
-        return sp.hstack(cols, format="csc").tocsr()
+        n_cols = self.shape[1]
+        idx = _positions(indices if not _is_int(indices) else [indices], n_cols, "column",
+                         self._matrix_name, everything_is_none=False)
+        return self._select(None, idx)
 
     def build_feature_index(self, chunk_size: int | None = None, compression: str = "zstd") -> None:
         """Build the column-major (CSC) chunks for feature-wise iteration.
@@ -305,6 +363,46 @@ class MeasurementLayer:
 
 def _is_int(sel) -> bool:
     return isinstance(sel, (int, np.integer)) and not isinstance(sel, (bool, np.bool_))
+
+
+def _positions(sel, n: int, what: str, matrix_name: str = "", everything_is_none: bool = True):
+    """The positions ``sel`` names along an axis of ``n``, as an int64 array.
+
+    numpy's rules, the same for rows and columns: an integer, a slice (any
+    step), a sequence of integers (any order, repeats allowed) or a boolean
+    mask with one value per position; negative positions count from the end;
+    a position outside the axis raises ``IndexError``. A full slice gives
+    ``None`` (every position, in order) when ``everything_is_none``.
+    """
+    if isinstance(sel, slice):
+        start, stop, step = sel.indices(n)
+        if everything_is_none and step == 1 and start == 0 and stop >= n:
+            return None
+        return np.arange(start, stop, step, dtype=np.int64)
+    if _is_int(sel):
+        i = int(sel)
+        j = i + n if i < 0 else i
+        if j < 0 or j >= n:
+            raise IndexError(f"{matrix_name}: {what} {i} is outside its {n} {what}s")
+        return np.array([j], dtype=np.int64)
+    if sel is None or isinstance(sel, (str, bytes, float, bool, np.bool_)):
+        raise TypeError(f"Unsupported {what} selector: {type(sel)}")
+    arr = np.asarray(sel)
+    if arr.dtype == bool:
+        if arr.ndim != 1 or arr.size != n:
+            raise IndexError(f"{matrix_name}: a boolean {what} mask needs {n} values, not {arr.size}")
+        return np.flatnonzero(arr).astype(np.int64)
+    if arr.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    if arr.dtype.kind not in "iu":
+        raise TypeError(f"{matrix_name}: {what} positions must be integers or a boolean mask, "
+                        f"not {arr.dtype}")
+    asked = arr.astype(np.int64).ravel()
+    pos = np.where(asked < 0, asked + n, asked)
+    bad = (pos < 0) | (pos >= n)
+    if bad.any():
+        raise IndexError(f"{matrix_name}: {what} {int(asked[bad][0])} is outside its {n} {what}s")
+    return pos
 
 
 def _slice_bounds(sel: object, size: int) -> tuple[int, int]:

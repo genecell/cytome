@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # A matrix called ``{X}_counts`` etc. implies modality X is present
 # iff X is in this set. Restricting to known names avoids false
 # positives from incidentally-prefixed user matrices.
-_KNOWN_MODALITY_NAMES = frozenset({"RNA", "GA", "ATAC", "tiles"})
+_KNOWN_MODALITY_NAMES = frozenset({"RNA", "GA", "ATAC", "tiles", "ChIP", "DNase"})
 
 
 def _sql_column_type(series) -> str:
@@ -71,9 +71,9 @@ class Modality:
 
     @property
     def fragments(self):
-        """Return fragment store for ATAC modality."""
-        if self._name != "ATAC":
-            raise AttributeError("fragments is only available for ATAC modality")
+        """Return fragment store for chromatin modalities (ATAC, ChIP, DNase)."""
+        if self._name not in ("ATAC", "ChIP", "DNase"):
+            raise AttributeError("fragments is only available for chromatin modalities (ATAC, ChIP, DNase)")
         from cytome.core.fragments import FragmentStore
 
         return FragmentStore(self._conn, self._dataset)
@@ -291,6 +291,50 @@ class CytomeDataset:
         ``mode="r"``, or because it cannot be written."""
         return is_read_only(self._conn)
 
+    @property
+    def frozen(self) -> dict | None:
+        """The store's freeze record (``at``, ``reason``, ``mode``), or None if it is not frozen.
+
+        A frozen store cannot be written by anything until it is unfrozen (:func:`cytome.freeze`).
+        """
+        value = self._read_manifest().get("frozen")
+        if value is None:
+            return None
+        if isinstance(value, str):
+            import json
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return {"reason": value}
+        return value if isinstance(value, dict) else {"reason": str(value)}
+
+    def freeze(self, reason: str) -> dict:
+        """Freeze this store (:func:`cytome.freeze`), and keep it open for reading."""
+        import warnings
+        from cytome.core.freeze import freeze as _freeze
+
+        self.require_writable("freeze")
+        if not self.is_closed:
+            self._rollback_open_writers()
+            self.flush()
+            self._close_connection()
+        info = _freeze(self.path, reason)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ReadOnlyWarning)
+            self.reopen()
+        return info
+
+    def unfreeze(self, reason: str) -> dict:
+        """Unfreeze this store (:func:`cytome.unfreeze`), and reopen it for writing."""
+        from cytome.core.freeze import unfreeze as _unfreeze
+
+        if not self.is_closed:
+            self._close_connection()
+        info = _unfreeze(self.path, reason)
+        self.mode = "r+" if self.mode == "r" else self.mode
+        self.reopen()
+        return info
+
     def require_writable(self, what: str = "this operation") -> None:
         """Raise :class:`cytome.ReadOnlyError` now if the store is read only.
 
@@ -328,6 +372,14 @@ class CytomeDataset:
     @property
     def peaks(self) -> EntityTable:
         return EntityTable(self._conn, "peaks", enqueue_write=self._enqueue_write)
+
+    @property
+    def chip_peaks(self) -> EntityTable:
+        return EntityTable(self._conn, "chip_peaks", enqueue_write=self._enqueue_write)
+
+    @property
+    def dnase_peaks(self) -> EntityTable:
+        return EntityTable(self._conn, "dnase_peaks", enqueue_write=self._enqueue_write)
 
     @property
     def samples(self) -> EntityTable:
@@ -2340,9 +2392,29 @@ class CytomeDataset:
 
     def _write_entity_table(self, table_name: str, frame: pd.DataFrame) -> None:
         key_col = _primary_key_for_table(table_name)
-        if key_col not in frame.columns:
-            frame = frame.copy()
-            frame.insert(0, key_col, np.arange(frame.shape[0], dtype=np.int64))
+        cell_plan = None
+        if table_name == "cells":
+            # The rows keep their order and get keys 0..n-1; spatial_coords and cell_sets name cells by
+            # cell_idx value, so they are carried to the new numbers (cytome.core.cell_renumber).
+            from cytome.core.cell_renumber import plan_cell_value_remap
+
+            old_ids = [r[0] for r in self._conn.execute("SELECT cell_idx FROM cells ORDER BY rowid")]
+            if old_ids:
+                plan = plan_cell_value_remap(self._conn, old_ids)
+                if plan.spatial is not None or plan.cell_sets is not None:
+                    if len(old_ids) != frame.shape[0]:
+                        raise ValueError(
+                            f"rewriting the cells table from {len(old_ids)} to {frame.shape[0]} rows would "
+                            "leave its spatial coordinates and cell sets naming the wrong cells; "
+                            "subset the store instead"
+                        )
+                    cell_plan = plan
+
+        frame = frame.copy()
+        drop_cols = [c for c in frame.columns if c.lower() == key_col.lower()]
+        if drop_cols:
+            frame = frame.drop(columns=drop_cols)
+        frame.insert(0, key_col, np.arange(frame.shape[0], dtype=np.int64))
 
         # Resolve case-insensitive column collisions (SQLite column names
         # are case-insensitive, but Python's ``in`` check is case-sensitive).
@@ -2387,8 +2459,18 @@ class CytomeDataset:
         placeholders = ",".join(["?"] * len(cols))
         quoted_cols = ", ".join(_quote_ident(c) for c in cols)
         sql = f"INSERT INTO {table_name} ({quoted_cols}) VALUES ({placeholders})"
-        rows = [tuple(_py_scalar(v) for v in row) for row in frame.to_numpy()]
-        self._conn.executemany(sql, rows)
+        arr = frame.to_numpy()
+        n_rows = arr.shape[0]
+        block_size = 65536
+        for start in range(0, n_rows, block_size):
+            block = arr[start : start + block_size]
+            rows = [tuple(_py_scalar(v) for v in row) for row in block]
+            self._conn.executemany(sql, rows)
+
+        if cell_plan is not None:
+            from cytome.core.cell_renumber import apply_cell_value_remap
+
+            apply_cell_value_remap(self._conn, cell_plan)
 
     def _sync_manifest_counts(self) -> None:
         n_cells = int(self._conn.execute("SELECT COUNT(*) FROM cells").fetchone()[0])
@@ -2431,6 +2513,51 @@ class CytomeDataset:
             (key, json.dumps(value)),
         )
 
+    # ------------------------------------------------------------------
+    # Sequence-to-chromatin ML & quantitative genomics primitives (0.4.0)
+    # ------------------------------------------------------------------
+
+    def aggregate_pseudobulk(
+        self,
+        modality: str = "ATAC",
+        layer: str = "counts",
+        by: str | Sequence[str] = "cell_type",
+        **kwargs,
+    ):
+        """Compute or retrieve a multi-axis :class:`~cytome.core.pseudobulk.PseudobulkCube`."""
+        from cytome.core.pseudobulk import aggregate_pseudobulk as _impl
+        return _impl(self, modality=modality, layer=layer, by=by, **kwargs)
+
+    def store_peak_sequences(self, fasta_path=None, **kwargs) -> dict:
+        """Extract and embed summit- & midpoint-centered peak DNA sequences into ``peak_sequences``."""
+        from cytome.core.sequences import store_peak_sequences as _impl
+        return _impl(self, fasta_path=fasta_path, **kwargs)
+
+    def get_peak_sequences(self, window: int = 500, **kwargs):
+        """Retrieve embedded peak DNA sequences in ``'uint8'``, ``'onehot'``, or ``'str'`` encoding."""
+        from cytome.core.sequences import get_peak_sequences as _impl
+        return _impl(self, window=window, **kwargs)
+
+    def annotate_peaks_tss(self, gtf_path=None, **kwargs) -> dict:
+        """Populate dual-track TSS distances, region annotations, and GC content on ``peaks``."""
+        from cytome.core.peak_annotation import annotate_peaks_tss as _impl
+        return _impl(self, gtf_path=gtf_path, **kwargs)
+
+    def sync_gene_metadata(self, gtf_path=None, **kwargs) -> dict:
+        """Synchronize ``genes`` and ``GA_genes`` tables with ``_gene_annotation``."""
+        from cytome.io.gtf_import import sync_gene_metadata as _impl
+        return _impl(self, gtf_path=gtf_path, **kwargs)
+
+    def ensure_gtf_imported(self, gtf_path=None, **kwargs) -> dict:
+        """Ensure ``_gene_annotation`` and ``_exon_annotation`` are populated and have biotypes."""
+        from cytome.io.gtf_import import ensure_gtf_imported as _impl
+        return _impl(self, gtf_path=gtf_path, **kwargs)
+
+    def get_tn5_footprints(self, regions, **kwargs):
+        """Extract base-pair or binned Tn5 insertion footprints across one or more genomic regions."""
+        from cytome.core.footprints import get_tn5_footprints as _impl
+        return _impl(self, regions, **kwargs)
+
 
 def _embedding_array(name: str, values) -> np.ndarray:
     """``values`` as an embedding: a 2-D array of numbers. Checked when the
@@ -2460,6 +2587,8 @@ def _primary_key_for_table(table_name: str) -> str:
         "genes": "gene_idx",
         "GA_genes": "gene_idx",
         "peaks": "peak_idx",
+        "chip_peaks": "peak_idx",
+        "dnase_peaks": "peak_idx",
         "tiles": "tile_idx",
         "samples": "sample_idx",
         "proteins": "protein_idx",
@@ -2494,6 +2623,10 @@ def _quote_ident(name: str) -> str:
 
 
 def _infer_col_entity(matrix_name: str) -> str:
+    if matrix_name.startswith("ChIP_") or matrix_name == "ChIP":
+        return "chip_peaks"
+    if matrix_name.startswith("DNase_") or matrix_name == "DNase":
+        return "dnase_peaks"
     if "ATAC" in matrix_name or "peak" in matrix_name.lower():
         return "peaks"
     if "tile" in matrix_name.lower():

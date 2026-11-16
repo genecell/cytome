@@ -115,15 +115,16 @@ def _query_region_from_chunks(
     from cytome.io.compression import decompress_blob, decode_starts, decode_ends
 
     try:
-        # Chunks whose first start is at or past the query's end are skipped by
-        # the (chrom, min_start) index, and the rest are read one at a time
-        # through the cursor: fetchall() held every blob of the chromosome.
+        # Iterated, not fetched: one chunk's blobs in memory at a time (a store whose chunks have no
+        # max_end yet, as from PIASO's importer, sends every earlier chunk of the chromosome through here)
         rows = conn.execute(
             "SELECT starts_blob, ends_blob, cell_idx_blob, compression, "
             "COALESCE(encoding, 0) as encoding, min_start "
-            "FROM fragment_chunks WHERE chrom = ? AND (min_start IS NULL OR min_start < ?) "
+            "FROM fragment_chunks WHERE chrom = ? "
+            "AND (min_start IS NULL OR min_start < ?) "
+            "AND (max_end IS NULL OR max_end > ?) "
             "ORDER BY chunk_idx",
-            (chrom, int(end)),
+            (chrom, int(end), int(start)),
         )
     except sqlite3.OperationalError:
         return []

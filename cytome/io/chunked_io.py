@@ -227,26 +227,37 @@ def _decode_block(n_major: int, n_minor: int, data_blob, indices_blob, indptr_bl
     return sp.csr_matrix((data, indices, indptr), shape=(n_major, n_minor))
 
 
+#: The two stored layouts of a sparse matrix, by the axis their chunks cut:
+#: the chunk table, its span columns, and the axis's name in messages.
+_LAYOUT = {
+    "rows": ("matrix_chunks", "row_start", "row_end", "rows"),
+    "cols": ("matrix_csc_chunks", "col_start", "col_end", "columns"),
+}
+
+
 class _Plan:
-    """The chunks of one row-major matrix, in row order: their ids, row spans
-    and recorded sizes.
+    """The chunks of one stored layout of a matrix, in axis order: their ids,
+    spans and recorded sizes. ``axis="rows"`` is its row chunks (CSR blocks),
+    ``axis="cols"`` its column chunks (CSC blocks).
 
     Only columns stored before the blobs are read (``dtype`` follows them, and
     reading it walks each blob's overflow pages: 70 times slower, measured),
-    from the covering index ``idx_matrix_chunks_span`` where the store has it.
+    from the covering index (``idx_matrix_chunks_span``,
+    ``idx_csc_chunks_span``) where the store has it.
     """
 
-    __slots__ = ("ids", "starts", "ends", "nnz", "in_order")
+    __slots__ = ("ids", "starts", "ends", "nnz", "in_order", "axis")
 
-    def __init__(self, conn, matrix_name: str):
+    def __init__(self, conn, matrix_name: str, axis: str = "rows"):
+        table, c0, c1, word = _LAYOUT[axis]
         rows = conn.execute(
-            "SELECT chunk_idx, row_start, row_end, COALESCE(n_nonzero, 0) FROM matrix_chunks "
+            f"SELECT chunk_idx, {c0}, {c1}, COALESCE(n_nonzero, 0) FROM {table} "
             "WHERE matrix_name = ? ORDER BY chunk_idx", (matrix_name,)).fetchall()
         arr = np.asarray(rows, dtype=np.int64).reshape(-1, 4) if rows else \
             np.zeros((0, 4), dtype=np.int64)
         ids, starts, ends, nnz = (np.ascontiguousarray(arr[:, i]) for i in range(4))
-        # chunk order is row order for every writer of this package; a store
-        # whose chunks were written out of order is read in row order anyway
+        # chunk order is axis order for every writer of this package; a store
+        # whose chunks were written out of order is read in axis order anyway
         self.in_order = bool(len(rows) < 2 or np.all(starts[1:] >= ends[:-1]))
         if not self.in_order:
             order = np.lexsort((ids, starts))
@@ -256,29 +267,32 @@ class _Plan:
                 j = int(bad[0])
                 raise ValueError(
                     f"{matrix_name}: chunks {int(ids[j])} and {int(ids[j + 1])} hold the same "
-                    f"rows ({int(starts[j + 1])} to {int(ends[j]) - 1}); the matrix is damaged")
+                    f"{word} ({int(starts[j + 1])} to {int(ends[j]) - 1}); the matrix is damaged")
         self.ids, self.starts, self.ends, self.nnz = ids, starts, ends, nnz
+        self.axis = axis
 
     def __len__(self) -> int:
         return int(self.ids.size)
 
     def touching(self, wanted_sorted: np.ndarray) -> np.ndarray:
-        """Positions (in row order) of the chunks holding any of ``wanted_sorted``."""
+        """Positions (in axis order) of the chunks holding any of ``wanted_sorted``."""
         lo = np.searchsorted(wanted_sorted, self.starts, side="left")
         hi = np.searchsorted(wanted_sorted, self.ends, side="left")
         return np.flatnonzero(hi > lo)
 
 
 def _blob_rows(conn, matrix_name: str, plan: _Plan, positions=None):
-    """``(row_start, row_end, data_blob, indices_blob, indptr_blob, compression, dtype)``
-    for the chunks at ``positions`` of ``plan`` (all when None), in row order.
+    """``(start, end, data_blob, indices_blob, indptr_blob, compression, dtype)``
+    for the chunks at ``positions`` of ``plan`` (all when None), in axis order;
+    ``start`` and ``end`` are the chunk's span along the plan's axis.
 
     A full read of a matrix in chunk order streams one cursor; anything else
     asks for the chunks by id, a bounded batch per statement."""
+    table, c0, c1, _word = _LAYOUT[plan.axis]
     if positions is None and plan.in_order:
         cur = conn.execute(
-            "SELECT row_start, row_end, data_blob, indices_blob, indptr_blob, compression, dtype "
-            "FROM matrix_chunks WHERE matrix_name = ? ORDER BY chunk_idx", (matrix_name,))
+            f"SELECT {c0}, {c1}, data_blob, indices_blob, indptr_blob, compression, dtype "
+            f"FROM {table} WHERE matrix_name = ? ORDER BY chunk_idx", (matrix_name,))
         yield from cur
         return
     pos = np.arange(len(plan)) if positions is None else np.asarray(positions, dtype=np.int64)
@@ -288,14 +302,23 @@ def _blob_rows(conn, matrix_name: str, plan: _Plan, positions=None):
         ids = [int(plan.ids[p]) for p in part]
         got = {}
         for row in conn.execute(
-                "SELECT chunk_idx, row_start, row_end, data_blob, indices_blob, indptr_blob, "
-                f"compression, dtype FROM matrix_chunks WHERE matrix_name = ? AND chunk_idx IN "
+                f"SELECT chunk_idx, {c0}, {c1}, data_blob, indices_blob, indptr_blob, "
+                f"compression, dtype FROM {table} WHERE matrix_name = ? AND chunk_idx IN "
                 f"({','.join('?' * len(ids))})", (matrix_name, *ids)):
             got[int(row[0])] = row[1:]
         for cid in ids:
             if cid not in got:
                 raise KeyError(f"{matrix_name}: chunk {cid} vanished during the read")
             yield got[cid]
+
+
+def touched_nonzeros(conn, matrix_name: str, axis: str, positions) -> int:
+    """The recorded entries of the ``axis`` chunks that hold any of ``positions``:
+    what a selective read along that axis decodes. 0 when the matrix has no
+    such chunks."""
+    plan = _Plan(conn, matrix_name, axis)
+    wanted = np.unique(np.asarray(positions, dtype=np.int64))
+    return int(plan.nnz[plan.touching(wanted)].sum()) if len(plan) else 0
 
 
 def _in_batch(conn) -> int:
@@ -623,36 +646,45 @@ def write_sparse_chunked(
 # Readers
 # --------------------------------------------------------------------------
 
-def read_sparse_chunked(conn: sqlite3.Connection, matrix_name: str) -> sp.csr_matrix:
-    """Read a full sparse matrix from chunk storage.
+def _read_full(conn: sqlite3.Connection, matrix_name: str, axis: str, stacklevel: int = 3):
+    """Every chunk of one stored layout, each placed by its span: CSR from the
+    row chunks (``axis="rows"``), CSC from the column chunks (``"cols"``).
 
-    Rows are placed by each chunk's ``row_start``; rows no chunk holds are
-    zero rows. The destination is sized from the chunks' recorded
+    Positions no chunk holds are zero; chunks that overlap are refused
+    (:class:`_Plan`). The destination is sized from the chunks' recorded
     ``n_nonzero`` before any blob is read, so a full read holds the matrix
     once, not twice; past 2**31 - 1 entries its index arrays are int64 (an
     int32 index pointer wrapped there and returned a corrupt matrix).
     """
     n_rows, n_cols, meta_dtype, n_nonzero = _matrix_meta(conn, matrix_name)
-    plan = _Plan(conn, matrix_name)
+    _table, _c0, _c1, word = _LAYOUT[axis]
+    by_rows = axis == "rows"
+    n_major, n_minor = (n_rows, n_cols) if by_rows else (n_cols, n_rows)
+    build = sp.csr_matrix if by_rows else sp.csc_matrix
+
+    def shape(n):
+        return (n, n_cols) if by_rows else (n_rows, n)
+
+    plan = _Plan(conn, matrix_name, axis)
     if not len(plan):
-        return sp.csr_matrix((n_rows, n_cols), dtype=meta_dtype)
+        return build(shape(n_major), dtype=meta_dtype)
     out_dtype = meta_dtype
 
     recorded = int(plan.nnz.sum())
-    n_out = max(n_rows, int(plan.ends.max()))
+    n_out = max(n_major, int(plan.ends.max()))
     cap = max(recorded, 1)
     idx_dtype = _index_dtype(max(cap, n_nonzero or 0))
     data = np.empty(cap, dtype=out_dtype)
     indices = np.empty(cap, dtype=idx_dtype)
     indptr = np.zeros(n_out + 1, dtype=idx_dtype)
     at = 0
-    row_at = 0
+    major_at = 0
     covered = 0
-    for rs, re_, d_blob, i_blob, p_blob, comp, cdt in _blob_rows(conn, matrix_name, plan):
-        rs, re_ = int(rs), int(re_)
-        block = _decode_block(re_ - rs, n_cols, d_blob, i_blob, p_blob, comp, cdt,
-                              meta_dtype, f"{matrix_name} rows {rs}-{re_ - 1}",
-                              matrix_name=matrix_name)
+    for s, e, d_blob, i_blob, p_blob, comp, cdt in _blob_rows(conn, matrix_name, plan):
+        s, e = int(s), int(e)
+        block = _decode_block(e - s, n_minor, d_blob, i_blob, p_blob, comp, cdt,
+                              meta_dtype, f"{matrix_name} {word} {s}-{e - 1}",
+                              fmt="csr" if by_rows else "csc", matrix_name=matrix_name)
         k = int(block.nnz)
         if at + k > data.size:               # the recorded sizes were short
             new_cap = max(2 * data.size, at + k)
@@ -668,22 +700,46 @@ def read_sparse_chunked(conn: sqlite3.Connection, matrix_name: str) -> sp.csr_ma
             indices = grown
         data[at:at + k] = block.data
         indices[at:at + k] = block.indices
-        _place_rows(indptr, row_at, rs, re_, block.indptr, at)
+        _place_rows(indptr, major_at, s, e, block.indptr, at)
         at += k
-        row_at = re_
-        covered += re_ - rs
-    indptr[row_at + 1:] = at
-    if at != recorded or (n_nonzero is not None and at != n_nonzero) or covered != n_rows \
-            or n_out != n_rows:
+        major_at = e
+        covered += e - s
+    indptr[major_at + 1:] = at
+    if at != recorded or (n_nonzero is not None and at != n_nonzero) or covered != n_major \
+            or n_out != n_major:
         # The recorded totals disagree with what is on disk. Trust the blobs,
         # not the metadata, and say so rather than returning a matrix padded
         # with uninitialised memory.
         warnings.warn(
             f"{matrix_name}: matrix_meta says {n_nonzero} nonzeros over "
-            f"{n_rows} rows but the chunks hold {at} over {covered} (rows "
-            f"to {n_out}). Using the chunks; rows no chunk holds are zero.",
-            stacklevel=2)
-    return sp.csr_matrix((data[:at], indices[:at], indptr), shape=(n_out, n_cols))
+            f"{n_major} {word} but the chunks hold {at} over {covered} ({word} "
+            f"to {n_out}). Using the chunks; {word} no chunk holds are zero.",
+            stacklevel=stacklevel)
+    return build((data[:at], indices[:at], indptr), shape=shape(n_out))
+
+
+def read_sparse_chunked(conn: sqlite3.Connection, matrix_name: str) -> sp.csr_matrix:
+    """Read a full sparse matrix from its row chunks, as CSR.
+
+    Rows are placed by each chunk's ``row_start``; rows no chunk holds are
+    zero rows. The destination is sized from the chunks' recorded
+    ``n_nonzero`` before any blob is read, so a full read holds the matrix
+    once, not twice; past 2**31 - 1 entries its index arrays are int64 (an
+    int32 index pointer wrapped there and returned a corrupt matrix).
+    """
+    return _read_full(conn, matrix_name, "rows")
+
+
+def read_sparse_chunked_csc(conn: sqlite3.Connection, matrix_name: str) -> sp.csc_matrix:
+    """Read a full sparse matrix from its column chunks, as CSC.
+
+    The column twin of :func:`read_sparse_chunked`: columns are placed by each
+    chunk's ``col_start`` (columns no chunk holds are zero, overlapping chunks
+    are refused), and the destination is sized once from the recorded sizes.
+    It replaced stacking the decoded chunks in ``chunk_idx`` order, which never
+    checked that they covered every column once and held the matrix twice.
+    """
+    return _read_full(conn, matrix_name, "cols")
 
 
 def _place_rows(indptr: np.ndarray, row_at: int, rs: int, re_: int, block_indptr, at: int) -> None:
@@ -739,10 +795,169 @@ def read_sparse_slice(
     return _rows_from_blocks(blocks, n_want, n_cols, meta_dtype)
 
 
+def _cols_from_blocks(blocks, n_cols: int, n_rows: int, dtype) -> sp.csc_matrix:
+    """Stack ``[(local_col, csc_block), ...]`` (ascending, non-overlapping) into
+    ``n_cols`` columns; columns between blocks are zero columns."""
+    parts = []
+    at = 0
+    for c0, blk in blocks:
+        if c0 > at:
+            parts.append(sp.csc_matrix((int(n_rows), c0 - at), dtype=dtype))
+        parts.append(blk)
+        at = c0 + blk.shape[1]
+    if at < n_cols:
+        parts.append(sp.csc_matrix((int(n_rows), n_cols - at), dtype=dtype))
+    if not parts:
+        return sp.csc_matrix((int(n_rows), int(n_cols)), dtype=dtype)
+    if len(parts) == 1:
+        return parts[0].tocsc()
+    return sp.hstack(parts, format="csc")
+
+
+def _as_positions(sel, n: int, what: str, matrix_name: str, limit: int | None = None) -> np.ndarray:
+    """``sel`` (integers in ``[0, limit)``, or a boolean mask) as an int64 array.
+
+    The storage-level rule: no negative positions (the dataset API counts them
+    from the end before it calls in). A boolean mask of any length is read as
+    the positions it marks, as the row reader always did."""
+    arr = np.asarray(sel)
+    if arr.dtype == bool:
+        arr = np.flatnonzero(arr)
+    arr = np.asarray(arr, dtype=np.int64).ravel()
+    limit = n if limit is None else limit
+    bad = (arr < 0) | (arr >= limit)
+    if bad.any():
+        raise IndexError(f"{matrix_name}: {what} {int(arr[bad][0])} is outside its {limit} {what}s")
+    return arr
+
+
+def _minor_maps(minor: np.ndarray, n_minor: int):
+    """For a selection along the axis the chunks don't cut: which positions to
+    keep (``keep``), each one's place among the sorted distinct positions
+    (``pos``), how many those are, and the order that puts them back as asked
+    (``None`` when they were asked sorted and distinct)."""
+    uniq, inverse = np.unique(minor, return_inverse=True)
+    keep = np.zeros(n_minor, dtype=bool)
+    keep[uniq] = True
+    pos = np.full(n_minor, -1, dtype=_index_dtype(max(uniq.size, 1)))
+    pos[uniq] = np.arange(uniq.size, dtype=pos.dtype)
+    same = uniq.size == minor.size and bool(np.all(minor[1:] > minor[:-1]))
+    return keep, pos, int(uniq.size), (None if same else inverse.ravel())
+
+
+def _mask_minor(block, keep: np.ndarray, pos: np.ndarray, n_keep: int):
+    """``block`` (CSR or CSC) with only the minor positions ``keep`` marks,
+    renumbered by ``pos``; the major axis is unchanged. One pass over the
+    block's entries; the per-chunk temporaries are a boolean per entry and the
+    kept entries."""
+    ind = block.indices
+    kept = np.flatnonzero(keep[ind])
+    idx_dt = _index_dtype(max(n_keep, kept.size, 1))
+    indptr = np.searchsorted(kept, block.indptr, side="left").astype(idx_dt, copy=False)
+    data = block.data[kept]
+    indices = pos[ind[kept]].astype(idx_dt, copy=False)
+    if block.format == "csr":
+        return sp.csr_matrix((data, indices, indptr), shape=(block.shape[0], n_keep))
+    return sp.csc_matrix((data, indices, indptr), shape=(n_keep, block.shape[1]))
+
+
+def read_sparse_axis(
+    conn: sqlite3.Connection,
+    matrix_name: str,
+    axis: str,
+    major: "np.ndarray | None" = None,
+    minor: "np.ndarray | None" = None,
+):
+    """Read a selection of a sparse matrix from one stored layout.
+
+    ``axis`` names the layout: ``"rows"`` reads the row chunks and returns CSR,
+    ``"cols"`` reads the column chunks and returns CSC. ``major`` selects along
+    that axis (rows of the row chunks, columns of the column chunks), ``minor``
+    along the other; each is a sequence of positions, in any order, repeats
+    allowed, or ``None`` for all, and the result follows the order asked on
+    both axes.
+
+    - With ``major``, only the chunks that hold one of its positions are fetched
+      and decoded.
+    - Without it, every chunk is read once, in order. Memory is then the result
+      plus one chunk: this is how the axis a matrix is not stored by is read.
+    - ``minor`` is applied inside each chunk, never on a full-width intermediate.
+
+    Positions no chunk holds are zero. A position outside the matrix raises
+    ``IndexError``; negative positions are refused here (the dataset API counts
+    them from the end before it calls in).
+    """
+    n_rows, n_cols, meta_dtype, _nnz = _matrix_meta(conn, matrix_name)
+    _table, _c0, _c1, word = _LAYOUT[axis]
+    by_rows = axis == "rows"
+    n_major, n_minor = (n_rows, n_cols) if by_rows else (n_cols, n_rows)
+    major_word, minor_word = ("row", "column") if by_rows else ("column", "row")
+    plan = _Plan(conn, matrix_name, axis)
+    limit = max(n_major, int(plan.ends.max()) if len(plan) else 0)
+
+    if minor is not None:
+        minor = _as_positions(minor, n_minor, minor_word, matrix_name)
+    if major is not None:
+        major = _as_positions(major, n_major, major_word, matrix_name, limit=limit)
+        n_out = int(major.size)
+    else:
+        n_out = limit
+    minor_len = n_minor if minor is None else int(minor.size)   # the result's size on that axis
+    if n_out == 0 or minor_len == 0:
+        return sp.csr_matrix((n_out, minor_len), dtype=meta_dtype) if by_rows else \
+            sp.csc_matrix((minor_len, n_out), dtype=meta_dtype)
+
+    if minor is not None:
+        keep, pos, n_keep, minor_back = _minor_maps(minor, n_minor)
+    if major is not None:
+        order = np.argsort(major, kind="stable")
+        wanted = major[order]
+        positions = plan.touching(wanted)
+    else:
+        wanted = order = positions = None
+
+    blocks = []
+    for s, e, d_blob, i_blob, p_blob, comp, cdt in _blob_rows(conn, matrix_name, plan, positions):
+        s, e = int(s), int(e)
+        chunk = _decode_block(e - s, n_minor, d_blob, i_blob, p_blob, comp, cdt, meta_dtype,
+                              f"{matrix_name} {word} {s}-{e - 1}",
+                              fmt="csr" if by_rows else "csc", matrix_name=matrix_name)
+        if wanted is not None:
+            lo = int(np.searchsorted(wanted, s, side="left"))
+            hi = int(np.searchsorted(wanted, e, side="left"))
+            local = (wanted[lo:hi] - s).astype(np.intp)
+            chunk = chunk[local] if by_rows else chunk[:, local]
+            at = lo
+        else:
+            at = s
+        if minor is not None:
+            chunk = _mask_minor(chunk, keep, pos, n_keep)
+        blocks.append((at, chunk))
+
+    n_minor_out = n_minor if minor is None else n_keep
+    out = _rows_from_blocks(blocks, n_out, n_minor_out, meta_dtype) if by_rows else \
+        _cols_from_blocks(blocks, n_out, n_minor_out, meta_dtype)
+    # back to the order asked for, on both axes
+    if order is not None and not np.all(order[1:] > order[:-1]):
+        inverse = np.empty_like(order)
+        inverse[order] = np.arange(order.size)
+        out = out[inverse] if by_rows else out[:, inverse]
+    if minor is not None and minor_back is not None:
+        out = _minor_reorder(out, minor_back, by_rows)
+    return out
+
+
+def _minor_reorder(out, back: np.ndarray, by_rows: bool):
+    """Put the minor axis of ``out`` (sorted distinct positions) into the order
+    asked, repeats included."""
+    return (out[:, back] if by_rows else out[back, :]).asformat("csr" if by_rows else "csc")
+
+
 def read_sparse_rows(
     conn: sqlite3.Connection,
     matrix_name: str,
     row_indices: np.ndarray,
+    col_indices: "np.ndarray | None" = None,
 ) -> sp.csr_matrix:
     """Read specific rows from a chunked sparse matrix, in the order given.
 
@@ -750,7 +965,8 @@ def read_sparse_rows(
     Returns a CSR matrix with shape ``(len(row_indices), n_cols)``: rows in any
     order and repeated rows are allowed (they needed sorted unique indices
     before, and raised otherwise), a row no chunk holds is a zero row, and an
-    index outside the matrix raises ``IndexError``.
+    index outside the matrix raises ``IndexError``. With ``col_indices``, only
+    those columns are kept, in that order, taken inside each chunk.
 
     Parameters
     ----------
@@ -760,43 +976,28 @@ def read_sparse_rows(
         Matrix identifier.
     row_indices
         0-based row indices to read.
+    col_indices
+        Optional 0-based column indices to keep.
     """
-    row_indices = np.asarray(row_indices)
-    if row_indices.dtype == bool:
-        row_indices = np.flatnonzero(row_indices)
-    row_indices = np.asarray(row_indices, dtype=np.int64).ravel()
-    n_rows, n_cols, meta_dtype, _nnz = _matrix_meta(conn, matrix_name)
+    return read_sparse_axis(conn, matrix_name, "rows", major=row_indices, minor=col_indices)
 
-    if row_indices.size == 0:
-        return sp.csr_matrix((0, n_cols), dtype=meta_dtype)
 
-    plan = _Plan(conn, matrix_name)
-    limit = max(n_rows, int(plan.ends.max()) if len(plan) else 0)
-    bad = (row_indices < 0) | (row_indices >= limit)
-    if bad.any():
-        raise IndexError(f"{matrix_name}: row {int(row_indices[bad][0])} is outside its "
-                         f"{limit} rows")
-    order = np.argsort(row_indices, kind="stable")
-    wanted = row_indices[order]
-    pos = plan.touching(wanted)
+def read_sparse_cols(
+    conn: sqlite3.Connection,
+    matrix_name: str,
+    col_indices: np.ndarray,
+    row_indices: "np.ndarray | None" = None,
+) -> sp.csc_matrix:
+    """Read specific columns from a matrix's column chunks, in the order given.
 
-    blocks = []
-    for c_start, c_end, d_blob, i_blob, p_blob, comp, cdt in _blob_rows(conn, matrix_name, plan, pos):
-        c_start, c_end = int(c_start), int(c_end)
-        lo = int(np.searchsorted(wanted, c_start, side="left"))
-        hi = int(np.searchsorted(wanted, c_end, side="left"))
-        chunk = _decode_block(c_end - c_start, n_cols, d_blob, i_blob, p_blob, comp, cdt,
-                              meta_dtype, f"{matrix_name} rows {c_start}-{c_end - 1}",
-                              matrix_name=matrix_name)
-        blocks.append((lo, chunk[(wanted[lo:hi] - c_start).astype(np.intp)]))
-    # the wanted rows in ascending order (rows of no chunk zero), then back to
-    # the order asked for
-    sorted_rows = _rows_from_blocks(blocks, wanted.size, n_cols, meta_dtype)
-    if np.all(order[1:] > order[:-1]):
-        return sorted_rows
-    inverse = np.empty_like(order)
-    inverse[order] = np.arange(order.size)
-    return sorted_rows[inverse]
+    The column twin of :func:`read_sparse_rows`: only the column chunks that
+    hold a requested column are fetched and decoded, each once. Returns CSC
+    with shape ``(n_rows, len(col_indices))``; columns in any order and repeats
+    are allowed, a column no chunk holds is zero, and an index outside the
+    matrix raises ``IndexError``. With ``row_indices``, only those rows are
+    kept, in that order, taken inside each chunk.
+    """
+    return read_sparse_axis(conn, matrix_name, "cols", major=col_indices, minor=row_indices)
 
 
 def read_dense_rows(

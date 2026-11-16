@@ -314,14 +314,24 @@ def _concat_keeping_categories(frames):
 # ---------------------------------------------------------------------------
 
 def _merge_feature_tables(datasets, out, gene_strategy, peak_strategy, tile_strategy) -> dict:
-    """Merge and write each modality's feature table;
+    """Merge and write each modality's feature table once per entity;
     ``{modality: (entity, id_col, ids, axis unchanged)}``."""
     from cytome.core.column_meta import restore_column_dtypes, store_column_meta
     from cytome.utils.modality import MODALITY_VAR_ENTITY
-    strategy = {"RNA": gene_strategy, "GA": gene_strategy,
-                "ATAC": peak_strategy, "tiles": tile_strategy}
+    strategy = {
+        "RNA": gene_strategy,
+        "GA": gene_strategy,
+        "ATAC": peak_strategy,
+        "tiles": tile_strategy,
+        "ChIP": peak_strategy,
+        "DNase": peak_strategy,
+    }
     merged_axis = {}
+    merged_entities = {}
     for mod, (entity, id_col) in dict(MODALITY_VAR_ENTITY).items():
+        if entity in merged_entities:
+            merged_axis[mod] = merged_entities[entity]
+            continue
         frames = []
         for ds in datasets:
             fdf = _read_entity_frame(ds, entity)
@@ -335,7 +345,8 @@ def _merge_feature_tables(datasets, out, gene_strategy, peak_strategy, tile_stra
             output_ids = shared_order
             feat_df = _clean_feature_frame(frames[0], id_col)
         else:
-            output_ids, feat_df = _merge_feature_frames(frames, id_col, strategy[mod])
+            mod_strategy = strategy.get(mod, peak_strategy if "peak" in entity else "union")
+            output_ids, feat_df = _merge_feature_frames(frames, id_col, mod_strategy)
         if not output_ids:
             continue
         if entity in ("genes", "GA_genes") and "symbol" not in feat_df.columns:
@@ -343,7 +354,9 @@ def _merge_feature_tables(datasets, out, gene_strategy, peak_strategy, tile_stra
         out.set_entity(entity, feat_df)
         out.flush()
         store_column_meta(out._conn, entity, feat_df)
-        merged_axis[mod] = (entity, id_col, output_ids, shared_order is not None)
+        entry = (entity, id_col, output_ids, shared_order is not None)
+        merged_entities[entity] = entry
+        merged_axis[mod] = entry
     return merged_axis
 
 

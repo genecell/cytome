@@ -65,10 +65,11 @@ def _build_multimodal_cytome(path, n_cells=8, seed=0):
 
 # --- Registry surface ---
 
-def test_modality_registry_covers_4_modalities():
+def test_modality_registry_covers_core_and_bulk_modalities():
     from cytome.utils.modality import MODALITY_REGISTRY
     names = [e[0] for e in MODALITY_REGISTRY]
-    assert names == ["RNA", "GA", "ATAC", "tiles"]
+    assert names[:4] == ["RNA", "GA", "ATAC", "tiles"]
+    assert names == ["RNA", "GA", "ATAC", "tiles", "ChIP", "DNase"]
 
 
 def test_modality_var_entity_each_modality():

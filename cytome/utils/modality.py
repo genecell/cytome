@@ -28,6 +28,8 @@ MODALITY_REGISTRY: list = [
     ("GA",    "GA_genes",  "gene_idx", ("gene_id", "symbol", "feature_name", "gene_name")),
     ("ATAC",  "peaks",     "peak_idx", ("peak_id", "feature_name")),
     ("tiles", "tiles",     "tile_idx", ("tile_id", "feature_name")),
+    ("ChIP",  "chip_peaks",  "peak_idx", ("peak_id", "feature_name")),
+    ("DNase", "dnase_peaks", "peak_idx", ("peak_id", "feature_name")),
 ]
 
 # Backward-compat shorthand mapping just modality → (entity_table, id_col).
@@ -37,15 +39,16 @@ MODALITY_VAR_ENTITY = {
     for name, entity, id_col, _ in MODALITY_REGISTRY
 }
 
+_CANONICAL_MODALITY = {name.lower(): name for name, _, _, _ in MODALITY_REGISTRY}
+
 
 def modality_var_entity(modality: str) -> Tuple[str, str]:
     """Return (var_entity_table, id_column) for ``modality``.
 
-    Case-sensitive on the canonical 4 modalities (RNA, GA, ATAC, tiles).
+    Case-insensitive on registered modalities (RNA, GA, ATAC, tiles, ChIP, DNase).
     Raises ``ValueError`` for unknown modality names.
     """
-    if modality.upper() in {"RNA", "GA", "ATAC"}:
-        modality = modality.upper()
+    modality = _CANONICAL_MODALITY.get(str(modality).lower(), modality)
     if modality not in MODALITY_VAR_ENTITY:
         raise ValueError(
             f"Unknown modality '{modality}'. Known: {list(MODALITY_VAR_ENTITY)}."
@@ -55,8 +58,7 @@ def modality_var_entity(modality: str) -> Tuple[str, str]:
 
 def _registry_entry(modality: str):
     """Internal — return the full ``MODALITY_REGISTRY`` row for ``modality``."""
-    if modality.upper() in {"RNA", "GA", "ATAC"}:
-        modality = modality.upper()
+    modality = _CANONICAL_MODALITY.get(str(modality).lower(), modality)
     for entry in MODALITY_REGISTRY:
         if entry[0] == modality:
             return entry
@@ -152,7 +154,14 @@ def modality_has_feature(ds, modality: str, feature: str) -> Optional[Tuple[int,
     ``(feat_idx, id_col)``; else return ``None``. Cheap — checks each
     candidate id column once per modality.
     """
-    _, feature_table, idx_col, candidate_cols = _registry_entry(modality)
+    canonical_mod, feature_table, idx_col, candidate_cols = _registry_entry(modality)
+    if hasattr(ds, "modalities"):
+        try:
+            present_mods = ds.modalities
+            if present_mods and canonical_mod not in present_mods:
+                return None
+        except Exception:
+            pass
     try:
         feat_cols = [
             c[1] for c in ds._conn.execute(

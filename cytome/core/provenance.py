@@ -153,3 +153,34 @@ def _read_dependency_versions() -> dict[str, str]:
             continue
         versions[name] = dist.version
     return versions
+
+
+def _plain(value):
+    """``value`` as JSON holds it: paths and other objects as text, tuples as lists."""
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def record_edit(ds, function_name: str, parameters: dict, outputs, inputs=(), notes: str | None = None) -> None:
+    """Record an in-place edit of a store in its provenance: the function, cytome's version, the parameters,
+    the time, and the tables written.
+
+    Every function that changes a store in place calls it, so a store says what changed it. A record that cannot be
+    written is warned about, not raised: the edit itself is done by then.
+    """
+    from cytome.io.sqlite_engine import _package_version
+
+    try:
+        ds.provenance.log(
+            operation="edit", function_name=function_name, parameters=_plain(dict(parameters)),
+            package_name="cytome", package_version=_package_version(), input_objects=list(inputs),
+            output_objects=list(outputs), notes=notes)
+    except Exception as exc:  # pragma: no cover - a store that took the edit takes the record
+        import warnings
+        warnings.warn(f"{function_name}: the edit is done, but its provenance record failed: {exc}", stacklevel=3)
+

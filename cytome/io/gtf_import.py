@@ -39,7 +39,8 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 #: Version of the reader written to ``ds.metadata['gene_annotation']`` by :func:`import_gtf`.
-#: Annotations imported before it (no ``reader_version``) took genes from ``gene`` lines only.
+#: Annotations imported before v2 (no ``reader_version``) took genes from ``gene`` lines only;
+#: v3 infers ``gene_type`` from ``CDS`` / ``transcript_type`` / ``gbkey`` when ``gene`` lines are absent.
 READER_VERSION = 2
 
 DEFAULT_FEATURES = (
@@ -194,7 +195,7 @@ def _rows(gtf_path: Path):
 class _Gene:
     """What the rows of one gene_id say about the gene."""
 
-    __slots__ = ("line", "name", "type", "tx", "rows", "loci")
+    __slots__ = ("line", "name", "type", "tx", "rows", "loci", "has_cds", "tx_types", "product")
 
     def __init__(self):
         self.line = None        # (chrom, start, end, strand) of its gene line, the longest if several
@@ -203,6 +204,9 @@ class _Gene:
         self.tx = {}            # (chrom, strand) -> [min start, max end] over transcript rows
         self.rows = {}          # (chrom, strand) -> [min start, max end] over all other rows
         self.loci = Counter()   # (chrom, strand) -> number of non-gene rows
+        self.has_cds = False
+        self.tx_types = set()
+        self.product = None
 
     def add(self, chrom, feature, start, end, strand, attrs):
         if feature == "gene":
@@ -216,6 +220,17 @@ class _Gene:
             self.name = _gene_name_of(attrs)
         if self.type is None:
             self.type = _gene_type_of(attrs)
+        if feature == "CDS":
+            self.has_cds = True
+        tt = (
+            attrs.get("transcript_type")
+            or attrs.get("transcript_biotype")
+            or attrs.get("gbkey")
+        )
+        if tt and tt not in ("exon", "GF", "Gene"):
+            self.tx_types.add(tt)
+        if self.product is None:
+            self.product = attrs.get("product") or attrs.get("description")
         key = (chrom, strand)
         self.loci[key] += 1
         span = self.rows.get(key)
@@ -223,6 +238,23 @@ class _Gene:
         if feature == "transcript":
             span = self.tx.get(key)
             self.tx[key] = [start, end] if span is None else [min(span[0], start), max(span[1], end)]
+
+    def inferred_type(self) -> Optional[str]:
+        """Explicit ``gene_type`` / ``gene_biotype``, else inferred from CDS / transcript rows."""
+        if self.type is not None:
+            return self.type
+        if self.has_cds or "mRNA" in self.tx_types or "protein_coding" in self.tx_types or "CDS" in self.tx_types:
+            return "protein_coding"
+        if "lnc_RNA" in self.tx_types or "lncRNA" in self.tx_types or "ncRNA" in self.tx_types:
+            return "lncRNA"
+        for bt in ("tRNA", "rRNA", "snRNA", "snoRNA", "miRNA", "scRNA", "misc_RNA"):
+            if bt in self.tx_types:
+                return bt
+        if "pseudogene" in self.tx_types or "transcribed_pseudogene" in self.tx_types:
+            return "pseudogene"
+        if self.tx_types:
+            return sorted(self.tx_types)[0]
+        return None
 
     def locus(self):
         """(chrom, start, end, strand, inferred): the gene line, else its transcripts' span on the
@@ -349,7 +381,7 @@ def iter_gtf(
         if loc is None:
             continue
         chrom, start, end, strand, inferred = loc
-        gtype = g.type if biotypes_set is None else gene_type.get(gid, g.type)
+        gtype = g.inferred_type() if biotypes_set is None else gene_type.get(gid)
         if biotypes_set is not None and gtype not in biotypes_set:
             st["genes_dropped_biotype"] += 1
             if gtype is None:
@@ -545,6 +577,7 @@ def import_gtf(
     }
     ds.metadata["gene_annotation"] = {
         "reader_version": READER_VERSION, "gtf": gtf_path.name,
+        "gtf_path": str(gtf_path.resolve()),
         **{k: v for k, v in out.items() if k != "features"}, "features": dict(feats),
         "filters": {"feature_filter": sorted(set(feature_filter)),
                     "transcript_id_pattern": transcript_id_pattern,
@@ -572,4 +605,357 @@ def import_gtf(
                 print(f"  {what}: {out[key]:,}")
         if out["genes_dropped_no_biotype"]:
             print(f"  of which {out['genes_dropped_no_biotype']:,} carry no biotype on any row")
+    from cytome.core.provenance import record_edit
+    record_edit(ds, "cytome.import_gtf",
+                {"gtf_path": gtf_path, "force": force, "source_label": source_label,
+                 "transcript_id_pattern": transcript_id_pattern, "transcript_tags": transcript_tags,
+                 "gene_biotypes": gene_biotypes, "chrom_names": chrom_names},
+                outputs=["_gene_annotation", "_exon_annotation"])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Biotype backfill & gene table synchronization (cytome 0.4.0)
+# ---------------------------------------------------------------------------
+
+def backfill_biotypes_from_exons(ds) -> dict:
+    """Infer missing ``_gene_annotation.gene_type`` values from ``_exon_annotation`` in-place.
+
+    RefSeq GTFs without ``gene`` lines on chr2..chrY (such as Cell Ranger ARC Mmul_10 and
+    mCalJac1) have ``CDS`` rows in ``_exon_annotation`` for protein-coding genes. This function
+    populates ``_gene_annotation.gene_type`` in < 0.2 s without re-reading the external GTF.
+    """
+    ds.require_writable("cytome.backfill_biotypes_from_exons")
+    conn = ds._conn
+    n_null_before = conn.execute(
+        "SELECT COUNT(*) FROM _gene_annotation WHERE gene_type IS NULL OR gene_type = ''"
+    ).fetchone()[0]
+    if n_null_before == 0:
+        return {"n_null_before": 0, "n_updated_protein_coding": 0, "n_updated_other": 0, "n_null_after": 0}
+
+    cur_pc = conn.execute(
+        """
+        UPDATE _gene_annotation
+        SET gene_type = 'protein_coding'
+        WHERE (gene_type IS NULL OR gene_type = '')
+          AND gene_id IN (
+              SELECT DISTINCT gene_id FROM _exon_annotation
+              WHERE feature = 'CDS' OR transcript_type IN ('mRNA', 'protein_coding')
+          )
+        """
+    )
+    n_pc = cur_pc.rowcount if cur_pc.rowcount is not None and cur_pc.rowcount >= 0 else 0
+
+    cur_lnc = conn.execute(
+        """
+        UPDATE _gene_annotation
+        SET gene_type = 'lncRNA'
+        WHERE (gene_type IS NULL OR gene_type = '')
+          AND gene_id IN (
+              SELECT DISTINCT gene_id FROM _exon_annotation
+              WHERE transcript_type IN ('lnc_RNA', 'lncRNA', 'ncRNA')
+          )
+        """
+    )
+    n_other = cur_lnc.rowcount if cur_lnc.rowcount is not None and cur_lnc.rowcount >= 0 else 0
+
+    # Any remaining gene with non-null transcript_type in _exon_annotation
+    cur_rem = conn.execute(
+        """
+        UPDATE _gene_annotation
+        SET gene_type = (
+            SELECT e.transcript_type FROM _exon_annotation e
+            WHERE e.gene_id = _gene_annotation.gene_id
+              AND e.transcript_type IS NOT NULL AND e.transcript_type != ''
+            LIMIT 1
+        )
+        WHERE (gene_type IS NULL OR gene_type = '')
+          AND EXISTS (
+              SELECT 1 FROM _exon_annotation e
+              WHERE e.gene_id = _gene_annotation.gene_id
+                AND e.transcript_type IS NOT NULL AND e.transcript_type != ''
+          )
+        """
+    )
+    if cur_rem.rowcount is not None and cur_rem.rowcount > 0:
+        n_other += cur_rem.rowcount
+
+    # Remaining transcripts without CDS on Gnomon/BestRefSeq/RefSeq/Curated Genomic in NCBI RefSeq GTFs
+    # are non-coding RNAs (lncRNA) or tRNAs (tRNAscan-SE).
+    conn.execute(
+        """
+        UPDATE _gene_annotation
+        SET gene_type = 'tRNA'
+        WHERE (gene_type IS NULL OR gene_type = '')
+          AND (gene_id LIKE 'TRNA%' OR gene_name LIKE 'TRNA%')
+        """
+    )
+    cur_nc_fallback = conn.execute(
+        """
+        UPDATE _gene_annotation
+        SET gene_type = 'lncRNA'
+        WHERE (gene_type IS NULL OR gene_type = '')
+          AND EXISTS (
+              SELECT 1 FROM _exon_annotation e
+              WHERE e.gene_id = _gene_annotation.gene_id
+                AND e.feature IN ('transcript', 'exon')
+          )
+        """
+    )
+    if cur_nc_fallback.rowcount is not None and cur_nc_fallback.rowcount > 0:
+        n_other += cur_nc_fallback.rowcount
+
+    conn.commit()
+    n_null_after = conn.execute(
+        "SELECT COUNT(*) FROM _gene_annotation WHERE gene_type IS NULL OR gene_type = ''"
+    ).fetchone()[0]
+    try:
+        info = dict(ds.metadata.get("gene_annotation") or {})
+        if info:
+            info["reader_version"] = max(int(info.get("reader_version", 0) or 0), READER_VERSION)
+            ds.metadata["gene_annotation"] = info
+            ds.flush()
+    except Exception:
+        pass
+    if n_pc or n_other:
+        from cytome.core.provenance import record_edit
+        record_edit(ds, "cytome.backfill_biotypes_from_exons", {}, outputs=["_gene_annotation"],
+                    inputs=["_exon_annotation"], notes=f"{int(n_pc) + int(n_other)} missing gene_type filled")
+    return {
+        "n_null_before": int(n_null_before),
+        "n_updated_protein_coding": int(n_pc),
+        "n_updated_other": int(n_other),
+        "n_null_after": int(n_null_after),
+    }
+
+
+def ensure_gtf_imported(
+    ds,
+    gtf_path=None,
+    *,
+    copy_from_dataset=None,
+    verbose: bool = False,
+) -> dict:
+    """Ensure ``_gene_annotation`` and ``_exon_annotation`` are populated and have biotypes.
+
+    The reference is data, never searched for:
+
+    1. If ``_gene_annotation`` already has rows, runs :func:`backfill_biotypes_from_exons` if any
+       ``gene_type`` is NULL. A ``gtf_path`` given beside it is not read, and a warning says so unless it is
+       the file the store's annotation was read from.
+    2. Otherwise, if ``gtf_path`` is given, calls :func:`import_gtf` (FileNotFoundError if it does not exist).
+    3. Otherwise, if ``copy_from_dataset`` is provided (another open :class:`CytomeDataset` or path
+       with the same genome that already has ``_gene_annotation`` populated), copies its
+       ``_gene_annotation`` and ``_exon_annotation`` tables.
+    4. Otherwise returns ``{'status': 'empty'}``.
+    """
+    conn = ds._conn
+    n_genes = conn.execute("SELECT COUNT(*) FROM _gene_annotation").fetchone()[0]
+    if n_genes > 0:
+        if gtf_path is not None:
+            # The store's own annotation is used, and a GTF given beside it is not read. Said when the two
+            # are not the same file, so that a call with another GTF is not taken to have used it.
+            info = ds.metadata.get("gene_annotation") or {}
+            held = info.get("gtf_path") or info.get("gtf")
+            given = Path(gtf_path)
+            same = held is not None and (
+                str(given.resolve()) == str(held) if info.get("gtf_path") else given.name == str(held))
+            if not same:
+                import warnings
+                warnings.warn(
+                    f"the store already holds a gene annotation ({n_genes:,} genes"
+                    + (f", read from {held}" if held else "") + f"); gtf_path={str(gtf_path)!r} was not read. "
+                    "cytome.import_gtf(ds, gtf_path, force=True) replaces the store's annotation.",
+                    UserWarning, stacklevel=3)
+        n_null = conn.execute(
+            "SELECT COUNT(*) FROM _gene_annotation WHERE gene_type IS NULL OR gene_type = ''"
+        ).fetchone()[0]
+        bf = {"n_null_before": 0, "n_updated_protein_coding": 0, "n_updated_other": 0, "n_null_after": 0}
+        if n_null > 0 and not ds.read_only:
+            bf = backfill_biotypes_from_exons(ds)
+        return {"status": "existing", "n_genes": int(n_genes), **bf}
+
+    if gtf_path is not None:
+        resolved = Path(gtf_path)
+        if not resolved.exists():
+            raise FileNotFoundError(f"GTF file not found: {resolved}")
+        out = import_gtf(ds, resolved, verbose=verbose)
+        bf = backfill_biotypes_from_exons(ds)
+        return {"status": "imported", **out, **bf}
+
+    if copy_from_dataset is not None:
+        ds.require_writable("cytome.ensure_gtf_imported")
+        import cytome as _cyt
+        close_src = False
+        if isinstance(copy_from_dataset, (str, Path)):
+            src = _cyt.open(str(copy_from_dataset), mode="r")
+            close_src = True
+        else:
+            src = copy_from_dataset
+        try:
+            g_rows = src._conn.execute(
+                "SELECT gene_id, chrom, start, end, strand, gene_name, gene_type, source FROM _gene_annotation"
+            ).fetchall()
+            e_rows = src._conn.execute(
+                "SELECT gene_id, transcript_id, exon_number, chrom, start, end, strand, feature, transcript_type "
+                "FROM _exon_annotation"
+            ).fetchall()
+            if g_rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO _gene_annotation "
+                    "(gene_id, chrom, start, end, strand, gene_name, gene_type, source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    g_rows,
+                )
+            if e_rows:
+                conn.executemany(
+                    "INSERT INTO _exon_annotation "
+                    "(gene_id, transcript_id, exon_number, chrom, start, end, strand, feature, transcript_type) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    e_rows,
+                )
+            conn.commit()
+            info = src.metadata.get("gene_annotation")
+            if info:
+                ds.metadata["gene_annotation"] = dict(info)
+                ds.flush()
+            bf = backfill_biotypes_from_exons(ds)
+            return {"status": "copied", "n_genes": len(g_rows), "n_features": len(e_rows), **bf}
+        finally:
+            if close_src:
+                src.close()
+
+    return {"status": "empty", "n_genes": 0}
+
+
+_REFSEQ_DUP_RE = re.compile(r"^(.+)_([1-9]\d*)$")
+_ENS_VER_RE = re.compile(r"^(ENS[A-Z]*G\d+)(?:\.\d+(?:_PAR_Y)?)?$")
+
+
+def sync_gene_metadata(
+    ds,
+    gtf_path=None,
+    *,
+    copy_from_dataset=None,
+    verbose: bool = False,
+) -> dict:
+    """Synchronize ``genes`` and ``GA_genes`` tables with ``_gene_annotation``.
+
+    Populates NULL ``chr, start, end_, strand, biotype, symbol`` in both ``genes`` and ``GA_genes``
+    from ``_gene_annotation``, matching by:
+    1. Exact ``gene_id == _gene_annotation.gene_id`` or ``gene_ids == _gene_annotation.gene_id``
+    2. Version-stripped Ensembl ID (``ENSG00000123456.12 -> ENSG00000123456``) on ``gene_id`` or
+       ``gene_ids`` (handles GENCODE vM23 vs. vM25 symbol renames via stable Ensembl IDs), or RefSeq
+       duplicate suffix (``CHRNA2_1 -> CHRNA2``)
+    3. Exact ``symbol == _gene_annotation.gene_name`` (or ``gene_id == _gene_annotation.gene_name``),
+       choosing the longest canonical chromosome annotation when a symbol appears multiple times.
+    """
+    ds.require_writable("cytome.sync_gene_metadata")
+    gtf_status = ensure_gtf_imported(
+        ds, gtf_path=gtf_path, copy_from_dataset=copy_from_dataset, verbose=verbose
+    )
+    conn = ds._conn
+    ann_rows = conn.execute(
+        "SELECT gene_id, chrom, start, end, strand, gene_name, gene_type FROM _gene_annotation"
+    ).fetchall()
+    if not ann_rows:
+        return {"gtf": gtf_status, "genes_updated": 0, "GA_genes_updated": 0}
+
+    by_id = {}
+    by_stripped_id = {}
+    by_name = {}
+    for gid, chrom, start, end, strand, gname, gtype in ann_rows:
+        rec = (chrom, int(start), int(end), strand or "+", gname or gid, gtype)
+        by_id[gid] = rec
+        m_ens = _ENS_VER_RE.match(str(gid))
+        if m_ens:
+            stripped = m_ens.group(1)
+            if stripped not in by_stripped_id or not str(gid).endswith("_PAR_Y"):
+                by_stripped_id[stripped] = rec
+        for key_name in filter(None, (gname, gid)):
+            prev = by_name.get(key_name)
+            if prev is None:
+                by_name[key_name] = rec
+            else:
+                # Prefer primary chromosomes over scaffolds, then longest span
+                prev_primary = not ("_" in str(prev[0]) or str(prev[0]).startswith(("chrUn", "NW_", "NT_")))
+                curr_primary = not ("_" in str(chrom) or str(chrom).startswith(("chrUn", "NW_", "NT_")))
+                if (curr_primary and not prev_primary) or (
+                    curr_primary == prev_primary and (int(end) - int(start)) > (prev[2] - prev[1])
+                ):
+                    by_name[key_name] = rec
+
+    summary = {"gtf": gtf_status, "genes_updated": 0, "GA_genes_updated": 0}
+    for table in ("genes", "GA_genes"):
+        cols = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
+        if not cols:
+            continue
+        if "strand" not in cols:
+            conn.execute(f'ALTER TABLE "{table}" ADD COLUMN strand TEXT')
+            conn.execute(
+                "INSERT OR REPLACE INTO _column_meta(table_name, column_name, dtype, categories) "
+                "VALUES (?, 'strand', 'object', NULL)",
+                (table,),
+            )
+        gene_ids_expr = "gene_ids" if "gene_ids" in cols else "NULL AS gene_ids"
+        rows = conn.execute(
+            f'SELECT gene_idx, gene_id, symbol, chr, start, end_, biotype, strand, {gene_ids_expr} FROM "{table}"'
+        ).fetchall()
+        if not rows:
+            continue
+        updates = []
+        for gidx, gid, sym, c_chr, c_start, c_end, c_bio, c_strand, g_ens_id in rows:
+            rec = by_id.get(gid)
+            if rec is None and gid:
+                m_ens = _ENS_VER_RE.match(str(gid))
+                if m_ens:
+                    rec = by_stripped_id.get(m_ens.group(1))
+            if rec is None and g_ens_id:
+                rec = by_id.get(str(g_ens_id))
+                if rec is None:
+                    m_ens = _ENS_VER_RE.match(str(g_ens_id))
+                    if m_ens:
+                        rec = by_stripped_id.get(m_ens.group(1))
+                    else:
+                        rec = by_stripped_id.get(str(g_ens_id).split(".")[0])
+            if rec is None and sym:
+                rec = by_name.get(str(sym))
+            if rec is None and gid:
+                rec = by_name.get(str(gid))
+                if rec is None:
+                    m_dup = _REFSEQ_DUP_RE.match(str(gid))
+                    if m_dup:
+                        rec = by_name.get(m_dup.group(1))
+            if rec is None:
+                continue
+            a_chr, a_start, a_end, a_strand, a_name, a_bio = rec
+            new_sym = sym if (sym is not None and str(sym) != "") else a_name
+            new_chr = c_chr if (c_chr is not None and str(c_chr) != "") else a_chr
+            new_start = c_start if c_start is not None else a_start
+            new_end = c_end if c_end is not None else a_end
+            new_bio = c_bio if (c_bio is not None and str(c_bio) != "") else a_bio
+            new_strand = c_strand if (c_strand is not None and str(c_strand) != "") else a_strand
+            if (
+                new_sym != sym
+                or new_chr != c_chr
+                or new_start != c_start
+                or new_end != c_end
+                or new_bio != c_bio
+                or new_strand != c_strand
+            ):
+                updates.append((new_sym, new_chr, new_start, new_end, new_bio, new_strand, gidx))
+        if updates:
+            conn.executemany(
+                f'UPDATE "{table}" SET symbol = ?, chr = ?, start = ?, end_ = ?, biotype = ?, strand = ? '
+                f'WHERE gene_idx = ?',
+                updates,
+            )
+            conn.commit()
+        summary[f"{table}_updated"] = len(updates)
+    changed = [t for t in ("genes", "GA_genes") if summary.get(f"{t}_updated")]
+    if changed:
+        from cytome.core.provenance import record_edit
+        record_edit(ds, "cytome.sync_gene_metadata", {"gtf_path": gtf_path}, outputs=changed,
+                    inputs=["_gene_annotation"],
+                    notes="missing values filled: " + ", ".join(f"{t} {summary[t + '_updated']}" for t in changed))
+    return summary

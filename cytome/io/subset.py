@@ -207,7 +207,7 @@ def _begin_output(ds, keep_idx, output, matrices, copy_annotations):
     # DataFrame of five million tiles, and every value arrives as stored.
     # ``samples`` describes the cells' samples and is always carried.
     out.flush()                                   # the cells table first
-    _feature_tables = ["genes", "peaks", "tiles", "proteins"]
+    _feature_tables = ["genes", "peaks", "chip_peaks", "dnase_peaks", "tiles", "proteins"]
     if copy_annotations:
         _feature_tables.append("GA_genes")
     removed = len(keep_idx) < int(ds.n_cells)
@@ -986,6 +986,8 @@ def carry_tables(src, out, keep_idx=None, copy_annotations: bool = True) -> None
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")      # the source said so when it was built
                 build_peak_index(o)
+    if copy_annotations and _table_has_rows(s, "peak_sequences") and _table_has_rows(o, "peaks"):
+        _copy_feature_table(s, o, "peak_sequences")
     src_ci = np.asarray(src.cells["cell_idx"], dtype=np.int64)
     keep = np.arange(src_ci.size) if keep_idx is None else np.asarray(keep_idx, dtype=np.int64)
     if _table_has_rows(s, "cell_sets"):
@@ -1141,7 +1143,8 @@ def _subset_spatial_coords(ds, out, keep_idx: np.ndarray) -> None:
         return
     if not rows:
         return
-    old_to_new = {int(old): new for new, old in enumerate(keep_idx)}
+    src_ci = np.asarray(ds.cells["cell_idx"], dtype=np.int64)
+    old_to_new = {int(c): new for new, c in enumerate(src_ci[keep_idx])}
     kept = [
         (old_to_new[int(ci)], x, y, z)
         for (ci, x, y, z) in rows
@@ -1255,6 +1258,7 @@ def _subset_fragments(ds: CytomeDataset, out: CytomeDataset, keep_idx: np.ndarra
             row_end INTEGER NOT NULL,
             n_fragments INTEGER NOT NULL,
             min_start INTEGER,
+            max_end INTEGER,
             starts_blob BLOB NOT NULL,
             ends_blob BLOB NOT NULL,
             cell_idx_blob BLOB NOT NULL,

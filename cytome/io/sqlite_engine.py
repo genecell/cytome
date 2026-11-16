@@ -105,6 +105,11 @@ def create_database(path: PathLike, force: bool = False) -> sqlite3.Connection:
         If ``path`` exists and ``force`` is ``False``.
     """
     db_path = Path(path)
+    if db_path.exists() and force:
+        from cytome.core.freeze import describe, frozen_info
+        info = frozen_info(db_path)
+        if info is not None:
+            raise ReadOnlyError(f"{db_path.name} is not replaced: {describe(info, db_path)}")
     if db_path.exists() and not force:
         raise FileExistsError(
             f"Cytome already exists: {db_path}. Pass force=True to overwrite "
@@ -146,6 +151,12 @@ def ensure_chunk_span_indexes(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_csc_chunks_span ON "
             "matrix_csc_chunks(matrix_name, chunk_idx, col_start, col_end, n_nonzero)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fc_chrom_chunk_minstart ON "
+            "fragment_chunks(chrom, chunk_idx, min_start, n_fragments)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fc_chrom_minstart_maxend ON "
+            "fragment_chunks(chrom, min_start, max_end)")
     except sqlite3.OperationalError as exc:
         if "readonly" not in str(exc).lower() and "read-only" not in str(exc).lower():
             raise
@@ -240,6 +251,10 @@ def _why_not_writable(db_path: Path) -> str | None:
     """
     folder = db_path.resolve().parent
     if not os.access(db_path, os.W_OK):
+        from cytome.core.freeze import describe, frozen_info
+        info = frozen_info(db_path)
+        if info is not None:
+            return describe(info, db_path)
         return f"{db_path} is not writable"
     for sfx in ("-wal", "-shm"):
         side = Path(str(db_path) + sfx)
@@ -536,7 +551,7 @@ def _init_manifest(conn: sqlite3.Connection, dataset_name: str) -> None:
 #: like it needed migrating and every open took the ALTER path below. Under a
 #: concurrent writer that meant waiting out ``busy_timeout`` (60 s) and then
 #: failing to open a file that was never old.
-_FRAGMENT_CHUNKS_MIGRATED_COLUMNS = ("min_start",)
+_FRAGMENT_CHUNKS_MIGRATED_COLUMNS = ("min_start", "max_end")
 
 
 def _migrate_fragment_chunks_columns(conn: sqlite3.Connection) -> None:
@@ -577,7 +592,7 @@ def _add_fragment_chunks_columns(conn: sqlite3.Connection, columns) -> None:
             conn.execute(f"ALTER TABLE fragment_chunks ADD COLUMN {col} INTEGER")
         except sqlite3.OperationalError as e:
             msg = str(e).lower()
-            if "readonly" in msg:
+            if "readonly" in msg or "read-only" in msg or "locked" in msg:
                 return
             if "duplicate column" in msg:
                 continue
@@ -677,6 +692,38 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             distance_to_tss INTEGER,
             -- narrowPeak / PICCO peak-calling stats (nullable; written by the
             -- quantifier when peaks come from a PICCO narrowPeak BED)
+            summit INTEGER,
+            score REAL,
+            signal REAL,
+            neg_log10_pvalue REAL,
+            neg_log10_qvalue REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS chip_peaks (
+            peak_idx INTEGER PRIMARY KEY,
+            peak_id TEXT NOT NULL,
+            chr TEXT NOT NULL,
+            start INTEGER NOT NULL,
+            end_ INTEGER NOT NULL,
+            annotation TEXT,
+            nearest_gene TEXT,
+            distance_to_tss INTEGER,
+            summit INTEGER,
+            score REAL,
+            signal REAL,
+            neg_log10_pvalue REAL,
+            neg_log10_qvalue REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS dnase_peaks (
+            peak_idx INTEGER PRIMARY KEY,
+            peak_id TEXT NOT NULL,
+            chr TEXT NOT NULL,
+            start INTEGER NOT NULL,
+            end_ INTEGER NOT NULL,
+            annotation TEXT,
+            nearest_gene TEXT,
+            distance_to_tss INTEGER,
             summit INTEGER,
             score REAL,
             signal REAL,
@@ -813,6 +860,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             row_end INTEGER NOT NULL,
             n_fragments INTEGER NOT NULL,
             min_start INTEGER,
+            max_end INTEGER,
             starts_blob BLOB NOT NULL,
             ends_blob BLOB NOT NULL,
             cell_idx_blob BLOB NOT NULL,
@@ -824,6 +872,10 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             ON fragment_chunks(chrom, chunk_idx);
         CREATE INDEX IF NOT EXISTS idx_fc_chrom_minstart
             ON fragment_chunks(chrom, min_start);
+        CREATE INDEX IF NOT EXISTS idx_fc_chrom_minstart_maxend
+            ON fragment_chunks(chrom, min_start, max_end);
+        CREATE INDEX IF NOT EXISTS idx_fc_chrom_chunk_minstart
+            ON fragment_chunks(chrom, chunk_idx, min_start, n_fragments);
 
         CREATE TABLE IF NOT EXISTS graph_knn (
             cell_i INTEGER NOT NULL,
@@ -958,6 +1010,63 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS _raw_var (
             var_idx INTEGER PRIMARY KEY,
             var_name TEXT NOT NULL
+        );
+
+        -- Multi-axis pseudobulk sufficient-statistics cubes (cytome 0.4.0).
+        CREATE TABLE IF NOT EXISTS pseudobulk_cubes (
+            cube_key TEXT PRIMARY KEY,
+            matrix_name TEXT NOT NULL,
+            col_entity TEXT NOT NULL,
+            group_cols_json TEXT NOT NULL,
+            group_names_json TEXT NOT NULL,
+            n_groups INTEGER NOT NULL,
+            n_features INTEGER NOT NULL,
+            n_cells_blob BLOB NOT NULL,
+            total_counts_blob BLOB NOT NULL,
+            total_fragments_blob BLOB NOT NULL,
+            sum_blob BLOB NOT NULL,
+            sum_sq_blob BLOB NOT NULL,
+            nnz_blob BLOB NOT NULL,
+            compression TEXT DEFAULT 'zstd',
+            digest_json TEXT,
+            created_at TEXT
+        );
+
+        -- Embedded 2.5-bit variable-length peak DNA sequences (cytome 0.4.0).
+        CREATE TABLE IF NOT EXISTS peak_sequences (
+            chunk_idx INTEGER PRIMARY KEY,
+            peak_start INTEGER NOT NULL,
+            peak_end INTEGER NOT NULL,
+            max_len INTEGER NOT NULL,
+            lengths_blob BLOB NOT NULL,
+            summit_pos_blob BLOB NOT NULL,
+            seq_blob BLOB NOT NULL,
+            compression TEXT DEFAULT 'zstd'
+        );
+
+        -- Donor-aware WLS + Empirical Bayes differential summary statistics (cytome 0.4.0).
+        CREATE TABLE IF NOT EXISTS donor_differential_stats (
+            stat_key TEXT PRIMARY KEY,
+            matrix_name TEXT NOT NULL,
+            group_col TEXT NOT NULL,
+            donor_col TEXT NOT NULL,
+            covariates_json TEXT NOT NULL,
+            group_names_json TEXT NOT NULL,
+            n_groups INTEGER NOT NULL,
+            n_features INTEGER NOT NULL,
+            n_donors_blob BLOB NOT NULL,
+            mean_cpm_blob BLOB NOT NULL,
+            beta_cpm_blob BLOB NOT NULL,
+            beta_log1p_blob BLOB NOT NULL,
+            se_log1p_blob BLOB NOT NULL,
+            t_stat_blob BLOB NOT NULL,
+            p_val_blob BLOB NOT NULL,
+            fdr_qval_blob BLOB NOT NULL,
+            prior_df_blob BLOB NOT NULL,
+            prior_var_blob BLOB NOT NULL,
+            compression TEXT DEFAULT 'zstd',
+            digest_json TEXT,
+            created_at TEXT
         );
         """
     )

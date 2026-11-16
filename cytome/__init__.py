@@ -56,6 +56,20 @@ __all__ = [
     "merge",
     "import_gtf",
     "read_gtf",
+    "ensure_gtf_imported",
+    "sync_gene_metadata",
+    "backfill_biotypes_from_exons",
+    "PseudobulkCube",
+    "aggregate_pseudobulk",
+    "store_peak_sequences",
+    "get_peak_sequences",
+    "annotate_peaks_tss",
+    "peak_gene_index",
+    "freeze",
+    "unfreeze",
+    "frozen_info",
+    "fill_fragment_chunk_extents",
+    "get_tn5_footprints",
     # modality routing -- see the note above before changing any of these
     "MODALITY_REGISTRY",
     "MODALITY_VAR_ENTITY",
@@ -74,7 +88,7 @@ __all__ = [
 # The manifest's writer_version reads THIS, not the installed distribution
 # metadata: a source tree run against a stale editable install would otherwise
 # stamp files with the version of code that did not write them.
-__version__ = "0.3.9"
+__version__ = "0.4.0"
 
 
 def import_gtf(ds, gtf_path, **kwargs):
@@ -88,6 +102,45 @@ def read_gtf(gtf_path, **kwargs):
     DataFrames, read the way :func:`import_gtf` reads it)."""
     from cytome.io.gtf_import import read_gtf as _impl
     return _impl(gtf_path, **kwargs)
+
+
+def ensure_gtf_imported(ds, gtf_path=None, **kwargs):
+    """Convenience: forward to :func:`cytome.io.gtf_import.ensure_gtf_imported`."""
+    from cytome.io.gtf_import import ensure_gtf_imported as _impl
+    return _impl(ds, gtf_path=gtf_path, **kwargs)
+
+
+def sync_gene_metadata(ds, gtf_path=None, **kwargs):
+    """Convenience: forward to :func:`cytome.io.gtf_import.sync_gene_metadata`."""
+    from cytome.io.gtf_import import sync_gene_metadata as _impl
+    return _impl(ds, gtf_path=gtf_path, **kwargs)
+
+
+def backfill_biotypes_from_exons(ds):
+    """Convenience: forward to :func:`cytome.io.gtf_import.backfill_biotypes_from_exons`."""
+    from cytome.io.gtf_import import backfill_biotypes_from_exons as _impl
+    return _impl(ds)
+
+
+from cytome.core.pseudobulk import (  # noqa: E402
+    PseudobulkCube,
+    aggregate_pseudobulk,
+)
+from cytome.core.sequences import get_peak_sequences, store_peak_sequences  # noqa: E402
+from cytome.core.peak_annotation import annotate_peaks_tss, peak_gene_index  # noqa: E402
+from cytome.core.freeze import freeze, frozen_info, unfreeze  # noqa: E402
+from cytome.core.fragments import fill_fragment_chunk_extents  # noqa: E402
+from cytome.core.footprints import get_tn5_footprints  # noqa: E402
+
+# An extension module, where a distribution carries one, registers its names when it is imported.
+import importlib as _importlib  # noqa: E402
+
+try:
+    _importlib.import_module("cytome._extras")
+except ModuleNotFoundError as _exc:
+    if _exc.name != "cytome._extras":
+        raise
+del _importlib
 
 
 def open(path: str | Path, mode: str = "r+") -> CytomeDataset:

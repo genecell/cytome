@@ -92,10 +92,12 @@ def test_cells_of_a_spatial_store_can_be_rewritten(tmp_path):
     ds.set_entity("cells", df)
     ds.flush()
     assert ds.cells["y"].tolist() == list("abcd")
-    # dropping a cell the coordinates refer to is still refused, at the commit
+    # dropping a cell the coordinates refer to is still refused, now before anything is written: a rewrite
+    # to another row count cannot tell which old cell each new row is, and the foreign key alone missed
+    # coordinates of only some cells and cell sets (audit 2026-11-07, Section 3.2)
     ds.set_entity("cells", df.iloc[:3])
     with pytest.warns(RuntimeWarning):
-        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        with pytest.raises(ValueError, match="spatial coordinates and cell sets"):
             ds.flush()
     assert ds.n_cells == 4
     ds.close()

@@ -195,15 +195,11 @@ class EntityTable:
     def query_mask(self, expression: str) -> np.ndarray:
         """Return boolean mask for rows satisfying SQL expression."""
         self._settle()
-        key_col = _infer_primary_key(self._conn, self._table_name)
-        all_ids = self._conn.execute(
-            f"SELECT {key_col} FROM {self._table_name} ORDER BY ROWID"
-        ).fetchall()
-        hit_ids = self._conn.execute(
-            f"SELECT {key_col} FROM {self._table_name} WHERE {expression}"
-        ).fetchall()
-        id_set = {h[0] for h in hit_ids}
-        return np.asarray([i[0] in id_set for i in all_ids], dtype=bool)
+        sql = f"SELECT CASE WHEN ({expression}) THEN 1 ELSE 0 END FROM {self._table_name} ORDER BY ROWID"
+        return np.fromiter(
+            (r[0] for r in self._conn.execute(sql)),
+            dtype=bool,
+        )
 
     def to_pandas(self, restore_dtypes: bool = False) -> pd.DataFrame:
         """Materialize table as pandas DataFrame.
@@ -216,7 +212,9 @@ class EntityTable:
         as SQLite stores them.
         """
         self._settle()
-        df = self._hide_shim_rowid(pd.read_sql_query(f"SELECT * FROM {self._table_name}", self._conn))
+        df = self._hide_shim_rowid(
+            pd.read_sql_query(f"SELECT * FROM {self._table_name} ORDER BY ROWID", self._conn)
+        )
         if restore_dtypes:
             from cytome.core.column_meta import restore_column_dtypes
             df = restore_column_dtypes(self._conn, self._table_name, df)

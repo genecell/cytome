@@ -328,3 +328,53 @@ def _rows_to_fragment_dict(rows) -> Dict[str, np.ndarray]:
         "cell_idx": cell_idx,
         "dup_count": dup_count,
     }
+
+
+def fill_fragment_chunk_extents(ds, batch: int = 512) -> dict:
+    """Record each fragment chunk's largest fragment end (``fragment_chunks.max_end``) where it is missing.
+
+    A region query reads only the chunks that can overlap the region: one that starts after the region ends,
+    or ends before it starts, is skipped. A chunk without its ``max_end`` (PIASO's importer wrote none before
+    the change of 2026-11-07) cannot be ruled out, so a query reads every such chunk of the chromosome that
+    starts before the region's end. The results are the same either way; only the time differs.
+
+    This fills the column once, as an explicit step. Reads never write it as they go, so a store opened for
+    reading or frozen is left as it is. ``repair()`` calls it too.
+
+    Returns
+    -------
+    dict
+        ``chunks_filled`` and ``chromosomes``: what was missing and is now recorded.
+    """
+    from cytome.io.sqlite_engine import _add_fragment_chunks_columns
+
+    ds.require_writable("cytome.fill_fragment_chunk_extents")
+    conn = ds._conn
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(fragment_chunks)")}
+    if not cols:
+        return {"chunks_filled": 0, "chromosomes": 0}
+    if "max_end" not in cols:
+        _add_fragment_chunks_columns(conn, ["max_end"])
+    ids = [r[0] for r in conn.execute("SELECT id FROM fragment_chunks WHERE max_end IS NULL ORDER BY id")]
+    chroms: set = set()
+    for i in range(0, len(ids), batch):
+        part = ids[i:i + batch]
+        marks = ",".join("?" * len(part))
+        rows = conn.execute(
+            f"SELECT id, chrom, starts_blob, ends_blob, COALESCE(compression, 'lz4'), COALESCE(encoding, 0) "
+            f"FROM fragment_chunks WHERE id IN ({marks})", part).fetchall()
+        updates = []
+        for cid, chrom, sb, eb, comp, enc in rows:
+            starts = decode_starts(sb, comp, enc)
+            ends = decode_ends(eb, comp, starts, enc)
+            if len(ends):
+                updates.append((int(np.max(ends)), cid))
+                chroms.add(chrom)
+        with conn:
+            conn.executemany("UPDATE fragment_chunks SET max_end = ? WHERE id = ?", updates)
+    out = {"chunks_filled": len(ids), "chromosomes": len(chroms)}
+    if ids:
+        from cytome.core.provenance import record_edit
+        record_edit(ds, "cytome.fill_fragment_chunk_extents", {}, outputs=["fragment_chunks"],
+                    notes=f"max_end recorded for {len(ids)} chunks on {len(chroms)} chromosomes")
+    return out

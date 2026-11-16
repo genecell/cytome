@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import warnings
 from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 import scipy.sparse as sp
@@ -52,7 +54,19 @@ _REQUIRED_TABLES = {
 }
 
 #: entity tables whose row count a matrix or embedding is checked against
-_ENTITY_TABLES = ("cells", "genes", "GA_genes", "peaks", "tiles", "proteins", "_raw_var")
+_ENTITY_TABLES = ("cells", "genes", "GA_genes", "peaks", "chip_peaks", "dnase_peaks", "tiles", "proteins", "_raw_var")
+
+#: primary key column for entity tables that enforce 0..n-1 positional indexing
+_ENTITY_PK_MAP = {
+    "cells": "cell_idx",
+    "genes": "gene_idx",
+    "GA_genes": "gene_idx",
+    "peaks": "peak_idx",
+    "chip_peaks": "peak_idx",
+    "dnase_peaks": "peak_idx",
+    "tiles": "tile_idx",
+    "proteins": "protein_idx",
+}
 
 
 def _q(sql_conn, sql, args=()):
@@ -244,6 +258,13 @@ def validate(ds, integrity: bool = True) -> ValidationReport:
     if not any(item.startswith("fragment_") for item in failed):
         passed.append("fragment_consistency")
 
+    # peak_sequences: if present, peak_end of last chunk must match peaks count
+    if _q(conn, "SELECT 1 FROM peak_sequences LIMIT 1"):
+        max_pe = _q(conn, "SELECT MAX(peak_end) FROM peak_sequences")
+        n_pk = entity_counts.get("peaks", 0)
+        if max_pe and int(max_pe[0][0] or 0) != int(n_pk):
+            failed.append("peak_sequences_count")
+
     # every metadata value reads back (with integrity: it reads every value).
     # Record arrays were written so that numpy could not read their dtype, and
     # validate() passed on the store.
@@ -267,19 +288,85 @@ def validate(ds, integrity: bool = True) -> ValidationReport:
     else:
         passed.append("cell_identity")
 
+    # entity primary keys must be contiguous 0..n-1 matching positional CSR/dense row indices
+    for tbl, pk_col in _ENTITY_PK_MAP.items():
+        n_ent = entity_counts.get(tbl, 0)
+        if n_ent <= 0:
+            continue
+        mm = _q(conn, f'SELECT MIN("{pk_col}"), MAX("{pk_col}"), COUNT("{pk_col}") FROM "{tbl}"')
+        if not mm or mm[0][0] != 0 or mm[0][1] != (n_ent - 1) or mm[0][2] != n_ent:
+            failed.append(f"entity_pk_contiguity:{tbl}")
+    if not any(item.startswith("entity_pk_contiguity:") for item in failed):
+        passed.append("entity_pk_contiguity")
+
     return ValidationReport(passed=(len(failed) == 0), checks_passed=passed, checks_failed=failed)
 
 
 #: failures repair() can fix (the rest need the data rebuilt)
 REPAIRABLE = ("matrix_rows:", "matrix_cols:", "matrix_chunk_count:", "matrix_row_coverage:",
               "matrix_csc_chunk_count:", "matrix_chunk_dtype:", "matrix_orphan_chunks",
-              "embedding_rows:", "embedding_chunk_count:")
+              "embedding_rows:", "embedding_chunk_count:", "entity_pk_contiguity:")
+
+
+def _repair_entity_pk_contiguity(conn, tbl: str, pk_col: str) -> Optional[str]:
+    """Compact the primary keys of ``tbl`` to ``0..n-1`` in ``rowid`` order; returns what was done.
+
+    For ``cells``, the tables that name a cell by its ``cell_idx`` value (``spatial_coords`` and
+    ``cell_sets``) are carried along (:mod:`cytome.core.cell_renumber`). Fragments name cells by position;
+    they are rewritten only when the store's per-cell fragment counts show they were written by ``cell_idx``,
+    and the cells are left alone when neither reading fits. For ``peaks``, the peak R-tree is rebuilt.
+    """
+    from cytome.core.cell_renumber import (
+        apply_cell_value_remap,
+        fragment_cell_reading,
+        plan_cell_value_remap,
+        rewrite_fragment_cells_to_positions,
+    )
+
+    rows = _q(conn, f'SELECT rowid, "{pk_col}" FROM "{tbl}" ORDER BY rowid')
+    if not rows:
+        return None
+    n = len(rows)
+    old_pks = [int(r[1]) for r in rows]
+    if old_pks == list(range(n)):
+        return None
+
+    reading = "none"
+    plan = None
+    if tbl == "cells":
+        try:
+            reading = fragment_cell_reading(conn, old_pks)
+        except ValueError as exc:
+            warnings.warn(f"repair: {exc}", stacklevel=3)
+            return f"cells: left as is ({exc})"
+        plan = plan_cell_value_remap(conn, old_pks)
+
+    conn.execute("PRAGMA defer_foreign_keys = ON")
+    # Two phases so that no new key collides with an old one (INTEGER PRIMARY KEY aliases rowid)
+    conn.executemany(
+        f'UPDATE "{tbl}" SET "{pk_col}" = ? WHERE "{pk_col}" = ?',
+        [(-1 - new_idx, old_pk) for new_idx, old_pk in enumerate(old_pks)],
+    )
+    conn.execute(f'UPDATE "{tbl}" SET "{pk_col}" = -1 - "{pk_col}" WHERE "{pk_col}" < 0')
+
+    done = f"{tbl}: compacted {pk_col} to 0..n-1"
+    if plan is not None:
+        apply_cell_value_remap(conn, plan)
+    if reading == "cell_idx":
+        n_chunks = rewrite_fragment_cells_to_positions(conn, old_pks)
+        done += f"; {n_chunks} fragment chunk(s) rewritten from cell_idx values to positions"
+    if tbl == "peaks" and _q(conn, "SELECT 1 FROM peaks_rtree LIMIT 1"):
+        from cytome.index.builder import build_peak_index
+        build_peak_index(conn)
+        done += "; peak R-tree rebuilt"
+    return done
 
 
 def repair(ds) -> list[str]:
     """Repair recoverable integrity issues; returns what was done.
 
     Fixes:
+    - Non-contiguous entity primary keys (compacted to ``0..n-1`` in ``rowid`` order).
     - Orphan matrix (row and column), embedding and graph chunks.
     - Matrix row counts that disagree with the row table: a matrix with more
       rows is cut; one with fewer gets zero rows for the missing ones, as an
@@ -291,6 +378,8 @@ def repair(ds) -> list[str]:
       float32 inputs by 0.3.8): the matrix is rewritten in one dtype, the
       promotion of all.
     - Embedding row count mismatches.
+    - Fragment chunks without their largest end (``max_end``), which region queries use to skip chunks:
+      :func:`cytome.core.fragments.fill_fragment_chunk_extents`.
 
     Parameters
     ----------
@@ -302,6 +391,10 @@ def repair(ds) -> list[str]:
     done: list[str] = []
     with conn:
         conn.execute("REINDEX")
+        for tbl, pk_col in _ENTITY_PK_MAP.items():
+            action = _repair_entity_pk_contiguity(conn, tbl, pk_col)
+            if action:
+                done.append(action)
         for table in ("matrix_chunks", "matrix_csc_chunks"):
             cur = conn.execute(
                 f"DELETE FROM {table} WHERE matrix_name NOT IN (SELECT matrix_name FROM matrix_meta)")
@@ -392,6 +485,13 @@ def repair(ds) -> list[str]:
                 continue
             _repair_embedding_rows(conn, name, n_rows, expected)
             done.append(f"{name}: {n_rows} rows -> {expected}")
+    from cytome.core.fragments import fill_fragment_chunk_extents
+    filled = fill_fragment_chunk_extents(ds)
+    if filled["chunks_filled"]:
+        done.append(f"recorded max_end for {filled['chunks_filled']} fragment chunks")
+    if done:
+        from cytome.core.provenance import record_edit
+        record_edit(ds, "cytome.repair", {}, outputs=["store"], notes="; ".join(done))
     return done
 
 
